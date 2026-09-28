@@ -772,6 +772,22 @@ export async function push(
   // branch/commit/reset never touch the user's active tree. withKnowledgeWorktree
   // hands pushCore a config whose localPath is the worktree's .teamai.
   if (localConfig.repo.kind === 'self') {
+    // A dry run reports the plan and leaves the machine as it found it, so it
+    // skips this whole branch: the sync-lock (whose `acquireLock` creates
+    // `<getDataHome>`, which a fresh self-mode clone has no partition for and
+    // `releaseLock` leaves behind), the `.teamai/.gitignore` self-heal, and the
+    // disposable knowledge worktree (#866). `pushCore` reaches its own dry-run
+    // guard without writing, and the active checkout is the truer preview in
+    // self mode — the worktree is cut from the same commits, and any uncommitted
+    // local edit is exactly what the real push would send.
+    if (options.dryRun) {
+      // The pending-config read is the one part of this branch that is
+      // read-only, and `pushCore` needs it: in self mode it is handed the
+      // uncommitted `teamai.yaml` rather than discovering it. Skipping it would
+      // make the preview under-report the very push it is describing.
+      await pushCore(localConfig, teamConfig, options, await pendingSelfTeamConfig(localConfig), result);
+      return;
+    }
     // Guard self machine-data writes against a concurrent P2 migration relocating
     // the same files. Contend on <getDataHome>/.sync-lock — the exact path
     // migrateSelfA1 takes (for a pre-migration self install that is
@@ -794,17 +810,7 @@ export async function push(
 
       const { withKnowledgeWorktree, EmptyRepoError } = await import('./utils/reports-branch.js');
       try {
-        const activeConfigPath = path.join(localConfig.repo.localPath, 'teamai.yaml');
-        const activeConfig = await readFileSafe(activeConfigPath);
-        const businessRoot = localConfig.repo.businessRepoRoot ?? localConfig.projectRoot;
-        let pendingTeamConfig: string | null = null;
-        if (activeConfig !== null && businessRoot) {
-          const relativeConfigPath = path.relative(businessRoot, activeConfigPath).split(path.sep).join('/');
-          const committed = await getFileContentAtRev(businessRoot, 'HEAD', relativeConfigPath);
-          if (committed === null || committed.toString() !== activeConfig) {
-            pendingTeamConfig = activeConfig;
-          }
-        }
+        const pendingTeamConfig = await pendingSelfTeamConfig(localConfig);
         await withKnowledgeWorktree(localConfig, async (wtConfig) => {
           if (pendingTeamConfig !== null) {
             await writeFile(path.join(wtConfig.repo.localPath, 'teamai.yaml'), pendingTeamConfig);
@@ -841,6 +847,24 @@ export async function push(
   } finally {
     await releaseLock(syncLock);
   }
+}
+
+/**
+ * The `teamai.yaml` a self-mode push has to carry, or null when HEAD already
+ * holds it. Read from the ACTIVE tree — the business repo is `businessRepoRoot`,
+ * and the worktree the push swaps into is a detached checkout of the same
+ * commits, so this is the one input `pushCore` cannot rediscover from the
+ * worktree alone. Read-only, which is why the `--dry-run` path calls it too
+ * (#866); writing it into the worktree stays with the real path.
+ */
+async function pendingSelfTeamConfig(localConfig: LocalConfig): Promise<string | null> {
+  const activeConfigPath = path.join(localConfig.repo.localPath, 'teamai.yaml');
+  const activeConfig = await readFileSafe(activeConfigPath);
+  const businessRoot = localConfig.repo.businessRepoRoot ?? localConfig.projectRoot;
+  if (activeConfig === null || !businessRoot) return null;
+  const relativeConfigPath = path.relative(businessRoot, activeConfigPath).split(path.sep).join('/');
+  const committed = await getFileContentAtRev(businessRoot, 'HEAD', relativeConfigPath);
+  return committed === null || committed.toString() !== activeConfig ? activeConfig : null;
 }
 
 async function pushCore(

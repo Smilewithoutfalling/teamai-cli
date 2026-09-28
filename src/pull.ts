@@ -1862,6 +1862,12 @@ export async function pull(
     // migrateSelfA1 takes). http has no clone and no machine-data relocation, so it
     // needs no lock.
     if (config.repo.kind === 'http') return true;
+    // A dry run writes nothing for this scope, so it has no reason to hold the
+    // lock — and taking one is itself a write: `acquireLock` creates the lock's
+    // parent directory, which a fresh self-mode clone has no partition for yet,
+    // and `releaseLock` removes the lock file but leaves that directory behind
+    // (#866). Reporting the scope uncontended is exact — nothing was serialized.
+    if (options.dryRun) return true;
     const lock = path.join(getDataHome(config), SYNC_LOCK_FILENAME);
     if (await acquireLock(lock)) {
       heldLocks.set(config, lock);
