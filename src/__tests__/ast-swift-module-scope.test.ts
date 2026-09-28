@@ -342,3 +342,110 @@ describe('Swift module-scope resolution (web-tree-sitter WASM)', () => {
     expect(implementsEdges[0]?.to).toBe('Tests/Fixtures/A/Sources/App/Proto.swift');
   });
 });
+
+describe('Swift module-scope resolution yields to enclosing bindings', () => {
+  beforeEach(() => {
+    resetParserRegistryForTests();
+  });
+
+  // Every case below pairs a *shadowed* call with an unshadowed one of the same
+  // name, and the shadowed one gets its own file. Edges are file-to-file, so
+  // putting both in one file would make the assertion true either way: the
+  // resolved call would supply the very edge the unresolved call must not.
+
+  it('does not resolve a call to a parameter of the enclosing function', async () => {
+    const { result } = await extractFiles([
+      ['Sources/App/Worker.swift', 'func work() -> Int { return 1 }\n'],
+      ['Sources/App/Shadowed.swift', 'func shadowed(work: () -> Int) -> Int {\n  return work()\n}\n'],
+      ['Sources/App/Plain.swift', 'func plain() -> Int {\n  return work()\n}\n'],
+    ]);
+
+    const references = result.edges.filter((e) => e.relation === 'REFERENCES');
+    expect(references).toHaveLength(1);
+    expect(references[0]?.from).toBe('Sources/App/Plain.swift');
+    expect(references[0]?.to).toBe('Sources/App/Worker.swift');
+  });
+
+  it('does not resolve a call to a local binding', async () => {
+    const { result } = await extractFiles([
+      ['Sources/App/Worker.swift', 'func work() -> Int { return 1 }\n'],
+      [
+        'Sources/App/Shadowed.swift',
+        'func shadowed() -> Int {\n  let work = { 1 }\n  return work()\n}\n',
+      ],
+      ['Sources/App/Plain.swift', 'func plain() -> Int {\n  return work()\n}\n'],
+    ]);
+
+    const references = result.edges.filter((e) => e.relation === 'REFERENCES');
+    expect(references).toHaveLength(1);
+    expect(references[0]?.from).toBe('Sources/App/Plain.swift');
+  });
+
+  it('does not resolve a call to a guard binding, which is a sibling statement', async () => {
+    const { result } = await extractFiles([
+      ['Sources/App/Worker.swift', 'func work() -> Int { return 1 }\n'],
+      [
+        'Sources/App/Shadowed.swift',
+        'func shadowed(opt: (() -> Int)?) -> Int {\n  guard let work = opt else { return 0 }\n  return work()\n}\n',
+      ],
+      ['Sources/App/Plain.swift', 'func plain() -> Int {\n  return work()\n}\n'],
+    ]);
+
+    // `guard let` binds into the *rest of the block*, not into a nested scope,
+    // so the call sits beside the guard instead of inside it. A walk that only
+    // looked at ancestors would miss this one.
+    const references = result.edges.filter((e) => e.relation === 'REFERENCES');
+    expect(references).toHaveLength(1);
+    expect(references[0]?.from).toBe('Sources/App/Plain.swift');
+  });
+
+  it('does not resolve a call to a closure parameter', async () => {
+    const { result } = await extractFiles([
+      ['Sources/App/Worker.swift', 'func work() -> Int { return 1 }\n'],
+      [
+        'Sources/App/Shadowed.swift',
+        'func shadowed(handler: (() -> Int) -> Int) -> Int {\n  return handler { work in work() }\n}\n',
+      ],
+      ['Sources/App/Plain.swift', 'func plain() -> Int {\n  return work()\n}\n'],
+    ]);
+
+    const references = result.edges.filter((e) => e.relation === 'REFERENCES');
+    expect(references).toHaveLength(1);
+    expect(references[0]?.from).toBe('Sources/App/Plain.swift');
+  });
+
+  it('still resolves when the binding belongs to a different function of the same file', async () => {
+    const { result } = await extractFiles([
+      ['Sources/App/Worker.swift', 'func work() -> Int { return 1 }\n'],
+      [
+        'Sources/App/Mixed.swift',
+        // Only the second function binds `work`, so exactly one of the two calls
+        // may resolve. The assertion is two-sided: it fails if the binding is
+        // ignored (both resolve, and the graph keeps one edge per resolved call)
+        // and it fails under a position-blind per-file rule (neither resolves).
+        // The binding set therefore has to be per call site, not per file.
+        'func caller() -> Int {\n  return work()\n}\n\nfunc param(work: () -> Int) -> Int {\n  return work()\n}\n',
+      ],
+    ]);
+
+    const references = result.edges.filter((e) => e.relation === 'REFERENCES');
+    expect(references).toHaveLength(1);
+    expect(references[0]?.from).toBe('Sources/App/Mixed.swift');
+    expect(references[0]?.to).toBe('Sources/App/Worker.swift');
+  });
+
+  it('does not resolve a receiver that an enclosing scope binds', async () => {
+    const { result } = await extractFiles([
+      ['Sources/App/Widget.swift', 'class Widget {\n  static func make() -> Int { return 1 }\n}\n'],
+      ['Sources/App/Shadowed.swift', 'func shadowed(Widget: Int) -> Int {\n  return Widget.make()\n}\n'],
+      ['Sources/App/Plain.swift', 'func plain() -> Int {\n  return Widget.make()\n}\n'],
+    ]);
+
+    // The receiver fallback leans on a naming convention, so it has to yield to
+    // a scope that actually binds the name.
+    const references = result.edges.filter((e) => e.relation === 'REFERENCES');
+    expect(references).toHaveLength(1);
+    expect(references[0]?.from).toBe('Sources/App/Plain.swift');
+    expect(references[0]?.to).toBe('Sources/App/Widget.swift');
+  });
+});

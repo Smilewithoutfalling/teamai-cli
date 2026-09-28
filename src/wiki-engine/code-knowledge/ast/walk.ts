@@ -129,11 +129,13 @@ export function walkFile(file: CodeCollectedFile): FileWalkResult {
         const receiver = byName.get("call.receiver")?.text;
         const member = byName.get("call.member")?.text;
         const calleeText = callee ?? (receiver && member ? `${receiver}.${member}` : callNode.text);
+        const localBindings = variant === "swift" ? swiftLocalBindingsAt(callNode) : [];
         callSites.push({
           fromFile: file.relativePath,
           line,
           calleeText,
           receiver,
+          ...(localBindings.length > 0 ? { localBindings } : {}),
           confidence: "INFERRED"
         });
         continue;
@@ -206,4 +208,166 @@ function isSwiftModuleVisible(decl: Node): boolean {
 function symbolId(file: string, kind: AstSymbolKind, name: string): string {
   const kindLabel = kind.charAt(0).toUpperCase() + kind.slice(1);
   return `${file}#${kindLabel}:${name}`;
+}
+
+/** web-tree-sitter types `namedChildren` as `(Node | null)[]`; drop the holes. */
+function namedChildrenOf(node: Node): Node[] {
+  return node.namedChildren.filter((child): child is Node => child !== null);
+}
+
+const SWIFT_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/u;
+
+function addSwiftName(name: string, names: Set<string>): void {
+  // `_` is the "no internal name" placeholder, not a binding.
+  if (name === "_" || !SWIFT_IDENTIFIER.test(name)) {
+    return;
+  }
+  names.add(name);
+}
+
+/** Every identifier under `node`, skipping type positions such as `Int` in `(work: Int)`. */
+function collectSwiftIdentifiers(node: Node, names: Set<string>): void {
+  if (node.type === "simple_identifier") {
+    addSwiftName(node.text, names);
+    return;
+  }
+  if (node.type === "user_type" || node.type === "type_identifier") {
+    return;
+  }
+  for (const child of namedChildrenOf(node)) {
+    collectSwiftIdentifiers(child, names);
+  }
+}
+
+/**
+ * The names one binding construct introduces.
+ *
+ * Two shapes carry them in this grammar: a `pattern` child that holds the names
+ * directly (`let work`, `let (a, b)`, `for x in`, `catch let x`), and a
+ * `value_binding_pattern` whose *next* sibling is the name (`guard let work`,
+ * `if let work`, `case let work`, and `let work = x`, where that sibling is a
+ * `pattern`).
+ *
+ * A `simple_identifier` that is neither of those is a *use*, not a binding —
+ * `property_declaration` for `let work = pair` holds `pair` as a bare child, and
+ * collecting it would invent a name.
+ */
+function addSwiftBoundNames(scope: Node, names: Set<string>): void {
+  const children = namedChildrenOf(scope);
+  children.forEach((child, index) => {
+    if (child.type !== "value_binding_pattern") {
+      return;
+    }
+    const bound = children[index + 1];
+    if (bound?.type === "simple_identifier") {
+      addSwiftName(bound.text, names);
+    } else if (bound?.type === "pattern") {
+      collectSwiftIdentifiers(bound, names);
+    }
+  });
+  for (const child of children) {
+    if (child.type === "pattern") {
+      collectSwiftIdentifiers(child, names);
+    }
+  }
+}
+
+/**
+ * A parameter binds the *last* identifier in its leading run: an external label
+ * comes first, so `with work: Int` and `_ work: Int` both bind `work`, while
+ * `with: Int` binds `with`. Stopping at the first non-identifier keeps a default
+ * value such as `x: Int = defaultX` from contributing `defaultX`.
+ */
+function addSwiftParameterName(parameter: Node, names: Set<string>): void {
+  let candidate: string | undefined;
+  for (const child of namedChildrenOf(parameter)) {
+    if (child.type !== "simple_identifier") {
+      break;
+    }
+    candidate = child.text;
+  }
+  if (candidate !== undefined) {
+    addSwiftName(candidate, names);
+  }
+}
+
+/**
+ * The names bound by an enclosing scope at `node`, in Swift.
+ *
+ * This is the missing half of the module-wide lookup. `call-resolver` decides
+ * *which module* a bare call belongs to, but only the syntax tree knows whether
+ * the name is a module-level declaration at all: `run(work:) { work() }` calls
+ * its parameter, and a `let work = ...` above the call wins over a sibling
+ * file's `func work()`. Resolving those against the module would fabricate a
+ * cross-file edge, which is worse than missing one, so the names are gathered
+ * here — while the tree is still in hand — and carried on the call site.
+ *
+ * The walk stops at the call's own ancestors, so a binding in an unrelated
+ * function of the same file cannot shadow anything. It deliberately
+ * over-collects inside the scopes it does visit: a binding introduced by an
+ * `if let` reaches the `else` branch it does not cover, and a `where` clause
+ * sees the `case let` it follows. Over-collecting costs a resolution; the
+ * opposite error invents an edge, so the asymmetry is the point.
+ */
+function swiftLocalBindingsAt(node: Node): string[] {
+  const names = new Set<string>();
+  const position = node.startIndex;
+  let current: Node = node;
+  while (current.parent) {
+    const scope = current.parent;
+    switch (scope.type) {
+      case "function_declaration":
+      case "protocol_function_declaration":
+      case "init_declaration":
+      case "deinit_declaration":
+      case "subscript_declaration":
+        for (const child of namedChildrenOf(scope)) {
+          if (child.type === "parameter") {
+            addSwiftParameterName(child, names);
+          }
+        }
+        break;
+      case "lambda_literal":
+        for (const child of namedChildrenOf(scope)) {
+          if (child.type !== "lambda_function_type") {
+            continue;
+          }
+          for (const params of namedChildrenOf(child)) {
+            if (params.type === "lambda_function_type_parameters") {
+              collectSwiftIdentifiers(params, names);
+            }
+          }
+        }
+        break;
+      case "statements":
+        // Only what is declared *before* the call: a later statement, or one in
+        // a nested block, is not in scope at this position.
+        for (const child of namedChildrenOf(scope)) {
+          if (child.startIndex >= position) {
+            continue;
+          }
+          if (child.type === "property_declaration" || child.type === "guard_statement") {
+            addSwiftBoundNames(child, names);
+          }
+        }
+        break;
+      case "switch_entry":
+        for (const child of namedChildrenOf(scope)) {
+          if (child.type === "switch_pattern") {
+            addSwiftBoundNames(child, names);
+          }
+        }
+        break;
+      case "for_statement":
+      case "catch_block":
+      case "if_statement":
+      case "while_statement":
+        addSwiftBoundNames(scope, names);
+        break;
+      default:
+        break;
+    }
+    current = scope;
+  }
+  return [...names];
 }

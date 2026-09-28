@@ -105,7 +105,12 @@ function resolveOneCall(
     // visible without any import, so the same-file and import lookups above
     // cannot be the only ones. INFERRED rather than EXTRACTED because the
     // module boundary itself is read off the directory layout, not the syntax.
-    if (swiftModules) {
+    //
+    // A name bound by an enclosing scope wins over every module-level one, and
+    // the walker reports those bindings per site: `run(work:) { work() }` calls
+    // its parameter, so claiming a sibling file's `func work()` here would
+    // invent an edge. Missing a resolution is the better failure.
+    if (swiftModules && !site.localBindings?.includes(callee)) {
       const moduleSymbol = findSwiftModuleSymbol(swiftModules, site.fromFile, callee, ["function", "class"]);
       if (moduleSymbol) {
         return {
@@ -149,7 +154,11 @@ function resolveOneCall(
   // Swift module. Swift convention capitalises type names, so a receiver that
   // matches a module-local class declaration is a type reference and not a
   // local value — the same heuristic the same-file branch above already uses.
-  if (swiftModules) {
+  //
+  // The heuristic is a convention, not a rule, so it still has to yield to the
+  // scopes that actually bind the name: a parameter or local called `Service`
+  // shadows the type, and the receiver then has nothing to do with this module.
+  if (swiftModules && !site.localBindings?.includes(recv)) {
     const moduleClass = findSwiftModuleSymbol(swiftModules, site.fromFile, recv, ["class"]);
     if (moduleClass) {
       return { ...site, resolvedTargetFile: moduleClass.file, receiver: recv, confidence: "INFERRED" };
