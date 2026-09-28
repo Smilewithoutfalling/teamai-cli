@@ -772,29 +772,16 @@ export async function push(
   // branch/commit/reset never touch the user's active tree. withKnowledgeWorktree
   // hands pushCore a config whose localPath is the worktree's .teamai.
   if (localConfig.repo.kind === 'self') {
-    // A dry run reports the plan and leaves the machine as it found it, so it
-    // skips this whole branch: the sync-lock (whose `acquireLock` creates
-    // `<getDataHome>`, which a fresh self-mode clone has no partition for and
-    // `releaseLock` leaves behind), the `.teamai/.gitignore` self-heal, and the
-    // disposable knowledge worktree (#866). `pushCore` reaches its own dry-run
-    // guard without writing, and the active checkout is the truer preview in
-    // self mode — the worktree is cut from the same commits, and any uncommitted
-    // local edit is exactly what the real push would send.
-    if (options.dryRun) {
-      // The pending-config read is the one part of this branch that is
-      // read-only, and `pushCore` needs it: in self mode it is handed the
-      // uncommitted `teamai.yaml` rather than discovering it. Skipping it would
-      // make the preview under-report the very push it is describing.
-      await pushCore(localConfig, teamConfig, options, await pendingSelfTeamConfig(localConfig), result);
-      return;
-    }
     // Guard self machine-data writes against a concurrent P2 migration relocating
     // the same files. Contend on <getDataHome>/.sync-lock — the exact path
     // migrateSelfA1 takes (for a pre-migration self install that is
     // <repo>/.teamai/.sync-lock). Like git-mode push, error on contention rather
     // than silently skipping (that would drop the user's changes).
+    // Under a dry run `acquireLock` reads the lock's state instead of creating
+    // it (#866), so the preview contends on exactly what a real push would, and
+    // leaves no partition directory behind.
     const selfSyncLock = path.join(getDataHome(localConfig), SYNC_LOCK_FILENAME);
-    if (!(await acquireLock(selfSyncLock))) {
+    if (!(await acquireLock(selfSyncLock, { dryRun: options.dryRun }))) {
       log.error('Another teamai pull/push/migration is in progress for this project. Re-run once it finishes.');
       process.exitCode = 1;
       return;
@@ -803,11 +790,23 @@ export async function push(
       // Self-heal an older .teamai/.gitignore that still ignores `env` (pre-beta.5).
       // Run against the ACTIVE tree (original localConfig, projectRoot intact) BEFORE
       // swapping into the worktree, so the fixed .gitignore lets env changes surface.
-      try {
-        const { migrateSelfModeGitignore } = await import('./init.js');
-        await migrateSelfModeGitignore(localConfig);
-      } catch { /* best-effort */ }
+      // A dry run skips it: it rewrites a tracked file in the user's active tree,
+      // which outlives the preview (#866), and it is idempotent, so the next real
+      // push performs it.
+      if (!options.dryRun) {
+        try {
+          const { migrateSelfModeGitignore } = await import('./init.js');
+          await migrateSelfModeGitignore(localConfig);
+        } catch { /* best-effort */ }
+      }
 
+      // A dry run runs this too, and must: the worktree is not a side effect of
+      // pushing, it is the only source of the CLEAN BASELINE self-mode scanners
+      // compare the active tree against. `env.ts` diffs `projectRoot/.teamai`
+      // against `repo.localPath`, and outside the worktree those are the same
+      // path in self mode — so skipping it makes the preview silently
+      // under-report every edit, rather than merely report it early (#866). It
+      // is disposable: `withKnowledgeWorktree` removes it in a `finally`.
       const { withKnowledgeWorktree, EmptyRepoError } = await import('./utils/reports-branch.js');
       try {
         const pendingTeamConfig = await pendingSelfTeamConfig(localConfig);
@@ -836,7 +835,8 @@ export async function push(
   // A concurrent pull/push would corrupt it. Unlike pull, push must NOT silently
   // skip (that would drop the user's changes), so on contention we error out.
   const syncLock = path.join(getDataHome(localConfig), SYNC_LOCK_FILENAME);
-  const locked = await acquireLock(syncLock);
+  // Read-only acquisition under a dry run, exactly as the self-mode branch above.
+  const locked = await acquireLock(syncLock, { dryRun: options.dryRun });
   if (!locked) {
     log.error('Another teamai pull/push is in progress for this project. Re-run once it finishes.');
     process.exitCode = 1;

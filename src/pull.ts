@@ -1862,15 +1862,14 @@ export async function pull(
     // migrateSelfA1 takes). http has no clone and no machine-data relocation, so it
     // needs no lock.
     if (config.repo.kind === 'http') return true;
-    // A dry run writes nothing for this scope, so it has no reason to hold the
-    // lock — and taking one is itself a write: `acquireLock` creates the lock's
-    // parent directory, which a fresh self-mode clone has no partition for yet,
-    // and `releaseLock` removes the lock file but leaves that directory behind
-    // (#866). Reporting the scope uncontended is exact — nothing was serialized.
-    if (options.dryRun) return true;
     const lock = path.join(getDataHome(config), SYNC_LOCK_FILENAME);
-    if (await acquireLock(lock)) {
-      heldLocks.set(config, lock);
+    // `acquireLock` under a dry run reads the lock's state instead of creating
+    // it — taking one is itself a write (#866) — so the preview answers with
+    // what the real run would have found: a live holder reports this scope as
+    // contended and skips it, exactly as a real pull does. Nothing is recorded
+    // for release, because nothing was taken.
+    if (await acquireLock(lock, { dryRun: options.dryRun })) {
+      if (!options.dryRun) heldLocks.set(config, lock);
       return true;
     }
     // User-visible: this scope is skipped wholesale (no fetch/deploy/reconcile),
