@@ -45,6 +45,7 @@ export async function extractStructuralGraph(
 
   const { repoRoot, files } = options;
   const symbols: StructuralGraphResult["symbols"] = [];
+  const swiftModuleSymbols: StructuralGraphResult["symbols"] = [];
   const imports: StructuralGraphResult["imports"] = [];
   const callSites: StructuralGraphResult["callSites"] = [];
   const implementsSites: AstImplementsSite[] = [];
@@ -74,6 +75,7 @@ export async function extractStructuralGraph(
     }
     filesParsed++;
     symbols.push(...walked.symbols);
+    swiftModuleSymbols.push(...walked.swiftModuleSymbols);
     imports.push(...walked.imports);
     callSites.push(...walked.callSites);
     implementsSites.push(...walked.implementsSites);
@@ -88,8 +90,10 @@ export async function extractStructuralGraph(
 
   // Swift resolves symbols module-wide, not file-wide: two files under the same
   // SwiftPM target see each other with no import statement. Index the module
-  // scopes once so conformance and call resolution can fall back to them.
-  const swiftModules = buildSwiftModuleSymbolIndex(symbols);
+  // scopes once so conformance and call resolution can fall back to them —
+  // over the module-visible declarations only, since a method or a `private`
+  // declaration is not reachable by name from a sibling file.
+  const swiftModules = buildSwiftModuleSymbolIndex(swiftModuleSymbols);
 
   const resolvedImports = new Map<string, Awaited<ReturnType<typeof resolveImportSpecifier>>>();
   const resolvedKeys = new Set<string>();

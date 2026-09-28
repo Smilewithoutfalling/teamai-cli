@@ -32,6 +32,17 @@ describe('Swift module scope', () => {
     expect(swiftModuleScope('Sources\\App\\Models.swift')).toBe('Sources/App');
   });
 
+  it('keeps the package root in the module boundary', () => {
+    // Two packages in one repository can name their targets the same. The scope
+    // has to span the path up to the target, or the two would be one module and
+    // a name in one could resolve into the other.
+    const a = swiftModuleScope('Packages/A/Sources/App/Models.swift');
+    const b = swiftModuleScope('Packages/B/Sources/App/Models.swift');
+    expect(a).toBe('Packages/A/Sources/App');
+    expect(b).toBe('Packages/B/Sources/App');
+    expect(a).not.toBe(b);
+  });
+
   it('refuses to invent a module where the layout states none', () => {
     // No `Sources/` or `Tests/` segment: an arbitrary directory tree says
     // nothing about Swift's module boundary, so no scope is claimed.
@@ -147,5 +158,146 @@ describe('Swift module-scope resolution (web-tree-sitter WASM)', () => {
     const helperCall = result.callSites.find((c) => c.calleeText === 'helper');
     expect(helperCall?.confidence).toBe('EXTRACTED');
     expect(helperCall?.resolvedTargetFile).toBe('Sources/App/All.swift');
+  });
+
+  it('does not resolve a file-scoped declaration from another file', async () => {
+    const { result } = await extractFiles([
+      [
+        'Sources/App/Internal.swift',
+        [
+          'private func hidden() -> Int { return 1 }',
+          'fileprivate func alsoHidden() -> Int { return 2 }',
+          'func visible() -> Int { return 3 }',
+          '',
+        ].join('\n'),
+      ],
+      [
+        'Sources/App/Runner.swift',
+        [
+          'func run() -> Int {',
+          '  let a = hidden()',
+          '  let b = alsoHidden()',
+          '  let c = visible()',
+          '  return a + b + c',
+          '}',
+          '',
+        ].join('\n'),
+      ],
+    ]);
+
+    const calls = new Map(result.callSites.map((c) => [c.calleeText, c]));
+    for (const name of ['hidden', 'alsoHidden', 'visible']) {
+      expect(calls.has(name)).toBe(true);
+    }
+    // Same file, same call shape, same `-> Int` signature: the only variable is
+    // the modifier on the declaration. `private` and `fileprivate` stop at the
+    // file that declares them; the unmodified function is module-wide.
+    expect(calls.get('hidden')?.resolvedTargetFile).toBeUndefined();
+    expect(calls.get('alsoHidden')?.resolvedTargetFile).toBeUndefined();
+    expect(calls.get('visible')?.resolvedTargetFile).toBe('Sources/App/Internal.swift');
+  });
+
+  it('does not resolve a method or a protocol requirement from another file', async () => {
+    const { result } = await extractFiles([
+      [
+        'Sources/App/Service.swift',
+        [
+          'struct Service {',
+          '  func handle() -> Int { return 1 }',
+          '}',
+          '',
+          'protocol Handler {',
+          '  func respond() -> Int',
+          '}',
+          '',
+          'func handled() -> Int { return 2 }',
+          '',
+        ].join('\n'),
+      ],
+      [
+        'Sources/App/Runner.swift',
+        [
+          'func run() -> Int {',
+          '  let a = handle()',
+          '  let b = respond()',
+          '  let c = handled()',
+          '  return a + b + c',
+          '}',
+          '',
+        ].join('\n'),
+      ],
+    ]);
+
+    const calls = new Map(result.callSites.map((c) => [c.calleeText, c]));
+    for (const name of ['handle', 'respond', 'handled']) {
+      expect(calls.has(name)).toBe(true);
+    }
+    // A member is reached through its container, not by a bare name, so only the
+    // top-level function is something a sibling file can call on its own.
+    expect(calls.get('handle')?.resolvedTargetFile).toBeUndefined();
+    expect(calls.get('respond')?.resolvedTargetFile).toBeUndefined();
+    expect(calls.get('handled')?.resolvedTargetFile).toBe('Sources/App/Service.swift');
+  });
+
+  it('does not resolve a type nested inside another file', async () => {
+    const { result } = await extractFiles([
+      [
+        'Sources/App/Outer.swift',
+        [
+          'struct Outer {',
+          '  struct Config {',
+          '    static func make() -> Int { return 1 }',
+          '  }',
+          '}',
+          '',
+          'struct TopLevelConfig {',
+          '  static func make() -> Int { return 2 }',
+          '}',
+          '',
+        ].join('\n'),
+      ],
+      [
+        'Sources/App/Builder.swift',
+        [
+          'func build() -> Int {',
+          '  let a = Config.make()',
+          '  let b = TopLevelConfig.make()',
+          '  return a + b',
+          '}',
+          '',
+        ].join('\n'),
+      ],
+    ]);
+
+    const calls = new Map(result.callSites.map((c) => [c.calleeText, c]));
+    for (const name of ['Config.make', 'TopLevelConfig.make']) {
+      expect(calls.has(name)).toBe(true);
+    }
+    expect(calls.get('Config.make')?.resolvedTargetFile).toBeUndefined();
+    expect(calls.get('TopLevelConfig.make')?.resolvedTargetFile).toBe('Sources/App/Outer.swift');
+  });
+
+  it('does not merge same-named targets of different packages', async () => {
+    const { result } = await extractFiles([
+      ['Packages/A/Sources/App/Proto.swift', 'protocol Shared { }\n'],
+      ['Packages/B/Sources/App/Model.swift', 'struct S: Shared { }\n'],
+    ]);
+
+    // `Packages/A/Sources/App` and `Packages/B/Sources/App` share their last two
+    // segments but are separate modules, so the name stays unresolved.
+    expect(result.edges.filter((e) => e.relation === 'IMPLEMENTS')).toHaveLength(0);
+  });
+
+  it('resolves inside a nested package target', async () => {
+    const { result } = await extractFiles([
+      ['Packages/A/Sources/App/Proto.swift', 'protocol Shared { }\n'],
+      ['Packages/A/Sources/App/Model.swift', 'struct S: Shared { }\n'],
+    ]);
+
+    // The control for the case above: the same layout, one package, so the
+    // conformance must still resolve.
+    const implementsEdges = result.edges.filter((e) => e.relation === 'IMPLEMENTS');
+    expect(implementsEdges).toHaveLength(1);
+    expect(implementsEdges[0]?.to).toBe('Packages/A/Sources/App/Proto.swift');
   });
 });

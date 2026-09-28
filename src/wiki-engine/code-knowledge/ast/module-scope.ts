@@ -4,28 +4,40 @@ import type { AstSymbol, AstSymbolKind } from "./types.js";
  * Swift has no source-level package or module declaration — unlike Go's
  * `package` clause or Python's file-as-module rule, the module boundary is a
  * build-system fact that the AST cannot read. The only layout with a mandated
- * shape is SwiftPM: everything under `Sources/<Target>/` is one module, and
- * everything under `Tests/<Target>/` is another (test targets see the library
- * through `@testable import`, not by being the same module).
+ * shape is SwiftPM: everything under `<package>/Sources/<Target>/` is one
+ * module, and everything under `<package>/Tests/<Target>/` is another (test
+ * targets see the library through `@testable import`, not by being the same
+ * module).
+ *
+ * The key spans the path *up to and including* the target directory, not just
+ * the `Sources/<Target>` tail. One repository can hold several Swift packages
+ * side by side, and `Packages/A/Sources/App` and `Packages/B/Sources/App` are
+ * two different modules that happen to share their last two segments; keying on
+ * the tail alone would merge them and let a name in one package resolve into
+ * the other.
  *
  * Outside that layout this function returns `undefined` on purpose. Guessing a
  * module boundary from an arbitrary directory tree would fabricate edges
  * between files that Swift actually keeps apart, and a wrong edge is worse than
  * a missing one: the missing one still surfaces as a gap.
  */
-const SWIFT_MODULE_DIRECTORY = /(?:^|\/)(Sources|Tests)\/([^/]+)\//u;
-
-/** Module scope key (`Sources/Foo`, `Tests/FooTests`) for a Swift file, if the layout states one. */
 export function swiftModuleScope(relativePath: string): string | undefined {
   const normalized = relativePath.replace(/\\/gu, "/");
   if (!normalized.toLowerCase().endsWith(".swift")) {
     return undefined;
   }
-  const match = SWIFT_MODULE_DIRECTORY.exec(normalized);
-  if (!match) {
-    return undefined;
+  const segments = normalized.split("/");
+  // The loop stops before the last two segments: they have to hold the root
+  // directory and the target directory, so `Sources/App.swift` states no
+  // target and gets no scope.
+  for (let index = 0; index < segments.length - 2; index++) {
+    const segment = segments[index];
+    if (segment !== "Sources" && segment !== "Tests") {
+      continue;
+    }
+    return segments.slice(0, index + 2).join("/");
   }
-  return `${match[1]}/${match[2]}`;
+  return undefined;
 }
 
 export interface SwiftModuleSymbolIndex {
@@ -35,6 +47,17 @@ export interface SwiftModuleSymbolIndex {
   scopeOfFile: Map<string, string>;
 }
 
+/**
+ * Index the declarations that a sibling file can reach by name.
+ *
+ * The caller supplies module-visible declarations only — top-level, and not
+ * `private` / `fileprivate`. Neither fact survives into `AstSymbol`, so it
+ * cannot be re-checked here; handing this function the full symbol list instead
+ * would let a method, a protocol requirement or a file-scoped declaration
+ * resolve from another file, which is exactly the fabricated edge this layer
+ * exists to avoid. `walk.ts` decides it, at the point where the declaration node
+ * is still in hand.
+ */
 export function buildSwiftModuleSymbolIndex(symbols: AstSymbol[]): SwiftModuleSymbolIndex {
   const byModule = new Map<string, AstSymbol[]>();
   const scopeOfFile = new Map<string, string>();
