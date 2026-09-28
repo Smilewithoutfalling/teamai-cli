@@ -31,8 +31,11 @@ vi.mock('../utils/reports-branch.js', async (importOriginal) => ({
 
 import { contribute } from '../contribute.js';
 import { loadLocalConfigForScope } from '../config.js';
+import { pull } from '../pull.js';
+import { push } from '../push.js';
 import { recall } from '../recall.js';
 import { rolesSet } from '../roles-cmd.js';
+import { list, status } from '../status.js';
 import { tagsSubscribe, tagsUnsubscribe } from '../tags.js';
 import { updateReports } from '../utils/reports-branch.js';
 import { log } from '../utils/logger.js';
@@ -235,5 +238,64 @@ describe('--dry-run through the loaders the commands share (#850)', () => {
     const loaded = await loadLocalConfigForScope('user');
     expect(loaded?.primaryRole).toBe('hai');
     expect(fs.readFileSync(configPath, 'utf-8')).toContain('primaryRole: hai');
+  });
+
+  // The command-level half of #850. Each of these reaches the legacy role
+  // migration through a loader it used to call bare, so the fixture's
+  // `config.yaml` gained `primaryRole` even though nothing had asked to write.
+  // `pull`/`push` carry `--dry-run`; `status`/`list` are read-only and pass it
+  // unconditionally (see the note at their `autoDetectInit` call site).
+  //
+  // The positive control is the test directly above: the SAME fixture does gain
+  // `primaryRole` when the flag is absent, so an unchanged tree here is a real
+  // result and not the harness failing to look.
+  const LOAD_ONLY_COMMANDS: Array<[string, () => Promise<void>]> = [
+    ['pull --dry-run', () => pull({ dryRun: true })],
+    ['push --dry-run', () => push({ dryRun: true })],
+    ['status', () => status({})],
+    ['list', () => list(undefined, {})],
+  ];
+
+  it.each(LOAD_ONLY_COMMANDS)('%s migrates nothing it loads (#850)', async (_command, run) => {
+    const { root, configPath } = legacyRoot();
+    const before = snapshotTree(root);
+    const error = await run().then(() => null, (e: unknown) => e);
+    expect(error).toBeNull();
+    expect(snapshotTree(root)).toEqual(before);
+    expect(fs.readFileSync(configPath, 'utf-8')).not.toContain('primaryRole');
+    // A dry run may parse the remote, but nothing else may reach a provider.
+    expect(providerCalls).toEqual([]);
+  });
+
+  /** A git project whose partition still carries its pre-#546 name, i.e. project scope. */
+  function projectRoot(): string {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-dry-run-project-'));
+    roots.push(root);
+    const home = path.join(root, 'home');
+    fs.mkdirSync(path.join(home, '.teamai'), { recursive: true });
+    // An installed agent, so a bootstrap that did run would seed and wire it.
+    fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+    vi.stubEnv('HOME', home);
+    process.chdir(setupLegacyNamedPartition(root));
+    return root;
+  }
+
+  // The project-scope half. These reach the same bare calls through
+  // `detectProjectConfig`, whose dry-run branch is what stops
+  // `adoptLegacyPartition` (a real `fs.rename`) and the self-heal bootstrap.
+  // The issue report located these by code path only; they are run here.
+  const PROJECT_SCOPE_COMMANDS: Array<[string, () => Promise<void>]> = [
+    ['pull --dry-run', () => pull({ dryRun: true })],
+    ['status', () => status({})],
+    ['list', () => list(undefined, {})],
+  ];
+
+  it.each(PROJECT_SCOPE_COMMANDS)('%s adopts no legacy partition on a git project (#850)', async (_command, run) => {
+    const root = projectRoot();
+    const before = snapshotTree(root);
+    const error = await run().then(() => null, (e: unknown) => e);
+    expect(error).toBeNull();
+    expect(snapshotTree(root)).toEqual(before);
+    expect(providerCalls).toEqual([]);
   });
 });

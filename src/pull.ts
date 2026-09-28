@@ -1882,7 +1882,11 @@ export async function pull(
   let projectConfig: LocalConfig | null = null;
   const unreadable: string[] = [];
   try {
-    projectConfig = await detectProjectConfig(undefined, (configPath, error) => { unreadable.push(`${configPath}: ${error}`); });
+    projectConfig = await detectProjectConfig(
+      undefined,
+      (configPath, error) => { unreadable.push(`${configPath}: ${error}`); },
+      { dryRun: options.dryRun },
+    );
   } catch (e) {
     log.warn(`Project-scope detection error: ${(e as Error).message}`);
   }
@@ -1911,7 +1915,7 @@ export async function pull(
     log.info('project scope detected, skipped user scope');
   } else {
     try {
-      const loadedUserConfig = await loadLocalConfigForScope('user');
+      const loadedUserConfig = await loadLocalConfigForScope('user', undefined, { dryRun: options.dryRun });
       if (loadedUserConfig) {
         if (inheritUserScope) {
           inheritedUserConfig = loadedUserConfig;

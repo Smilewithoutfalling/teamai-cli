@@ -728,7 +728,7 @@ export async function push(
   result?: { completed: boolean },
 ): Promise<void> {
   // Auto-detect scope: project scope if cwd has project config, else user scope
-  const { localConfig, teamConfig } = await autoDetectInit();
+  const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: options.dryRun });
   assertNotReadOnly(localConfig, 'teamai push');
 
   // --project is a destination override expressed as a logical project. Each
