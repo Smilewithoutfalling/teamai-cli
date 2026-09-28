@@ -43,6 +43,23 @@ describe('Swift module scope', () => {
     expect(a).not.toBe(b);
   });
 
+  it('takes the innermost marker, so a package vendored under Tests/ keeps its own root', () => {
+    // A repository may vendor whole packages under a directory it already named
+    // `Tests`/`Sources`. The inner marker is those packages' boundary; taking the
+    // outer one would scope `Tests/Fixtures/A/...` and `Tests/Fixtures/B/...` to
+    // the same `Tests/Fixtures` and merge two packages.
+    expect(swiftModuleScope('Tests/Fixtures/A/Sources/App/Models.swift')).toBe('Tests/Fixtures/A/Sources/App');
+    expect(swiftModuleScope('Tests/Fixtures/A/Sources/App/Deep/Models.swift')).toBe('Tests/Fixtures/A/Sources/App');
+    // A directory merely *named* `Tests` inside a target is not a boundary when
+    // it cannot hold a target directory of its own — the file directly under it
+    // leaves the real marker the only candidate.
+    expect(swiftModuleScope('Sources/App/Tests/Helper.swift')).toBe('Sources/App');
+    // The bias this direction buys: a marker this function mistakes for a
+    // package root only ever yields a scope nested INSIDE the true module, so it
+    // under-scopes (loses a resolution) instead of spanning two real modules.
+    expect(swiftModuleScope('Sources/App/Tests/Sub/Helper.swift')).toBe('Sources/App/Tests/Sub');
+  });
+
   it('refuses to invent a module where the layout states none', () => {
     // No `Sources/` or `Tests/` segment: an arbitrary directory tree says
     // nothing about Swift's module boundary, so no scope is claimed.
@@ -299,5 +316,29 @@ describe('Swift module-scope resolution (web-tree-sitter WASM)', () => {
     const implementsEdges = result.edges.filter((e) => e.relation === 'IMPLEMENTS');
     expect(implementsEdges).toHaveLength(1);
     expect(implementsEdges[0]?.to).toBe('Packages/A/Sources/App/Proto.swift');
+  });
+
+  it('does not merge two packages vendored under the same Tests directory', async () => {
+    const { result } = await extractFiles([
+      ['Tests/Fixtures/A/Sources/App/Proto.swift', 'protocol Shared { }\n'],
+      ['Tests/Fixtures/B/Sources/App/Model.swift', 'struct S: Shared { }\n'],
+    ]);
+
+    // Both paths carry an outer `Tests` segment. A scan that took the first
+    // marker would scope both to `Tests/Fixtures` — the same merge the package
+    // root fix rules out one level down, just reached through the outer package.
+    expect(result.edges.filter((e) => e.relation === 'IMPLEMENTS')).toHaveLength(0);
+  });
+
+  it('resolves inside a package vendored under a Tests directory', async () => {
+    const { result } = await extractFiles([
+      ['Tests/Fixtures/A/Sources/App/Proto.swift', 'protocol Shared { }\n'],
+      ['Tests/Fixtures/A/Sources/App/Model.swift', 'struct S: Shared { }\n'],
+    ]);
+
+    // The control for the case above: the same layout, one fixture package.
+    const implementsEdges = result.edges.filter((e) => e.relation === 'IMPLEMENTS');
+    expect(implementsEdges).toHaveLength(1);
+    expect(implementsEdges[0]?.to).toBe('Tests/Fixtures/A/Sources/App/Proto.swift');
   });
 });

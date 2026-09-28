@@ -16,6 +16,12 @@ import type { AstSymbol, AstSymbolKind } from "./types.js";
  * the tail alone would merge them and let a name in one package resolve into
  * the other.
  *
+ * The marker that counts is the *innermost* one, because a package can also be
+ * nested under a directory the outer package already named `Sources` or `Tests`:
+ * `Tests/Fixtures/A/Sources/App` is package A's target `App`, not a target of the
+ * outer package. Derived from the path shape alone, this is still an inference,
+ * so the scan is deliberately biased towards under-scoping — see the loop below.
+ *
  * Outside that layout this function returns `undefined` on purpose. Guessing a
  * module boundary from an arbitrary directory tree would fabricate edges
  * between files that Swift actually keeps apart, and a wrong edge is worse than
@@ -27,10 +33,22 @@ export function swiftModuleScope(relativePath: string): string | undefined {
     return undefined;
   }
   const segments = normalized.split("/");
-  // The loop stops before the last two segments: they have to hold the root
-  // directory and the target directory, so `Sources/App.swift` states no
-  // target and gets no scope.
-  for (let index = 0; index < segments.length - 2; index++) {
+  // The innermost marker wins, so the scan runs from the end. A repository may
+  // vendor whole packages beneath a directory of its own named `Tests` or
+  // `Sources` — `Tests/Fixtures/A/Sources/App` and `Tests/Fixtures/B/Sources/App`
+  // are two packages that share an outer `Tests` segment, and taking the first
+  // marker would scope both to `Tests/Fixtures` and merge them.
+  //
+  // The direction also decides how a layout this function misreads can fail.
+  // An inner marker can only ever yield a scope nested *inside* the true module,
+  // which loses a resolution; an outer one can span two real modules, which
+  // fabricates an edge. Missing beats wrong here for the same reason it does
+  // everywhere else in this layer.
+  //
+  // The loop stops before the last two segments: they have to hold the marker
+  // and the target directory, so `Sources/App.swift` states no target and gets
+  // no scope.
+  for (let index = segments.length - 3; index >= 0; index--) {
     const segment = segments[index];
     if (segment !== "Sources" && segment !== "Tests") {
       continue;
