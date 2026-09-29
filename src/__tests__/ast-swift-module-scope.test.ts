@@ -575,4 +575,47 @@ describe('Swift module-scope resolution yields to enclosing bindings', () => {
     expect(references[0]?.from).toBe('Sources/App/Use.swift');
     expect(references[0]?.to).toBe('Sources/App/Factory.swift');
   });
+
+  it('does not let an argument mention stand in for a binding', async () => {
+    const { result } = await extractFiles([
+      ['Sources/App/Worker.swift', 'func work() -> Int { return 1 }\n'],
+      ['Sources/App/Run.swift', 'func run() {\n  consume(work)\n  work()\n}\n'],
+    ]);
+
+    // Passing a function along is a *use* of its name. Counting that mention as
+    // a binding suppresses the call on the next line, and the edge it should
+    // have carried disappears. The mention may sit on either side of the call.
+    const references = result.edges.filter((e) => e.relation === 'REFERENCES');
+    expect(references).toHaveLength(1);
+    expect(references[0]?.from).toBe('Sources/App/Run.swift');
+    expect(references[0]?.to).toBe('Sources/App/Worker.swift');
+  });
+
+  it('resolves a call that passes its own name', async () => {
+    const { result } = await extractFiles([
+      ['Sources/App/Worker.swift', 'func work() -> Int { return 1 }\n'],
+      ['Sources/App/Run.swift', 'func run() {\n  work(work)\n}\n'],
+    ]);
+
+    // The declaration binds `work` nowhere, so both the callee and the argument
+    // refer to the sibling function. Reading the declaration whole made the
+    // argument the evidence that suppressed the callee -- the same mention, and
+    // the same call.
+    const references = result.edges.filter((e) => e.relation === 'REFERENCES');
+    expect(references).toHaveLength(1);
+    expect(references[0]?.from).toBe('Sources/App/Run.swift');
+    expect(references[0]?.to).toBe('Sources/App/Worker.swift');
+  });
+
+  it('still shadows a call whose name a closure parameter binds', async () => {
+    const { result } = await extractFiles([
+      ['Sources/App/Worker.swift', 'func work() -> Int { return 1 }\n'],
+      ['Sources/App/Run.swift', 'func run() {\n  consume({ work in work() })\n}\n'],
+    ]);
+
+    // A closure handed over as an argument opens its own scope: the argument
+    // marker must be cleared on the way in, or the parameter stops counting and
+    // the inner call resolves to the sibling function it does not mean.
+    expect(result.edges.filter((e) => e.relation === 'REFERENCES')).toHaveLength(0);
+  });
 });

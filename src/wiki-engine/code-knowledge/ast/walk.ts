@@ -263,9 +263,15 @@ function addSwiftName(name: string, names: Set<string>): void {
  * resolution; the opposite error invents an edge, and that asymmetry is the
  * point.
  */
-function collectSwiftShadowedNames(node: Node, names: Set<string>): void {
+function collectSwiftShadowedNames(node: Node, names: Set<string>, insideArgument = false): void {
   if (node.type === "simple_identifier" || node.type === "type_identifier") {
-    addSwiftName(node.text, names);
+    // An argument is an expression position: `consume(work)` mentions `work`, it
+    // does not bind it. Counting the mention suppresses the resolution of every
+    // `work()` in the declaration — including the call that passes its own name,
+    // `work(work)`, whose callee is the very thing the argument names.
+    if (!insideArgument) {
+      addSwiftName(node.text, names);
+    }
     return;
   }
   // A type position such as `Int` in `(work: Int)` names a type, not a value;
@@ -285,12 +291,17 @@ function collectSwiftShadowedNames(node: Node, names: Set<string>): void {
       if (child.type === "navigation_expression" || child.type === "simple_identifier") {
         continue;
       }
-      collectSwiftShadowedNames(child, names);
+      collectSwiftShadowedNames(child, names, insideArgument);
     }
     return;
   }
+  // A closure opens a scope, so its parameters and captures bind for real however
+  // the closure itself was reached — including as an argument — and the argument
+  // marker is cleared on the way in. Everything else keeps the marker it was
+  // given.
+  const childInsideArgument = node.type === "lambda_literal" ? false : insideArgument || node.type === "value_arguments";
   for (const child of namedChildrenOf(node)) {
-    collectSwiftShadowedNames(child, names);
+    collectSwiftShadowedNames(child, names, childInsideArgument);
   }
 }
 
@@ -304,11 +315,15 @@ function collectSwiftShadowedNames(node: Node, names: Set<string>): void {
  * walk per call. The per-call version made a function holding N calls cost
  * O(N²) AST visits.
  *
- * The set is a shade coarser than the per-call walk: a name occurring *only*
- * inside the call — an argument, a closure body — now counts as well. That costs
- * nothing where the field is consumed, because the resolver asks about the callee
- * and the receiver, and callee positions are skipped below: a name can only reach
- * this set through a position that is not the very call it would resolve.
+ * Read whole, the declaration no longer excludes the call's own subtree, and
+ * that side effect mattered: a name appearing only in the call's own arguments
+ * used to be invisible, so `work(work)` still resolved through its callee.
+ * Marking argument positions restores that — and goes one step further, since a
+ * mention in a *sibling* call (`consume(work)` before a bare `work()`) was
+ * counted as a binding by the older version as well. An argument is an
+ * expression position: it can mention a name, never bind one. A closure reached
+ * through an argument still opens its own scope, so its parameters and captures
+ * are collected.
  *
  * Keyed by `startIndex`: top-level declarations do not overlap, and tree-sitter
  * hands out a fresh wrapper on every navigation, so node identity is not
