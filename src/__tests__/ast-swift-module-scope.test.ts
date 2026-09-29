@@ -510,4 +510,69 @@ describe('Swift module-scope resolution yields to enclosing bindings', () => {
     // the parameter and lets the sibling `func π()` win the fallback.
     expect(result.edges.filter((e) => e.relation === 'REFERENCES')).toHaveLength(0);
   });
+
+  it('recognises a binding whose name has to be escaped', async () => {
+    const { result } = await extractFiles([
+      ['Sources/App/Worker.swift', 'func `repeat`() -> Int { return 1 }\n'],
+      ['Sources/App/Shadowed.swift', 'func shadowed(`repeat`: () -> Int) -> Int {\n  return `repeat`()\n}\n'],
+      ['Sources/App/Plain.swift', 'func plain() -> Int {\n  return `repeat`()\n}\n'],
+    ]);
+
+    // A name that collides with a keyword is written between backticks, and the
+    // grammar reports it that way on both sides — the declaration and the call
+    // carry the same token, so leaving the escaped form out of the set is the
+    // only thing that breaks the pair.
+    const references = result.edges.filter((e) => e.relation === 'REFERENCES');
+    expect(references).toHaveLength(1);
+    expect(references[0]?.from).toBe('Sources/App/Plain.swift');
+    expect(references[0]?.to).toBe('Sources/App/Worker.swift');
+  });
+
+  it('recognises a binding whose name is a symbol', async () => {
+    // U+1F680, written as an escape so the case stays readable in an editor.
+    const rocket = '\u{1F680}';
+    const { result } = await extractFiles([
+      ['Sources/App/Worker.swift', `func ${rocket}() -> Int { return 1 }\n`],
+      ['Sources/App/Shadowed.swift', `func shadowed(${rocket}: () -> Int) -> Int {\n  return ${rocket}()\n}\n`],
+      ['Sources/App/Plain.swift', `func plain() -> Int {\n  return ${rocket}()\n}\n`],
+    ]);
+
+    // Swift admits symbol names, emoji included. A class built out of Unicode
+    // *letters* still excludes every one of them.
+    const references = result.edges.filter((e) => e.relation === 'REFERENCES');
+    expect(references).toHaveLength(1);
+    expect(references[0]?.from).toBe('Sources/App/Plain.swift');
+    expect(references[0]?.to).toBe('Sources/App/Worker.swift');
+  });
+
+  it('resolves every call of a declaration that binds the name nowhere', async () => {
+    const body = Array.from({ length: 12 }, () => '  work()').join('\n');
+    const { result } = await extractFiles([
+      ['Sources/App/Worker.swift', 'func work() -> Int { return 1 }\n'],
+      ['Sources/App/Many.swift', `func run() -> Int {\n${body}\n  return 0\n}\n`],
+    ]);
+
+    // The shadowing set is read off the declaration once and handed to every
+    // call inside it. Nothing binds `work` here, so all twelve calls resolve --
+    // a set looked up for the wrong declaration, or emptied after the first
+    // call, would show up as a shortfall rather than as a wrong edge.
+    const references = result.edges.filter((e) => e.relation === 'REFERENCES');
+    expect(references).toHaveLength(12);
+    for (const reference of references) expect(reference.to).toBe('Sources/App/Worker.swift');
+  });
+
+  it('does not let a type position stand in for a binding', async () => {
+    const { result } = await extractFiles([
+      ['Sources/App/Factory.swift', 'func Logger() -> Int { return 1 }\n'],
+      ['Sources/App/Use.swift', 'func run(logger: Logger) -> Int {\n  return Logger()\n}\n'],
+    ]);
+
+    // `Logger` in the parameter list is a *type*, and only a value binding can
+    // shadow a call. Counting the type position would suppress the resolution
+    // and drop the edge to the sibling function that actually answers for it.
+    const references = result.edges.filter((e) => e.relation === 'REFERENCES');
+    expect(references).toHaveLength(1);
+    expect(references[0]?.from).toBe('Sources/App/Use.swift');
+    expect(references[0]?.to).toBe('Sources/App/Factory.swift');
+  });
 });

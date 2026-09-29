@@ -70,6 +70,10 @@ export function walkFile(file: CodeCollectedFile): FileWalkResult {
   try {
     const query = getQuery(variant);
     const exportLineStarts = collectExportLineStarts(variant, tree.rootNode);
+    // One traversal per file, shared by every call site below: doing this per
+    // call would re-walk the enclosing declaration once for each of its calls.
+    const swiftShadowedNames =
+      variant === "swift" ? buildSwiftShadowedNames(tree.rootNode) : undefined;
 
     for (const match of query.matches(tree.rootNode)) {
       const byName = new Map(match.captures.map((c) => [c.name, c.node]));
@@ -129,7 +133,8 @@ export function walkFile(file: CodeCollectedFile): FileWalkResult {
         const receiver = byName.get("call.receiver")?.text;
         const member = byName.get("call.member")?.text;
         const calleeText = callee ?? (receiver && member ? `${receiver}.${member}` : callNode.text);
-        const localBindings = variant === "swift" ? swiftLocalBindingsAt(callNode) : [];
+        const localBindings =
+          swiftShadowedNames === undefined ? [] : swiftShadowedNamesAt(callNode, swiftShadowedNames);
         callSites.push({
           fromFile: file.relativePath,
           line,
@@ -215,21 +220,25 @@ function namedChildrenOf(node: Node): Node[] {
   return node.namedChildren.filter((child): child is Node => child !== null);
 }
 
-// Swift identifiers admit any Unicode letter, so an ASCII-only class would drop
-// a parameter named `π` and let a sibling `func π()` win the fallback.
-const SWIFT_IDENTIFIER = /^[\p{L}_][\p{L}\p{N}_]*$/u;
-
 function addSwiftName(name: string, names: Set<string>): void {
-  // `_` is the "no internal name" placeholder, not a binding.
-  if (name === "_" || !SWIFT_IDENTIFIER.test(name)) {
-    return;
+  // `_` is the "no internal name" placeholder, not a binding. Nothing else is
+  // tested here: every caller passes the text of a `simple_identifier` or a
+  // `type_identifier`, which is the grammar's own verdict that the token is a
+  // name, so there is no shape left to check. The character class that used to
+  // guard this was the defect — widened to Unicode letters it still dropped
+  // escaped identifiers such as `` `repeat` `` (which Swift requires when a name
+  // collides with a keyword) and symbol or emoji names, so a parameter with such
+  // a name never reached `localBindings` and a same-named sibling function won
+  // the fallback.
+  if (name !== "_") {
+    names.add(name);
   }
-  names.add(name);
 }
 
 
 /**
- * The names that stop `node`'s callee from resolving through Swift module scope.
+ * The names in one top-level declaration that stop a call inside it from
+ * resolving through Swift module scope.
  *
  * `call-resolver` decides *which module* a bare call belongs to, but only the
  * syntax tree knows whether the callee is genuinely a module-level declaration:
@@ -239,92 +248,97 @@ function addSwiftName(name: string, names: Set<string>): void {
  * names are gathered here — while the tree is still in hand — and carried on the
  * call site.
  *
- * The scopes that can shadow the name are the call's own ancestors, which is a
- * closed set: nothing binds a name without appearing somewhere on that chain.
- * What changed is that no code enumerates *kinds* of scope any more. The earlier
- * version switched on `scope.type` and pulled named fields out of the handful of
- * node types it recognised, while the doc comment above it promised to
- * over-collect. That promise only ever held "inside the scopes it does visit",
- * so every binding form the switch did not know — an instance property, a
- * generic parameter, a closure capture list, `if let` without `else`, `catch
- * let`, `case let` — stayed a live bug, and there was always one more. Reading
- * whole scopes instead of their recognised fields closes that door: every way of
- * introducing a name puts the name in the tree.
+ * The question asked is deliberately *closed*: does the name occur anywhere else
+ * in this declaration? Every construct that can introduce a name — a parameter, a
+ * local `let`, `if let`, `guard let`, `for … in`, `catch let`, `case let`, a
+ * stored property, a generic parameter, a closure capture list — puts that name
+ * somewhere else in the declaration, whether or not this walk understands the
+ * construct. Enumerating the constructs instead is precisely what makes a
+ * whitelist the defect: there is always one more binding form, and that was the
+ * shape of every review round this file has had.
  *
  * The cost is paid on the other side, deliberately. A name that merely *appears*
- * in an enclosing scope — a nested function's local, a value passed around
- * rather than bound — suppresses the resolution too. Over-suppressing costs a
+ * in the declaration — a value passed around rather than bound, a sibling
+ * statement's local — suppresses the resolution too. Over-suppressing costs a
  * resolution; the opposite error invents an edge, and that asymmetry is the
  * point.
  */
-function swiftLocalBindingsAt(node: Node): string[] {
-  const names = new Set<string>();
-  const call = enclosingCallExpression(node);
-  const start = call.startIndex;
-  const end = call.endIndex;
-
-  const collect = (current: Node): void => {
-    // The call is not evidence about itself: `work()` contains `work`, and
-    // counting that occurrence would suppress every cross-file resolution.
-    if (current.startIndex >= start && current.endIndex <= end) {
-      return;
-    }
-    if (current.type === "simple_identifier" || current.type === "type_identifier") {
-      addSwiftName(current.text, names);
-      return;
-    }
-    // A type position such as `Int` in `(work: Int)` names a type, not a value;
-    // collecting it would shadow every call to a same-named function. A generic
-    // parameter is a `type_identifier` too, but it never sits under `user_type`,
-    // so it still lands in the set.
-    if (current.type === "user_type") {
-      return;
-    }
-    // The name a *call* goes through is a use, not a binding. Without this,
-    // `work(); work()` has each call count the other one's identifier as
-    // evidence, and both cross-file resolutions are suppressed. Arguments are
-    // still walked, so a closure that does bind a name — `handler { work in
-    // work() }` — keeps counting.
-    if (current.type === "call_expression") {
-      for (const child of namedChildrenOf(current)) {
-        if (child.type === "navigation_expression" || child.type === "simple_identifier") {
-          continue;
-        }
-        collect(child);
-      }
-      return;
-    }
-    for (const child of namedChildrenOf(current)) {
-      collect(child);
-    }
-  };
-
-  // Up to but not including the file: the module level is what the fallback
-  // resolves *against*, so it cannot also be what shadows the name.
-  let scope: Node | null = call.parent;
-  while (scope && scope.type !== "source_file") {
-    collect(scope);
-    scope = scope.parent;
+function collectSwiftShadowedNames(node: Node, names: Set<string>): void {
+  if (node.type === "simple_identifier" || node.type === "type_identifier") {
+    addSwiftName(node.text, names);
+    return;
   }
-
-  return [...names];
+  // A type position such as `Int` in `(work: Int)` names a type, not a value;
+  // collecting it would shadow every call to a same-named function. A generic
+  // parameter is a `type_identifier` too, but it never sits under `user_type`,
+  // so it still lands in the set.
+  if (node.type === "user_type") {
+    return;
+  }
+  // The name a *call* goes through is a use, not a binding. Without this,
+  // `work(); work()` has each call count the other one's identifier as evidence,
+  // and both cross-file resolutions are suppressed. Arguments are still walked,
+  // so a closure that does bind a name — `handler { work in work() }` — keeps
+  // counting.
+  if (node.type === "call_expression") {
+    for (const child of namedChildrenOf(node)) {
+      if (child.type === "navigation_expression" || child.type === "simple_identifier") {
+        continue;
+      }
+      collectSwiftShadowedNames(child, names);
+    }
+    return;
+  }
+  for (const child of namedChildrenOf(node)) {
+    collectSwiftShadowedNames(child, names);
+  }
 }
 
 /**
- * The `call_expression` a captured node belongs to.
+ * The shadowing names of every top-level declaration in a file.
  *
- * The Swift query binds `@call.member` twice — once to the outer
- * `call_expression`, once to the `simple_identifier` in its `navigation_suffix`.
- * A capture map keyed by name keeps the last one, so the node handed to
- * `swiftLocalBindingsAt` is often just the member identifier (`make` in
- * `Service.make()`) rather than the whole call. Walking up is what makes the
- * "inside the call" test exact: excluding only the identifier would leave the
- * receiver (`Service`) looking like an ordinary mention of the name.
+ * Built once per file, not once per call. The ancestors a call could be shadowed
+ * by are the scopes between it and the file, and their union is exactly the
+ * top-level declaration that holds the call — so reading that declaration whole
+ * yields the same names, at one traversal per declaration instead of a subtree
+ * walk per call. The per-call version made a function holding N calls cost
+ * O(N²) AST visits.
+ *
+ * The set is a shade coarser than the per-call walk: a name occurring *only*
+ * inside the call — an argument, a closure body — now counts as well. That costs
+ * nothing where the field is consumed, because the resolver asks about the callee
+ * and the receiver, and callee positions are skipped below: a name can only reach
+ * this set through a position that is not the very call it would resolve.
+ *
+ * Keyed by `startIndex`: top-level declarations do not overlap, and tree-sitter
+ * hands out a fresh wrapper on every navigation, so node identity is not
+ * something a `Map` can be built on.
  */
-function enclosingCallExpression(node: Node): Node {
-  let current: Node = node;
-  while (current.type !== "call_expression" && current.parent) {
-    current = current.parent;
+function buildSwiftShadowedNames(root: Node): Map<number, string[]> {
+  const byDeclaration = new Map<number, string[]>();
+  for (const declaration of namedChildrenOf(root)) {
+    const names = new Set<string>();
+    collectSwiftShadowedNames(declaration, names);
+    byDeclaration.set(declaration.startIndex, [...names]);
   }
-  return current;
+  return byDeclaration;
+}
+
+/**
+ * The shadowing names for one call site, read off the map built above.
+ *
+ * The scope that can shadow the name is the top-level declaration holding the
+ * call: it is the outermost ancestor below the file, and the file's own module
+ * level is what the fallback resolves *against*, so it cannot also be what
+ * shadows the name. A call that *is* a top-level statement has no such
+ * declaration above it, and the map holds only its own bare callee — which is
+ * skipped as a callee position, leaving the empty set the per-call walk
+ * produced.
+ */
+function swiftShadowedNamesAt(node: Node, byDeclaration: Map<number, string[]>): string[] {
+  let scope: Node = node;
+  while (scope.parent && scope.parent.type !== "source_file") {
+    scope = scope.parent;
+  }
+  return byDeclaration.get(scope.startIndex) ?? [];
 }
