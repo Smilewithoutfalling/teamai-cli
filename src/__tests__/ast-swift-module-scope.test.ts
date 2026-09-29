@@ -485,4 +485,29 @@ describe('Swift module-scope resolution yields to enclosing bindings', () => {
     // parameter list is empty, which is all the old collector inspected.
     expect(result.edges.filter((e) => e.relation === 'REFERENCES')).toHaveLength(0);
   });
+
+  it('does not let one call stand in for another in the same body', async () => {
+    const { result } = await extractFiles([
+      ['Sources/App/Worker.swift', 'func work() -> Int { return 1 }\n'],
+      ['Sources/App/Twice.swift', 'func run() -> Int {\n  work()\n  work()\n  return 0\n}\n'],
+    ]);
+
+    // Neither call binds `work`; each one only *uses* it. Counting the other
+    // call's identifier as evidence would suppress both, so the over-collection
+    // this rule accepts has a floor: a call's own name sits below it.
+    const references = result.edges.filter((e) => e.relation === 'REFERENCES');
+    expect(references).toHaveLength(2);
+    for (const reference of references) expect(reference.to).toBe('Sources/App/Worker.swift');
+  });
+
+  it('recognises a binding whose name is not ASCII', async () => {
+    const { result } = await extractFiles([
+      ['Sources/App/Pi.swift', 'func π() -> Int { return 1 }\n'],
+      ['Sources/App/Runner.swift', 'func run(π: () -> Int) -> Int {\n  return π()\n}\n'],
+    ]);
+
+    // Swift identifiers are not ASCII. A class that only admits [A-Za-z] drops
+    // the parameter and lets the sibling `func π()` win the fallback.
+    expect(result.edges.filter((e) => e.relation === 'REFERENCES')).toHaveLength(0);
+  });
 });

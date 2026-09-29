@@ -215,7 +215,9 @@ function namedChildrenOf(node: Node): Node[] {
   return node.namedChildren.filter((child): child is Node => child !== null);
 }
 
-const SWIFT_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/u;
+// Swift identifiers admit any Unicode letter, so an ASCII-only class would drop
+// a parameter named `π` and let a sibling `func π()` win the fallback.
+const SWIFT_IDENTIFIER = /^[\p{L}_][\p{L}\p{N}_]*$/u;
 
 function addSwiftName(name: string, names: Set<string>): void {
   // `_` is the "no internal name" placeholder, not a binding.
@@ -276,6 +278,20 @@ function swiftLocalBindingsAt(node: Node): string[] {
     // parameter is a `type_identifier` too, but it never sits under `user_type`,
     // so it still lands in the set.
     if (current.type === "user_type") {
+      return;
+    }
+    // The name a *call* goes through is a use, not a binding. Without this,
+    // `work(); work()` has each call count the other one's identifier as
+    // evidence, and both cross-file resolutions are suppressed. Arguments are
+    // still walked, so a closure that does bind a name — `handler { work in
+    // work() }` — keeps counting.
+    if (current.type === "call_expression") {
+      for (const child of namedChildrenOf(current)) {
+        if (child.type === "navigation_expression" || child.type === "simple_identifier") {
+          continue;
+        }
+        collect(child);
+      }
       return;
     }
     for (const child of namedChildrenOf(current)) {
