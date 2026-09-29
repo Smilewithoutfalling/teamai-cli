@@ -915,7 +915,7 @@ const sessionCmd = program
 sessionCmd
   .command('save')
   .description('Record a privacy-scrubbed summary of a coding session to a local monthly log')
-  .option('--session-id <id>', 'Session to record (default: most recent, or $CLAUDE_SESSION_ID)')
+  .option('--session-id <id>', 'Session to record (default: the agent\'s session, e.g. $CLAUDE_CODE_SESSION_ID, or the most recent)')
   .option('--push', 'Also push the summary to the team repo (feeds `teamai digest`)')
   .option('--force', 'Push even if the session is not flagged as valuable')
   .option('--include-prompt', 'Include the redacted first-prompt line in the pushed summary (default: off)')
@@ -1271,9 +1271,9 @@ recallCmd
     if (cmdOpts.confidenceWriteback) {
       const { computeAllConfidence, writeBackConfidence } = await import('./maintenance/index.js');
       const map = await computeAllConfidence(votesDir);
-      const updated = await writeBackConfidence(learningsReadDirs, map, learningsWriteDir);
-      if (updated > 0) {
-        await publishMaintenance(localConfig, `[teamai] Update confidence for ${updated} learning(s)`);
+      const written = await writeBackConfidence(learningsReadDirs, map, learningsWriteDir);
+      if (written.length > 0) {
+        await publishMaintenance(localConfig, `[teamai] Update confidence for ${written.length} learning(s)`, written);
       }
       return;
     }
@@ -1301,6 +1301,7 @@ recallCmd
         await publishMaintenance(
           localConfig,
           `[teamai] Prune ${pruned.archived + pruned.removed} learning(s)`,
+          pruned.changed,
         );
       }
       return;
@@ -1375,13 +1376,13 @@ recallCmd
       return;
     }
 
-    await executePromotion(candidate, repoPath, {
+    const { marked } = await executePromotion(candidate, repoPath, {
       category: cmdOpts.category as 'skills' | 'rules' | 'docs' | undefined,
       dryRun: cmdOpts.dryRun,
       learningsWriteDir,
     });
-    if (!cmdOpts.dryRun) {
-      await publishMaintenance(localConfig, `[teamai] Mark ${candidate.docId} as promoted`);
+    if (marked) {
+      await publishMaintenance(localConfig, `[teamai] Mark ${candidate.docId} as promoted`, [marked]);
     }
   });
 
@@ -1412,14 +1413,14 @@ async function maintenancePathsOrExit(localConfig: LocalConfig): Promise<Mainten
 }
 
 /**
- * Publish what a maintenance command just changed in the learnings worktree.
- * Best-effort: the change is already on disk, so a failure to publish is worth
+ * Publish the files a maintenance command just changed in the learnings
+ * worktree, and nothing else there. Best-effort: the change is already on disk, so a failure to publish is worth
  * reporting but never worth failing the command over.
  */
-async function publishMaintenance(localConfig: LocalConfig, message: string): Promise<void> {
+async function publishMaintenance(localConfig: LocalConfig, message: string, changed: readonly string[]): Promise<void> {
   const { publishLearningsMaintenance } = await import('./utils/learnings-publish.js');
   const { log } = await import('./utils/logger.js');
-  const result = await publishLearningsMaintenance(localConfig, message);
+  const result = await publishLearningsMaintenance(localConfig, message, changed);
   if (result.status === 'published') {
     log.success('Published maintenance changes to the learnings branch');
   } else if (result.status === 'failed') {

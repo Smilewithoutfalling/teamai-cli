@@ -66,7 +66,18 @@ resets nothing, since a checkout recorded at an older revision already misses
 the fast path. `push` needs that entry too: before scanning, it syncs each rule
 and skill the member never edited, and "never edited" means equal to the
 version at a revision *this* checkout synced, not the shared `lastPullRev`
-another checkout may have moved (#812). A placed agent, which push does not
+another checkout may have moved (#812). Cursor and Copilot rules compare bodies
+against those revisions, ignoring derived frontmatter, and render refreshed
+copies in the tool's native format. Rule sync uses the same tool root as the
+scanner, including `COPILOT_HOME` for user-scope Copilot instructions.
+It checks `isAgentExcluded` before installation detection, so retained tool
+directories do not authorize writes to rules excluded by the local configuration.
+For Copilot updates that only change `paths`, it compares the entire local file
+with the rendered recorded versions before refreshing `applyTo`, preserving
+locally edited headers rather than overwriting them on a body match alone.
+Each copy it writes, in any format, is recorded in the checkout's `delivered`
+(#822), so the next pull does not keep it as the member's edit.
+A placed agent, which push does not
 sync, is held when the team file has changed since any of those revisions, or
 since it was added if one of them predates it (#823). That sync brings the
 unedited copies up
@@ -453,7 +464,7 @@ Upgrading from the per-checkout layout:
   migrated still says `kind: self`, and its queue would publish to the new
   repository. It is set aside instead, as a mode switch does (below), to
   `pending-learnings.self` beside the partition queue, with a warning naming
-  it; `contribute` and `import --from-mr` take the same step before they queue.
+  it.
   A queue with no `config.yaml` beside it is one an older self install left
   after its config had moved to the partition; once the project serves another
   install no plan covers it, so every migrating command sets it aside the same
@@ -518,7 +529,31 @@ Upgrading from the per-checkout layout:
   linked worktree works with no pull first. One with uncommitted changes stays:
   the side-branch step fails with an error naming the path and the next step
   (commit or move the changes, or delete the path by hand), and the queue keeps
-  the learnings until then. The error is also printed as a warning, because
+  the learnings until then. What `import --from-mr` in 0.25.0 to 0.26.0-beta.3 left there is not
+  such a change (#823 item 7): it wrote `learnings/<YYYY-MM-DD>-<title>.md` with
+  `source_mr` in the frontmatter and never committed it. `publishQueuedLearnings`
+  first finds the branch's one registered checkout (`git worktree list` of the
+  owning repo, so the shared one or the old `.teamai/<dirname>`, never another
+  repository's), and queues each untracked file of exactly that shape, directly
+  under `learnings/`, into the active namespace with `contribute`'s name, then
+  deletes the original. A file the branch (any namespace) or the queue
+  already has, by `source_mr` or by content, is deleted without queueing. The
+  branch is the tree of `origin/teamai-learnings`, fetched first, never the
+  checkout's tracked files: the old checkout is never synced again, so it may
+  miss a teammate's later import of the same MR, or still track one origin has
+  since deleted (#823 item 21). When that fetch fails, every such file stays where it is
+  until a run can fetch, so a stale ref never queues a duplicate; when
+  `git ls-remote` shows origin has no such branch (an offline first publish
+  never pushed it), origin adds nothing and the files are queued. A file of
+  that shape that cannot be read is skipped, never holding back the rest. The
+  queue is read under the queue lock, and only while the data home's config
+  still names the install the command loaded (`readPendingForInstall`, the
+  check `listPendingForInstall` makes): after `init` switched the project to
+  another team repository the queue holds that install's learnings, so while it
+  does, or while the lock stays busy, every such file stays where it is. It runs only under the sync lock, before the queue is listed,
+  and never on a dry run, which publishes nothing from the queue either and
+  `pull` reports as `Would publish N queued learning(s)` (#823 item 20); any
+  other file in the checkout is left alone. The error is also printed as a warning, because
   several callers treat a side-branch failure as non-fatal and log it at debug
   only; a silent (hook) run prints nothing. `refresh` does not swallow it:
   `recall maintenance` and `recall promote` stop with exit code 1 and write
@@ -535,7 +570,10 @@ Upgrading from the per-checkout layout:
   reader (`members`, `projects members`, `digest`, `pull`, `stats` and `viz`,
   through `readableReportsWorktree`) uses the local copy and never ensures it,
   after the same ownership probe as `indexableVotesDir` (below): another
-  repository's copy is refused with `ForeignCheckoutError`. The
+  repository's copy is refused with `ForeignCheckoutError`. A refresh that
+  failed is tried once more, under the lock, and a second failure throws its
+  cause: a reader never creates the checkout without the lock, which a writer
+  that took it meanwhile may be creating (#823 item 15). The
   checkout there may be another repository's, or not created yet, so
   `recall maintenance` and `recall promote` stop with exit code 1 and write
   nothing when either the reports lock (they rank by its votes) or the
@@ -595,6 +633,18 @@ exists but cannot be read names no owner: the loaders return null for it as for
 a fresh install, so `init` checks for the file, and with learnings queued moves
 them to `pending-learnings.unknown` the same way, the warning naming that config;
 queued or not, it drops the search indexes, as on an owner change.
+When `init` is about to clone another owner's team repository where the old
+install's clone was, or reuses a clone of it that an earlier `init` left there,
+it settles the old install right then, before the clone or the refresh,
+the same way (queue set aside, indexes dropped), and moves the old
+`config.yaml` to the first free `config.yaml.previous[.<n>]` instead of saving
+(#823 item 17). The save at the end still compares with the old install
+loaded before the clone, finds nothing left to set aside, and writes the new
+config. An `init` that stops in between (an unknown `--role`, a busy queue lock, a
+prompt left) leaves no config naming the old team beside the new clone, so every
+command asks for `teamai init`; nothing is deleted. The rerun finds no
+`config.yaml`, so it reads the last `config.yaml.previous[.<n>]` for the
+settings a re-init carries forward (`inheritUserScope`, agents, tool roots).
 A self install whose
 business repository moved to another URL (renamed or transferred) is another
 owner too: `init` sets its queue aside, and the warning names the directory to
@@ -799,6 +849,37 @@ written, except by an earlier release after a rollback, so every scope seeds fro
 what the machine had reported by then, never from another scope's later report.
 The seed holds a session's whole total, so a session still running at the
 upgrade goes on from the reported total, as before.
+
+Every writer that may modify `events.jsonl` — each hook's append, and a
+compaction that finds the log past its threshold or side files to fold —
+takes `events.jsonl.lock` beside it (#804), the pattern the usage
+file took for the same lost update (#803): compaction's
+read → filter → temp-file → rename cannot drop an append that lands while it
+runs, and two compactions cannot interleave their rewrites. A compaction
+whose log is below the threshold and holds no side files does the common
+case lock-free: one read, and it returns without touching the lock, so a
+state directory that is being torn down concurrently never meets a lock
+creation. A hook append waits
+up to ~250 ms, inside its foreground budget, and one that gives up records its
+line in an `events.pending-<uuid>.jsonl` side file, with the file's mode, that
+the next lock holder folds into the file before it writes — so an event is
+late, never gone. Side files fold in their events' own time order, not
+readdir's, and the compaction classifies sessions in time order too (the
+order every reader rebuilds from), so a side file that outlived newer appends
+cannot place an older event after them and re-mark a live session stopped.
+The line carries a `pendingId`, so a fold never appends a side file twice (a
+holder that died after appending it but before removing it leaves it for the
+next one), two side files of identical events are both kept, and the id stays
+in the raw file — a rewrite keeps it, as the usage file's does — until the
+side file itself is gone, while no reader ever sees it: `readEvents` drops it.
+A side file without its trailing
+newline is still being written and waits for the next holder. A compaction
+waits up to ~5 s for a peer's rewrite, and skips — leaving the file as it is
+for the next compaction — when a live holder outlasts the wait; a lock whose
+owner is gone is reclaimed, and a rewrite's temp copy left by a killed
+compaction (`events.jsonl.<pid>.<hex>.tmp`) is removed by the next one. The
+side files and the lock live in `~/.teamai/dashboard/` beside the log, which
+no repository tracks, so nothing needs adding to a workspace `.gitignore`.
 
 **`anchor` on save.** Previously only migration wrote a partition's `anchor`
 reverse-lookup file, so freshly-init'd partitions had none. `saveLocalConfigForScope`

@@ -116,6 +116,15 @@ The doc lands in the team's `learnings/` and appears for teammates on their next
 - Confirm it landed: `teamai list skills` (or `teamai status`).
 - Teammates receive it automatically on their next session, or via `teamai pull`.
 
+Before listing rules, `push` refreshes copies whose bodies still match a recorded
+sync revision. Copilot's generated `applyTo` header does not count as a local
+edit: unedited old instructions update in native format, including under
+`COPILOT_HOME` in user scope. Genuine local body edits remain push candidates.
+Rule pre-sync leaves tools excluded by `enabledAgents` or `disabledAgents` untouched.
+When only team `paths` change, `applyTo` refreshes if the local file still matches
+a recorded version's generated copy; locally edited headers are kept.
+The copies push refreshes are recorded, so a later `teamai pull` still updates them.
+
 ## If push is denied
 
 A permission error usually means you don't have write access to the team repo.

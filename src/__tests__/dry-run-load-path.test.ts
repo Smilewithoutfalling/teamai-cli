@@ -29,7 +29,13 @@ vi.mock('../utils/reports-branch.js', async (importOriginal) => ({
   updateReports: vi.fn(),
 }));
 
+import { contribute } from '../contribute.js';
+import { loadLocalConfigForScope } from '../config.js';
+import { pull } from '../pull.js';
+import { push } from '../push.js';
+import { recall } from '../recall.js';
 import { rolesSet } from '../roles-cmd.js';
+import { list, status } from '../status.js';
 import { tagsSubscribe, tagsUnsubscribe } from '../tags.js';
 import { updateReports } from '../utils/reports-branch.js';
 import { log } from '../utils/logger.js';
@@ -179,5 +185,194 @@ describe.each(FIXTURES)('--dry-run on %s', (_fixture, setup) => {
     expect(snapshotTree(root)).toEqual(before);
     expect(updateReports).not.toHaveBeenCalled();
     expect(log.info).toHaveBeenCalledWith(expect.stringContaining('[dry-run] Would'));
+  });
+});
+
+describe('--dry-run through the loaders the commands share (#850)', () => {
+  const originalCwd = process.cwd();
+  const roots: string[] = [];
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    process.chdir(originalCwd);
+    for (const dir of roots.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  function legacyRoot(): { root: string; configPath: string } {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-dry-run-loader-'));
+    roots.push(root);
+    const home = path.join(root, 'home');
+    fs.mkdirSync(path.join(home, '.teamai'), { recursive: true });
+    vi.stubEnv('HOME', home);
+    process.chdir(setupLegacyRoleConfig(root));
+    return { root, configPath: path.join(home, '.teamai', 'config.yaml') };
+  }
+
+  it('recall --dry-run writes no file: the user scope loads through the flag (#850)', async () => {
+    const { root } = legacyRoot();
+    const before = snapshotTree(root);
+    await recall('dry run probe', { dryRun: true });
+    expect(snapshotTree(root)).toEqual(before);
+  });
+
+  it('contribute --scope user --dry-run writes no file on a config pending the role migration (#850)', async () => {
+    const { root } = legacyRoot();
+    // In the tree before the snapshot, so the run itself adds nothing.
+    const file = path.join(process.cwd(), 'note.md');
+    fs.writeFileSync(file, 'Learned: a dry run must not migrate the teamai config.\n');
+    const before = snapshotTree(root);
+    await contribute({ file, scope: 'user', dryRun: true });
+    expect(snapshotTree(root)).toEqual(before);
+  });
+
+  it('the loader previews the legacy role migration under --dry-run and writes nothing (#850)', async () => {
+    const { configPath } = legacyRoot();
+    const loaded = await loadLocalConfigForScope('user', undefined, { dryRun: true });
+    expect(loaded?.primaryRole).toBe('hai');
+    expect(fs.readFileSync(configPath, 'utf-8')).not.toContain('primaryRole');
+  });
+
+  it('the loader still migrates in place when the caller passes nothing, as before (#850)', async () => {
+    const { configPath } = legacyRoot();
+    const loaded = await loadLocalConfigForScope('user');
+    expect(loaded?.primaryRole).toBe('hai');
+    expect(fs.readFileSync(configPath, 'utf-8')).toContain('primaryRole: hai');
+  });
+
+  // The command-level half of #850. Each of these reaches the legacy role
+  // migration through a loader it used to call bare, so the fixture's
+  // `config.yaml` gained `primaryRole` even though nothing had asked to write.
+  // `pull`/`push` carry `--dry-run`; `status`/`list` are read-only and pass it
+  // unconditionally (see the note at their `autoDetectInit` call site).
+  //
+  // The positive control is the test directly above: the SAME fixture does gain
+  // `primaryRole` when the flag is absent, so an unchanged tree here is a real
+  // result and not the harness failing to look.
+  const LOAD_ONLY_COMMANDS: Array<[string, () => Promise<void>]> = [
+    ['pull --dry-run', () => pull({ dryRun: true })],
+    ['push --dry-run', () => push({ dryRun: true })],
+    ['status', () => status({})],
+    ['list', () => list(undefined, {})],
+  ];
+
+  it.each(LOAD_ONLY_COMMANDS)('%s migrates nothing it loads (#850)', async (_command, run) => {
+    const { root, configPath } = legacyRoot();
+    const before = snapshotTree(root);
+    const error = await run().then(() => null, (e: unknown) => e);
+    expect(error).toBeNull();
+    expect(snapshotTree(root)).toEqual(before);
+    expect(fs.readFileSync(configPath, 'utf-8')).not.toContain('primaryRole');
+    // A dry run may parse the remote, but nothing else may reach a provider.
+    expect(providerCalls).toEqual([]);
+  });
+
+  /** A git project whose partition still carries its pre-#546 name, i.e. project scope. */
+  function projectRoot(): string {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-dry-run-project-'));
+    roots.push(root);
+    const home = path.join(root, 'home');
+    fs.mkdirSync(path.join(home, '.teamai'), { recursive: true });
+    // An installed agent, so a bootstrap that did run would seed and wire it.
+    fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+    vi.stubEnv('HOME', home);
+    process.chdir(setupLegacyNamedPartition(root));
+    return root;
+  }
+
+  // The project-scope half. These reach the same bare calls through
+  // `detectProjectConfig`, whose dry-run branch is what stops
+  // `adoptLegacyPartition` (a real `fs.rename`) and the self-heal bootstrap.
+  // The issue report located these by code path only; they are run here.
+  const PROJECT_SCOPE_COMMANDS: Array<[string, () => Promise<void>]> = [
+    ['pull --dry-run', () => pull({ dryRun: true })],
+    ['status', () => status({})],
+    ['list', () => list(undefined, {})],
+  ];
+
+  it.each(PROJECT_SCOPE_COMMANDS)('%s adopts no legacy partition on a git project (#850)', async (_command, run) => {
+    const root = projectRoot();
+    const before = snapshotTree(root);
+    const error = await run().then(() => null, (e: unknown) => e);
+    expect(error).toBeNull();
+    expect(snapshotTree(root)).toEqual(before);
+    expect(providerCalls).toEqual([]);
+  });
+});
+
+// The self-mode half of #866. `pull` and `push` are the two commands that take a
+// partition sync-lock, and every fixture above runs them at user scope, or on a
+// project partition that already exists. A fresh self-mode clone is the one
+// shape where the partition does NOT exist yet — so `acquireLock` creating the
+// lock's parent directory creates a directory that nothing removes afterwards.
+// `push` carries a second instance of the same mistake: its self-mode setup
+// (lock, `.teamai/.gitignore` self-heal, knowledge worktree) all runs before
+// `pushCore` reaches its own dry-run guard.
+describe('--dry-run on a fresh self-mode clone (#866)', () => {
+  const originalCwd = process.cwd();
+  let root: string;
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-dry-run-self-'));
+    const home = path.join(root, 'home');
+    fs.mkdirSync(path.join(home, '.teamai'), { recursive: true });
+    // An installed agent, so a bootstrap that did run would seed and wire it.
+    fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+    vi.stubEnv('HOME', home);
+    process.chdir(setupSelfModeClone(root));
+    vi.spyOn(log, 'info').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.mocked(updateReports).mockClear();
+    providerCalls.length = 0;
+    vi.unstubAllEnvs();
+    process.chdir(originalCwd);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  // Each command declares exactly which new entries it may leave behind, and
+  // both are empty: a preview writes nothing at all.
+  //
+  // `pull` used to be allowed one — the empty `<getTeamaiHome>/locks/` its queue
+  // listing created. `pull` counts the contribution queue so it can report how
+  // many learnings it would publish, and `publishQueuedLearnings` lists it
+  // through `listPendingForInstall` (`utils/pending-learnings.ts`), which holds
+  // the queue lock. Taking that lock is a write: `acquireLock` creates the
+  // lock's parent, and `releaseLock` removes the lock file but not the
+  // directory. `dryRun` now reaches that `acquireLock` as it already reached the
+  // partition locks in `pull` and `push` (#866), so the preview creates neither
+  // and this list is empty.
+  const FETCH_HEAD = path.join('app', '.git', 'FETCH_HEAD');
+  // `git fetch` — which the preview performs on purpose, so that its plan is
+  // based on the same `origin/<default>` the real push would branch from —
+  // leaves its own one-line record behind. It names no ref, changes no working
+  // tree, and git overwrites it on the next fetch. Declared and counted, so any
+  // other new entry still fails this test.
+  const SELF_COMMANDS: Array<[string, () => Promise<void>, string[]]> = [
+    ['pull --dry-run', () => pull({ dryRun: true }), []],
+    ['push --dry-run', () => push({ dryRun: true }), [FETCH_HEAD]],
+  ];
+
+  it.each(SELF_COMMANDS)('%s creates no partition, worktree or lock file', async (_command, run, allowed) => {
+    // The reported symptom, named so a failure here reads as #866 rather than
+    // as an anonymous tree diff: taking the sync-lock used to create this
+    // directory, and releasing it removed the lock file but not the directory.
+    const partitionRoot = path.join(root, 'home', '.teamai', 'projects');
+    expect(fs.existsSync(partitionRoot)).toBe(false);
+    const before = snapshotTree(root);
+    const error = await run().then(() => null, (e: unknown) => e);
+    expect(error).toBeNull();
+    expect(fs.existsSync(partitionRoot)).toBe(false);
+
+    const after = snapshotTree(root);
+    const appeared = Object.keys(after).filter((key) => !(key in before));
+    const vanished = Object.keys(before).filter((key) => !(key in after));
+    expect({ appeared, vanished }).toEqual({ appeared: allowed, vanished: [] });
+    // Nothing that already existed may be rewritten, whatever it is.
+    for (const key of Object.keys(before)) expect(after[key]).toBe(before[key]);
+    // A dry run may parse the remote, but nothing else may reach a provider.
+    expect(providerCalls).toEqual([]);
   });
 });

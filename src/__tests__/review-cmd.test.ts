@@ -142,7 +142,7 @@ describe('review-cmd', () => {
         expect(removePendingReview).not.toHaveBeenCalled();
 
         const output = consoleSpy.mock.calls.map((c) => c.join(' ')).join('\n');
-        expect(output).toContain('不支持');
+        expect(output).toContain('does not support auto-apply');
     });
 
     // ── reject 模式 ───────────────────────────────────────

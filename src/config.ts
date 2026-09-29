@@ -17,7 +17,7 @@ import {
   getStatePath,
   getDataHome,
 } from './types.js';
-import { readFileSafe, readJson, writeFileAtomic, writeJson, expandHome, pathExists } from './utils/fs.js';
+import { readFileSafe, readJson, writeFileAtomic, writeJsonAtomic, expandHome, pathExists } from './utils/fs.js';
 import { resolveAnchors } from './utils/git.js';
 import { getUserHome } from './utils/home.js';
 import { resolvePartitionDir, writeAnchorFile } from './utils/partition.js';
@@ -142,7 +142,10 @@ export async function loadState(): Promise<State> {
  * Save the local state
  */
 export async function saveState(state: State): Promise<void> {
-  await writeJson(expandHome(getUserStatePath()), state);
+  // state.json holds the pull/push bases (lastPullRev, per-checkout targets).
+  // A torn in-place write reads back as parse({}) on the next run, which drops
+  // every base and re-opens the stale-base overwrites #827 closed (#854).
+  await writeJsonAtomic(expandHome(getUserStatePath()), state);
 }
 
 /**
@@ -229,14 +232,15 @@ async function throwTeamConfigMissingOrInvalid(repoPath: string): Promise<never>
 export async function loadLocalConfigForScope(
   scope: Scope,
   projectRoot?: string,
+  options: LoadOptions = {},
 ): Promise<LocalConfig | null> {
   if (scope === 'project') {
     if (!projectRoot) return null;
     // Reuse the single detection path so config location never drifts between
     // "detect the active project" and "load a named project's config".
-    const detected = await detectProjectConfig(projectRoot);
+    const detected = await detectProjectConfig(projectRoot, undefined, options);
     if (!detected) return null;
-    return migrateLegacyRoleConfig(detected, path.join(getDataHome(detected), 'config.yaml'));
+    return migrateLegacyRoleConfig(detected, path.join(getDataHome(detected), 'config.yaml'), options);
   }
   const configPath = getConfigPath(scope, projectRoot);
   const content = await readFileSafe(expandHome(configPath));
@@ -244,7 +248,7 @@ export async function loadLocalConfigForScope(
   try {
     const raw = YAML.parse(content);
     const parsed = LocalConfigSchema.parse(raw);
-    return await migrateLegacyRoleConfig(parsed, configPath);
+    return await migrateLegacyRoleConfig(parsed, configPath, options);
   } catch (e) {
     log.error(`Invalid ${scope} config at ${configPath}: ${describeConfigError(e)}`);
     return null;
@@ -298,7 +302,7 @@ export async function loadStateForScope(localConfig: LocalConfig): Promise<State
  */
 export async function saveStateForScope(state: State, localConfig: LocalConfig): Promise<void> {
   const statePath = getStatePath(localConfig);
-  await writeJson(expandHome(statePath), state);
+  await writeJsonAtomic(expandHome(statePath), state);
 }
 
 /**

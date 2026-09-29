@@ -5,13 +5,14 @@ import { assertNotReadOnly } from './read-only.js';
 import { pathExists } from './utils/fs.js';
 import { log, spinner } from './utils/logger.js';
 import { markContributed } from './contribute-check.js';
-import { pendingLearningsDir, queueOwner, queueWriteRefusal, savePendingLearning } from './utils/pending-learnings.js';
+import { agentSessionIdFromEnv } from './utils/session-id.js';
+import { pendingLearningsDir, queueWriteRefusal, savePendingLearning } from './utils/pending-learnings.js';
 import { publishQueuedLearnings } from './utils/learnings-publish.js';
 import { indexableLearningsRoots } from './utils/learnings-roots.js';
 import { resolveActiveLearningsNamespaces } from './projects.js';
 import { isSafeNamespaceSegment } from './manifest-schema.js';
 import type { GlobalOptions, LocalConfig } from './types.js';
-import { getBusinessRoot, getDataHome, getProjectSearchIndexPath, isSelfMode } from './types.js';
+import { getProjectSearchIndexPath, isSelfMode } from './types.js';
 
 /**
  * Decide which learnings subdirectory a contribution lands in — resolved from
@@ -103,31 +104,6 @@ export async function rebuildIndexAfterContribute(localConfig: LocalConfig): Pro
 //
 
 /**
- * A queue an older teamai kept in this checkout's `.teamai/` is deleted with a
- * linked worktree; move it into the shared queue, so the publish that follows
- * sends it too (#808), or aside when the partition now serves another install
- * (settleCheckoutQueue). The migration before contribute and import --from-mr
- * does it too, and they stop when the queue would stay in the checkout
- * (queueKeptInCheckout); this is a second pass. Best effort: the learning
- * being queued must still be saved, and the old queue stays where it is.
- */
-export async function drainCheckoutQueue(localConfig: LocalConfig): Promise<void> {
-  if (!isSelfMode(localConfig)) return;
-  const legacyDir = path.join(getBusinessRoot(localConfig), '.teamai');
-  const dataHome = getDataHome(localConfig);
-  if (path.resolve(legacyDir) === path.resolve(dataHome)) return;
-  const { settleCheckoutQueue } = await import('./migrate.js');
-  try {
-    await settleCheckoutQueue(legacyDir, dataHome, queueOwner(localConfig));
-  } catch (e) {
-    log.warn(
-      `Could not move the learnings an older teamai queued in ${legacyDir} ` +
-        `(${e instanceof Error ? e.message : String(e)}). They stay there; the next teamai pull moves them.`,
-    );
-  }
-}
-
-/**
  * Where a learning saved for an install that changed before it was published
  * is, for the member: still queued, or set aside with the previous install's
  * queue by the `init` that switched it, which names the directory.
@@ -191,19 +167,22 @@ export async function contribute(
     return;
   }
 
-  // Init check — select scope based on --scope flag or auto-detect
+  // Init check — select scope based on --scope flag or auto-detect. The flag
+  // reaches the loaders: a bare load migrates the legacy role config in place,
+  // which would write under --dry-run (#850).
+  const loadOpts = { dryRun: options.dryRun };
   let localConfig: LocalConfig;
   if (options.scope === 'project') {
-    const cfg = await loadLocalConfigForScope('project', process.cwd());
+    const cfg = await loadLocalConfigForScope('project', process.cwd(), loadOpts);
     if (!cfg) { log.error('No project-level teamai config in this directory'); return; }
     localConfig = cfg;
   } else if (options.scope === 'user') {
-    const { localConfig: userCfg } = await requireInit();
+    const { localConfig: userCfg } = await requireInit(loadOpts);
     localConfig = userCfg;
   } else {
     // Auto-detect (unchanged default behavior)
-    const projectConfig = await detectProjectConfig();
-    localConfig = projectConfig ?? (await requireInit()).localConfig;
+    const projectConfig = await detectProjectConfig(undefined, undefined, loadOpts);
+    localConfig = projectConfig ?? (await requireInit(loadOpts)).localConfig;
   }
   assertNotReadOnly(localConfig, 'teamai contribute');
   const username = localConfig.username;
@@ -227,7 +206,6 @@ export async function contribute(
   if (isSelfMode(localConfig)) {
     const { migrateSelfModeGitignore } = await import('./init.js');
     await migrateSelfModeGitignore(localConfig);
-    await drainCheckoutQueue(localConfig);
   }
 
   try {
@@ -271,7 +249,7 @@ export async function contribute(
   // it reaches origin: the queue always retries, and re-contributing the same
   // session would add a second copy of the same knowledge rather than fix
   // anything. `pull` and `doctor` are what tell the user it is still queued.
-  const sessionId = options.sessionId || process.env.CLAUDE_SESSION_ID || '';
+  const sessionId = options.sessionId || (await agentSessionIdFromEnv()) || '';
   if (sessionId) {
     await markContributed(sessionId);
   }

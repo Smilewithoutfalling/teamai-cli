@@ -225,149 +225,90 @@ function addSwiftName(name: string, names: Set<string>): void {
   names.add(name);
 }
 
-/** Every identifier under `node`, skipping type positions such as `Int` in `(work: Int)`. */
-function collectSwiftIdentifiers(node: Node, names: Set<string>): void {
-  if (node.type === "simple_identifier") {
-    addSwiftName(node.text, names);
-    return;
-  }
-  if (node.type === "user_type" || node.type === "type_identifier") {
-    return;
-  }
-  for (const child of namedChildrenOf(node)) {
-    collectSwiftIdentifiers(child, names);
-  }
-}
 
 /**
- * The names one binding construct introduces.
+ * The names that stop `node`'s callee from resolving through Swift module scope.
  *
- * Two shapes carry them in this grammar: a `pattern` child that holds the names
- * directly (`let work`, `let (a, b)`, `for x in`, `catch let x`), and a
- * `value_binding_pattern` whose *next* sibling is the name (`guard let work`,
- * `if let work`, `case let work`, and `let work = x`, where that sibling is a
- * `pattern`).
+ * `call-resolver` decides *which module* a bare call belongs to, but only the
+ * syntax tree knows whether the callee is genuinely a module-level declaration:
+ * `run(work:) { work() }` calls its parameter, and a `let work = ...` above the
+ * call wins over a sibling file's `func work()`. Resolving those against the
+ * module fabricates a cross-file edge, which is worse than missing one, so the
+ * names are gathered here — while the tree is still in hand — and carried on the
+ * call site.
  *
- * A `simple_identifier` that is neither of those is a *use*, not a binding —
- * `property_declaration` for `let work = pair` holds `pair` as a bare child, and
- * collecting it would invent a name.
- */
-function addSwiftBoundNames(scope: Node, names: Set<string>): void {
-  const children = namedChildrenOf(scope);
-  children.forEach((child, index) => {
-    if (child.type !== "value_binding_pattern") {
-      return;
-    }
-    const bound = children[index + 1];
-    if (bound?.type === "simple_identifier") {
-      addSwiftName(bound.text, names);
-    } else if (bound?.type === "pattern") {
-      collectSwiftIdentifiers(bound, names);
-    }
-  });
-  for (const child of children) {
-    if (child.type === "pattern") {
-      collectSwiftIdentifiers(child, names);
-    }
-  }
-}
-
-/**
- * A parameter binds the *last* identifier in its leading run: an external label
- * comes first, so `with work: Int` and `_ work: Int` both bind `work`, while
- * `with: Int` binds `with`. Stopping at the first non-identifier keeps a default
- * value such as `x: Int = defaultX` from contributing `defaultX`.
- */
-function addSwiftParameterName(parameter: Node, names: Set<string>): void {
-  let candidate: string | undefined;
-  for (const child of namedChildrenOf(parameter)) {
-    if (child.type !== "simple_identifier") {
-      break;
-    }
-    candidate = child.text;
-  }
-  if (candidate !== undefined) {
-    addSwiftName(candidate, names);
-  }
-}
-
-/**
- * The names bound by an enclosing scope at `node`, in Swift.
+ * The scopes that can shadow the name are the call's own ancestors, which is a
+ * closed set: nothing binds a name without appearing somewhere on that chain.
+ * What changed is that no code enumerates *kinds* of scope any more. The earlier
+ * version switched on `scope.type` and pulled named fields out of the handful of
+ * node types it recognised, while the doc comment above it promised to
+ * over-collect. That promise only ever held "inside the scopes it does visit",
+ * so every binding form the switch did not know — an instance property, a
+ * generic parameter, a closure capture list, `if let` without `else`, `catch
+ * let`, `case let` — stayed a live bug, and there was always one more. Reading
+ * whole scopes instead of their recognised fields closes that door: every way of
+ * introducing a name puts the name in the tree.
  *
- * This is the missing half of the module-wide lookup. `call-resolver` decides
- * *which module* a bare call belongs to, but only the syntax tree knows whether
- * the name is a module-level declaration at all: `run(work:) { work() }` calls
- * its parameter, and a `let work = ...` above the call wins over a sibling
- * file's `func work()`. Resolving those against the module would fabricate a
- * cross-file edge, which is worse than missing one, so the names are gathered
- * here — while the tree is still in hand — and carried on the call site.
- *
- * The walk stops at the call's own ancestors, so a binding in an unrelated
- * function of the same file cannot shadow anything. It deliberately
- * over-collects inside the scopes it does visit: a binding introduced by an
- * `if let` reaches the `else` branch it does not cover, and a `where` clause
- * sees the `case let` it follows. Over-collecting costs a resolution; the
- * opposite error invents an edge, so the asymmetry is the point.
+ * The cost is paid on the other side, deliberately. A name that merely *appears*
+ * in an enclosing scope — a nested function's local, a value passed around
+ * rather than bound — suppresses the resolution too. Over-suppressing costs a
+ * resolution; the opposite error invents an edge, and that asymmetry is the
+ * point.
  */
 function swiftLocalBindingsAt(node: Node): string[] {
   const names = new Set<string>();
-  const position = node.startIndex;
-  let current: Node = node;
-  while (current.parent) {
-    const scope = current.parent;
-    switch (scope.type) {
-      case "function_declaration":
-      case "protocol_function_declaration":
-      case "init_declaration":
-      case "deinit_declaration":
-      case "subscript_declaration":
-        for (const child of namedChildrenOf(scope)) {
-          if (child.type === "parameter") {
-            addSwiftParameterName(child, names);
-          }
-        }
-        break;
-      case "lambda_literal":
-        for (const child of namedChildrenOf(scope)) {
-          if (child.type !== "lambda_function_type") {
-            continue;
-          }
-          for (const params of namedChildrenOf(child)) {
-            if (params.type === "lambda_function_type_parameters") {
-              collectSwiftIdentifiers(params, names);
-            }
-          }
-        }
-        break;
-      case "statements":
-        // Only what is declared *before* the call: a later statement, or one in
-        // a nested block, is not in scope at this position.
-        for (const child of namedChildrenOf(scope)) {
-          if (child.startIndex >= position) {
-            continue;
-          }
-          if (child.type === "property_declaration" || child.type === "guard_statement") {
-            addSwiftBoundNames(child, names);
-          }
-        }
-        break;
-      case "switch_entry":
-        for (const child of namedChildrenOf(scope)) {
-          if (child.type === "switch_pattern") {
-            addSwiftBoundNames(child, names);
-          }
-        }
-        break;
-      case "for_statement":
-      case "catch_block":
-      case "if_statement":
-      case "while_statement":
-        addSwiftBoundNames(scope, names);
-        break;
-      default:
-        break;
+  const call = enclosingCallExpression(node);
+  const start = call.startIndex;
+  const end = call.endIndex;
+
+  const collect = (current: Node): void => {
+    // The call is not evidence about itself: `work()` contains `work`, and
+    // counting that occurrence would suppress every cross-file resolution.
+    if (current.startIndex >= start && current.endIndex <= end) {
+      return;
     }
-    current = scope;
+    if (current.type === "simple_identifier" || current.type === "type_identifier") {
+      addSwiftName(current.text, names);
+      return;
+    }
+    // A type position such as `Int` in `(work: Int)` names a type, not a value;
+    // collecting it would shadow every call to a same-named function. A generic
+    // parameter is a `type_identifier` too, but it never sits under `user_type`,
+    // so it still lands in the set.
+    if (current.type === "user_type") {
+      return;
+    }
+    for (const child of namedChildrenOf(current)) {
+      collect(child);
+    }
+  };
+
+  // Up to but not including the file: the module level is what the fallback
+  // resolves *against*, so it cannot also be what shadows the name.
+  let scope: Node | null = call.parent;
+  while (scope && scope.type !== "source_file") {
+    collect(scope);
+    scope = scope.parent;
   }
+
   return [...names];
+}
+
+/**
+ * The `call_expression` a captured node belongs to.
+ *
+ * The Swift query binds `@call.member` twice — once to the outer
+ * `call_expression`, once to the `simple_identifier` in its `navigation_suffix`.
+ * A capture map keyed by name keeps the last one, so the node handed to
+ * `swiftLocalBindingsAt` is often just the member identifier (`make` in
+ * `Service.make()`) rather than the whole call. Walking up is what makes the
+ * "inside the call" test exact: excluding only the identifier would leave the
+ * receiver (`Service`) looking like an ordinary mention of the name.
+ */
+function enclosingCallExpression(node: Node): Node {
+  let current: Node = node;
+  while (current.type !== "call_expression" && current.parent) {
+    current = current.parent;
+  }
+  return current;
 }

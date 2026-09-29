@@ -27,6 +27,7 @@ import {
 } from './session-collector.js';
 import { log, spinner } from './utils/logger.js';
 import { withTimeout } from './utils/async.js';
+import { agentSessionIdFromEnv } from './utils/session-id.js';
 import { getSessionLogsDir, usesBranchWorktree } from './types.js';
 import type { GlobalOptions, LocalConfig } from './types.js';
 
@@ -58,7 +59,7 @@ export async function saveSession(options: SaveSessionOptions): Promise<void> {
   }
 
   const sessionId =
-    options.sessionId || process.env.CLAUDE_SESSION_ID || mostRecentSessionId(events);
+    options.sessionId || (await agentSessionIdFromEnv()) || mostRecentSessionId(events);
   if (!sessionId) {
     log.error('Could not determine a session id. Pass --session-id <id>.');
     return;
@@ -96,20 +97,23 @@ export async function saveSession(options: SaveSessionOptions): Promise<void> {
     return;
   }
 
+  // The flag reaches the loaders: a bare load migrates the legacy role config
+  // in place, which would write under --dry-run (#850).
+  const loadOpts = { dryRun: options.dryRun };
   let localConfig: LocalConfig;
   try {
     if (options.scope === 'project') {
-      const cfg = await loadLocalConfigForScope('project', process.cwd());
+      const cfg = await loadLocalConfigForScope('project', process.cwd(), loadOpts);
       if (!cfg) {
         log.error('No project-level teamai config in the current directory.');
         return;
       }
       localConfig = cfg;
     } else if (options.scope === 'user') {
-      localConfig = (await requireInit()).localConfig;
+      localConfig = (await requireInit(loadOpts)).localConfig;
     } else {
-      const projectConfig = await detectProjectConfig();
-      localConfig = projectConfig ?? (await requireInit()).localConfig;
+      const projectConfig = await detectProjectConfig(undefined, undefined, loadOpts);
+      localConfig = projectConfig ?? (await requireInit(loadOpts)).localConfig;
     }
   } catch (e) {
     log.error(`Cannot push: ${(e as Error).message}`);

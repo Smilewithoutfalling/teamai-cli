@@ -448,4 +448,41 @@ describe('Swift module-scope resolution yields to enclosing bindings', () => {
     expect(references[0]?.from).toBe('Sources/App/Plain.swift');
     expect(references[0]?.to).toBe('Sources/App/Widget.swift');
   });
+
+  it('does not resolve a call an enclosing stored property shadows', async () => {
+    const { result } = await extractFiles([
+      ['Sources/App/Worker.swift', 'func work() -> Int { return 1 }\n'],
+      [
+        'Sources/App/Stored.swift',
+        ['struct S {', '  let work: () -> Void', '  func run() {', '    work()', '  }', '}', ''].join('\n'),
+      ],
+    ]);
+
+    // Swift reads an unqualified `work` inside a method as `self.work`, so the
+    // stored property binds the name — even though it is neither a parameter nor
+    // a local, the two shapes the collector once looked for.
+    expect(result.edges.filter((e) => e.relation === 'REFERENCES')).toHaveLength(0);
+  });
+
+  it('does not resolve a receiver an enclosing generic parameter shadows', async () => {
+    const { result } = await extractFiles([
+      ['Sources/App/Factory.swift', 'class Factory {\n  static func make() -> Int { return 1 }\n}\n'],
+      ['Sources/App/Generic.swift', 'func run<Factory: Maker>() -> Int {\n  return Factory.make()\n}\n'],
+    ]);
+
+    // `Factory` in this position is the generic parameter, not the sibling
+    // class the receiver fallback would otherwise claim.
+    expect(result.edges.filter((e) => e.relation === 'REFERENCES')).toHaveLength(0);
+  });
+
+  it('does not resolve a call a closure capture list shadows', async () => {
+    const { result } = await extractFiles([
+      ['Sources/App/Worker.swift', 'func work() -> Int { return 1 }\n'],
+      ['Sources/App/Captured.swift', 'func outer() -> Int {\n  let g = { [work = makeWork()] in work() }\n  return g()\n}\n'],
+    ]);
+
+    // The capture list introduces `work` inside the closure. The lambda's own
+    // parameter list is empty, which is all the old collector inspected.
+    expect(result.edges.filter((e) => e.relation === 'REFERENCES')).toHaveLength(0);
+  });
 });

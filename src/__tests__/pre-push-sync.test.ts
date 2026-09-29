@@ -28,6 +28,8 @@ vi.mock('../utils/git.js', () => ({
 }));
 
 import { syncTeamUpdatesToLocal } from '../utils/pre-push-sync.js';
+import { fileHash } from '../utils/fs.js';
+import { teamRuleToCopilotInstructions } from '../resources/copilot-instructions.js';
 import type { TeamaiConfig, LocalConfig } from '../types.js';
 
 describe('syncTeamUpdatesToLocal — rules', () => {
@@ -98,6 +100,21 @@ describe('syncTeamUpdatesToLocal — rules', () => {
     // Local should now have v2
     const content = await fse.readFile(path.join(homeDir, '.claude/rules', 'my-rule.md'), 'utf-8');
     expect(content).toBe('v2 content');
+  });
+
+  it('records the rule it syncs as delivered, and leaves an edited one on record (#822)', async () => {
+    await fse.writeFile(path.join(repoPath, 'rules', 'synced.md'), 'v2 content');
+    await fse.writeFile(path.join(repoPath, 'rules', 'edited.md'), 'v2 content');
+    const synced = path.join(homeDir, '.claude/rules', 'synced.md');
+    const edited = path.join(homeDir, '.claude/rules', 'edited.md');
+    await fse.writeFile(synced, 'v1 content');
+    await fse.writeFile(edited, 'local edit');
+    mockGetFileContentAtRev.mockResolvedValue(Buffer.from('v1 content'));
+    const delivered: Record<string, string> = { [synced]: 'hash-of-v1', [edited]: 'hash-of-v1' };
+
+    await syncTeamUpdatesToLocal(teamConfig, localConfig, 'abc1234', undefined, delivered);
+
+    expect(delivered).toEqual({ [synced]: await fileHash(synced), [edited]: 'hash-of-v1' });
   });
 
   it('syncs a local rule at any of several bases, and keeps one at none (#812)', async () => {
@@ -432,6 +449,123 @@ describe('syncTeamUpdatesToLocal — rules', () => {
     expect(mockGetFileContentAtRev).not.toHaveBeenCalled();
   });
 
+  describe.each(['project', 'user'] as const)('Copilot rules in %s scope', (scope) => {
+    let instructionsDir: string;
+    const oldRule = '---\npaths: ["src/**/*.ts"]\n---\n\nv1 content\n';
+    const newRule = '---\npaths: ["lib/**/*.ts"]\n---\n\nv2 content\n';
+
+    beforeEach(() => {
+      const copilotHome = path.join(tmpDir, 'custom-copilot-home');
+      vi.stubEnv('COPILOT_HOME', copilotHome);
+      mockGetFileContentAtRev.mockResolvedValue(Buffer.from(oldRule));
+      localConfig.scope = scope;
+      localConfig.projectRoot = scope === 'project' ? homeDir : undefined;
+      localConfig.enabledAgents = ['copilot'];
+      teamConfig.toolPaths = {
+        copilot: { rules: '.github/instructions', userScope: { rules: 'instructions' } },
+      };
+      instructionsDir = scope === 'project'
+        ? path.join(homeDir, '.github/instructions')
+        : path.join(copilotHome, 'instructions');
+    });
+
+    it.each(['enabledAgents', 'disabledAgents'] as const)('does not touch rules excluded by %s', async (setting) => {
+      localConfig[setting] = setting === 'enabledAgents' ? ['claude'] : ['copilot'];
+      // Installation is independent of permission to sync this tool.
+      await fse.ensureDir(process.env.COPILOT_HOME!);
+      const localFile = path.join(instructionsDir, 'my-rule.instructions.md');
+      const original = teamRuleToCopilotInstructions(oldRule).replace('src/**/*.ts', 'custom/**/*.ts');
+      await fse.outputFile(localFile, original);
+      await fse.writeFile(path.join(repoPath, 'rules/my-rule.md'), newRule);
+
+      await syncTeamUpdatesToLocal(teamConfig, localConfig, 'abc1234');
+
+      expect(await fse.readFile(localFile, 'utf-8')).toBe(original);
+      expect(mockGetFileContentAtRev).not.toHaveBeenCalled();
+    });
+
+    it('updates an unedited old body and regenerates applyTo from the current team rule', async () => {
+      const localFile = path.join(instructionsDir, 'my-rule.instructions.md');
+      await fse.outputFile(localFile, teamRuleToCopilotInstructions(oldRule));
+      await fse.writeFile(path.join(repoPath, 'rules/my-rule.md'), newRule);
+      mockGetFileContentAtRev.mockResolvedValue(Buffer.from(oldRule));
+
+      await syncTeamUpdatesToLocal(teamConfig, localConfig, 'abc1234');
+
+      expect(await fse.readFile(localFile, 'utf-8')).toBe(teamRuleToCopilotInstructions(newRule));
+      expect(mockGetFileContentAtRev).toHaveBeenCalledWith(repoPath, 'abc1234', './rules/my-rule.md');
+    });
+
+    it('records the Copilot rule it syncs as delivered (#822)', async () => {
+      const localFile = path.join(instructionsDir, 'my-rule.instructions.md');
+      await fse.outputFile(localFile, teamRuleToCopilotInstructions(oldRule));
+      await fse.writeFile(path.join(repoPath, 'rules/my-rule.md'), newRule);
+      const delivered: Record<string, string> = { [localFile]: 'hash-of-v1' };
+
+      await syncTeamUpdatesToLocal(teamConfig, localConfig, 'abc1234', undefined, delivered);
+
+      expect(delivered).toEqual({ [localFile]: await fileHash(localFile) });
+    });
+
+    it('refreshes applyTo when only the team paths change', async () => {
+      const localFile = path.join(instructionsDir, 'my-rule.instructions.md');
+      const pathsOnlyUpdate = oldRule.replace('src/**/*.ts', 'lib/**/*.ts');
+      await fse.outputFile(localFile, teamRuleToCopilotInstructions(oldRule));
+      await fse.writeFile(path.join(repoPath, 'rules/my-rule.md'), pathsOnlyUpdate);
+
+      await syncTeamUpdatesToLocal(teamConfig, localConfig, 'abc1234');
+
+      expect(await fse.readFile(localFile, 'utf-8')).toBe(teamRuleToCopilotInstructions(pathsOnlyUpdate));
+    });
+
+    it('keeps a locally edited header when only the team paths change', async () => {
+      const localFile = path.join(instructionsDir, 'my-rule.instructions.md');
+      const edited = teamRuleToCopilotInstructions(oldRule).replace('src/**/*.ts', 'custom/**/*.ts');
+      await fse.outputFile(localFile, edited);
+      await fse.writeFile(path.join(repoPath, 'rules/my-rule.md'), oldRule.replace('src/**/*.ts', 'lib/**/*.ts'));
+
+      await syncTeamUpdatesToLocal(teamConfig, localConfig, 'abc1234');
+
+      expect(await fse.readFile(localFile, 'utf-8')).toBe(edited);
+    });
+
+    it('preserves a genuine local body edit', async () => {
+      const localFile = path.join(instructionsDir, 'my-rule.instructions.md');
+      const edited = teamRuleToCopilotInstructions('my local edit\n');
+      await fse.outputFile(localFile, edited);
+      await fse.writeFile(path.join(repoPath, 'rules/my-rule.md'), newRule);
+      mockGetFileContentAtRev.mockResolvedValue(Buffer.from(oldRule));
+
+      await syncTeamUpdatesToLocal(teamConfig, localConfig, 'abc1234');
+
+      expect(await fse.readFile(localFile, 'utf-8')).toBe(edited);
+    });
+
+    it('leaves a current body alone without consulting history', async () => {
+      const localFile = path.join(instructionsDir, 'my-rule.instructions.md');
+      const current = teamRuleToCopilotInstructions(newRule);
+      await fse.outputFile(localFile, current);
+      await fse.writeFile(path.join(repoPath, 'rules/my-rule.md'), newRule);
+
+      await syncTeamUpdatesToLocal(teamConfig, localConfig, 'abc1234');
+
+      expect(await fse.readFile(localFile, 'utf-8')).toBe(current);
+      expect(mockGetFileContentAtRev).not.toHaveBeenCalled();
+    });
+
+    it('keeps the local copy when its base cannot be read', async () => {
+      const localFile = path.join(instructionsDir, 'my-rule.instructions.md');
+      const original = teamRuleToCopilotInstructions(oldRule);
+      await fse.outputFile(localFile, original);
+      await fse.writeFile(path.join(repoPath, 'rules/my-rule.md'), newRule);
+      mockGetFileContentAtRev.mockResolvedValue(null);
+
+      await syncTeamUpdatesToLocal(teamConfig, localConfig, 'missing-base');
+
+      expect(await fse.readFile(localFile, 'utf-8')).toBe(original);
+    });
+  });
+
   it('should skip sync when getFileContentAtRev returns null (rev invalid)', async () => {
     await fse.writeFile(path.join(repoPath, 'rules', 'my-rule.md'), 'v2');
     await fse.writeFile(path.join(homeDir, '.claude/rules', 'my-rule.md'), 'v1');
@@ -520,6 +654,21 @@ describe('syncTeamUpdatesToLocal — skills', () => {
     // Local should now have v2
     const content = await fse.readFile(path.join(localSkillDir, 'SKILL.md'), 'utf-8');
     expect(content).toBe('v2 skill');
+  });
+
+  it('records the team files of a skill it syncs as delivered, not the member\'s own (#822)', async () => {
+    const teamSkillDir = path.join(repoPath, 'skills', 'my-skill');
+    await fse.outputFile(path.join(teamSkillDir, 'SKILL.md'), 'v2 skill');
+    await fse.outputFile(path.join(teamSkillDir, 'CONTRIBUTORS'), 'alice\n');
+    const localSkillDir = path.join(homeDir, '.claude/skills', 'my-skill');
+    await fse.outputFile(path.join(localSkillDir, 'SKILL.md'), 'v1 skill');
+    await fse.outputFile(path.join(localSkillDir, 'notes.md'), 'mine');
+    mockGetFileContentAtRev.mockResolvedValue(Buffer.from('v1 skill'));
+    const delivered: Record<string, string> = { [path.join(localSkillDir, 'SKILL.md')]: 'hash-of-v1' };
+
+    await syncTeamUpdatesToLocal(teamConfig, localConfig, 'abc1234', undefined, delivered);
+
+    expect(delivered).toEqual({ [path.join(localSkillDir, 'SKILL.md')]: await fileHash(path.join(localSkillDir, 'SKILL.md')) });
   });
 
   it('should NOT sync skill dir when user edited any file', async () => {

@@ -136,7 +136,7 @@ async function remoteBranchExists(spec: BranchWorktreeSpec, repoRoot: string): P
  * stale. An explicit refspec creates and updates that tracking ref in every
  * clone (#706). Used by both the reports and learnings branches.
  */
-async function fetchTrackingRef(git: SimpleGit, branch: string): Promise<void> {
+export async function fetchTrackingRef(git: SimpleGit, branch: string): Promise<void> {
   await git.fetch(['origin', `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
 }
 
@@ -274,12 +274,7 @@ async function ensureWorktree(
  */
 async function removeOldCheckoutsInDotTeamai(spec: BranchWorktreeSpec, git: SimpleGit, wt: string): Promise<void> {
   const oldSuffix = `${path.sep}${path.join('.teamai', spec.worktreeDirname)}`;
-  const listing = await git.raw(['worktree', 'list', '--porcelain']);
-  for (const entry of listing.split('\n\n')) {
-    const lines = entry.split('\n');
-    const checkout = lines.find((l) => l.startsWith('worktree '))?.slice('worktree '.length);
-    const branch = lines.find((l) => l.startsWith('branch '))?.slice('branch '.length);
-    if (checkout === undefined || branch !== `refs/heads/${spec.branch}`) continue;
+  for (const checkout of await checkoutsOfBranch(spec, git)) {
     // resolve: git prints forward slashes on Windows too.
     if (!path.resolve(checkout).endsWith(oldSuffix) || path.resolve(checkout) === path.resolve(wt)) continue;
     try {
@@ -296,6 +291,31 @@ async function removeOldCheckoutsInDotTeamai(spec: BranchWorktreeSpec, git: Simp
       ));
     }
   }
+}
+
+/** The checkouts of this branch the repository behind `git` registers (git allows one). */
+async function checkoutsOfBranch(spec: BranchWorktreeSpec, git: SimpleGit): Promise<string[]> {
+  const listing = await git.raw(['worktree', 'list', '--porcelain']);
+  const checkouts: string[] = [];
+  for (const entry of listing.split('\n\n')) {
+    const lines = entry.split('\n');
+    const checkout = lines.find((l) => l.startsWith('worktree '))?.slice('worktree '.length);
+    const branch = lines.find((l) => l.startsWith('branch '))?.slice('branch '.length);
+    if (checkout !== undefined && branch === `refs/heads/${spec.branch}`) checkouts.push(checkout);
+  }
+  return checkouts;
+}
+
+/**
+ * Where this repository has the branch checked out, wherever that is: the
+ * shared checkout, or one an older teamai left in a checkout's `.teamai/`.
+ * Null when it has none, or no branch worktrees at all. Never another
+ * repository's checkout, since it is this repository's own registration.
+ */
+async function registeredCheckoutImpl(spec: BranchWorktreeSpec, localConfig: LocalConfig): Promise<string | null> {
+  if (!usesBranchWorktree(localConfig)) return null;
+  const [checkout] = await checkoutsOfBranch(spec, createGit(gitRoot(localConfig)));
+  return checkout ?? null;
 }
 
 /**
@@ -528,9 +548,15 @@ async function commitAndPushAt(
 ): Promise<PublishResult> {
   const git = createGit(wt);
 
-  await git.add(files);
-  const status = await git.status();
-  if (status.staged.length === 0 && !options.pushIfUnchanged && await nothingLeftToPush(git, spec)) {
+  // Literal: a filename with `[` or `*` would otherwise stage whatever it matches as a pattern.
+  await git.raw(['--literal-pathspecs', 'add', '--', ...files]);
+  // Only `files`: the checkout may hold a file someone else staged, and it must
+  // neither count as a change nor ride along in this commit. No paths would be the whole index.
+  const staged = files.length === 0
+    ? 0
+    : (await git.raw(['--literal-pathspecs', 'diff', '--cached', '--no-renames', '--name-only', '-z', '--', ...files]))
+      .split('\0').filter(Boolean).length;
+  if (staged === 0 && !options.pushIfUnchanged && await nothingLeftToPush(git, spec)) {
     // Nothing to commit AND nothing to deliver. Those are two different things:
     // an earlier attempt may have committed exactly this content and failed to
     // push it, and a caller that reads "already present" drops the only durable
@@ -541,7 +567,7 @@ async function commitAndPushAt(
 
   // A retry may reconstruct the same tree as a previously committed
   // but unconfirmed push. It still needs a push, without an empty commit.
-  if (status.staged.length > 0) await commitSkippingHooks(git, message);
+  if (staged > 0) await commitSkippingHooks(git, message, files);
 
   // Push with fetch+rebase retry. Each member only writes <user>.yaml, so
   // rebase conflicts are effectively impossible; retries handle the pure
@@ -559,8 +585,13 @@ async function commitAndPushAt(
         log.debug(`[${spec.logTag}] push failed after ${attempt} attempts: ${(pushErr as Error).message}`);
         return { status: 'failed', reason: (pushErr as Error).message };
       }
+      // The commit took only `files`: anything else staged or modified would
+      // make git refuse to rebase, on this attempt and every later one.
+      let carried: string | null = null;
       try {
         await fetchTrackingRef(git, spec.branch);
+        carried = await snapshotDirtyTree(spec, git);
+        if (carried) await git.raw(['reset', '--hard', 'HEAD']);
         await git.rebase([`origin/${spec.branch}`]);
       } catch (rebaseErr) {
         log.debug(`[${spec.logTag}] rebase failed, retrying: ${(rebaseErr as Error).message}`);
@@ -571,6 +602,7 @@ async function commitAndPushAt(
           // no rebase in progress
         }
       }
+      if (carried) await applyDirtySnapshot(spec, git, carried);
     }
   }
   return { status: 'failed', reason: `push did not land after ${MAX_PUSH_RETRIES} attempts` };
@@ -711,9 +743,11 @@ async function restoreConflictedFiles(spec: BranchWorktreeSpec, git: SimpleGit):
  * returns a dangling commit). `git rebase --autostash` would push onto the
  * shared stash list, which other worktrees of this repo also see.
  */
-async function snapshotDirtyTree(git: SimpleGit): Promise<string | null> {
+async function snapshotDirtyTree(spec: BranchWorktreeSpec, git: SimpleGit): Promise<string | null> {
   try {
     const sha = (await git.raw(['stash', 'create'])).trim();
+    // In debug.log, so a run killed before the snapshot is applied again can be recovered by hand.
+    if (sha.length > 0) log.debug(`[${spec.logTag}] uncommitted files saved as ${sha}; git stash apply --index ${sha} restores them`);
     return sha.length > 0 ? sha : null;
   } catch {
     return null;
@@ -722,11 +756,127 @@ async function snapshotDirtyTree(git: SimpleGit): Promise<string | null> {
 
 async function applyDirtySnapshot(spec: BranchWorktreeSpec, git: SimpleGit, sha: string): Promise<void> {
   try {
-    await git.raw(['stash', 'apply', sha]);
+    // `--index` keeps what was staged staged. It refuses, touching nothing,
+    // when the staged changes no longer apply; then restore the files alone.
+    await git.raw(['stash', 'apply', '--index', sha]);
+    return;
   } catch {
-    // apply conflicts leave UU paths; restoreConflictedFiles recovers them
+    try {
+      await git.raw(['stash', 'apply', sha]);
+    } catch {
+      // apply conflicts leave unmerged paths; restoreConflictsFromSnapshot resolves them
+    }
   }
-  await restoreConflictedFiles(spec, git);
+  const conflicted = await restoreConflictsFromSnapshot(spec, git, sha);
+  if (conflicted !== null) await restageSnapshotIndex(spec, git, sha, conflicted);
+}
+
+/**
+ * Resolve each stash-apply conflict to the snapshot's own copy of the path,
+ * left unstaged: its file, or no file where the snapshot had removed it (the
+ * version that removes is origin's, which HEAD holds). Unlike
+ * restoreConflictedFiles this needs no `--theirs` side, which a removal lacks,
+ * and on failure it resets nothing: it names the snapshot to restore from.
+ * Returns the conflicted paths, or null when they could not be resolved.
+ */
+async function restoreConflictsFromSnapshot(spec: BranchWorktreeSpec, git: SimpleGit, sha: string): Promise<string[] | null> {
+  let conflicted: string[] = [];
+  try {
+    conflicted = (await git.status()).conflicted ?? [];
+    if (conflicted.length === 0) return [];
+    const inSnapshot = new Set((await git.raw(['--literal-pathspecs', 'ls-tree', '-z', '--name-only', sha, '--', ...conflicted])).split('\0').filter(Boolean));
+    const kept = conflicted.filter((p) => inSnapshot.has(p));
+    const removed = conflicted.filter((p) => !inSnapshot.has(p));
+    if (kept.length > 0) await git.raw(['--literal-pathspecs', 'checkout', sha, '--', ...kept]);
+    if (removed.length > 0) await git.raw(['--literal-pathspecs', 'rm', '-q', '-f', '--', ...removed]);
+    await git.raw(['--literal-pathspecs', 'reset', '-q', 'HEAD', '--', ...conflicted]);
+    return conflicted;
+  } catch (e) {
+    const wt = await git.raw(['rev-parse', '--show-toplevel']).then((out) => out.trim(), () => spec.worktreeDirname);
+    log.warn(
+      `Could not restore uncommitted files in ${wt} after updating from origin (${failureReason(e)})` +
+        (conflicted.length > 0 ? `; ${conflicted.join(', ')} may hold conflict markers` : '') +
+        `. Nothing was discarded: commit ${sha} holds them as they were; read one with git -C "${wt}" show ${sha}:<file>, ` +
+        `or run git -C "${wt}" stash apply --index ${sha} once the conflicts are cleared.`,
+    );
+    return null;
+  }
+}
+
+/** A tree entry, as `ls-tree` prints it. */
+type TreeEntry = { mode: string; id: string };
+
+/**
+ * After a plain `stash apply`, put back what the snapshot had staged, and only
+ * where that is provably the same staging:
+ *  - origin did not change the path: its staged entry is restored as it was,
+ *    so a file staged in part stays staged in part;
+ *  - origin changed it, the apply merged without a conflict, and the file holds
+ *    exactly what was staged: staged again.
+ * Anything else stays unstaged, its content untouched, and is named in a
+ * warning: staging a conflicted path again would stage a revert of origin's change.
+ */
+async function restageSnapshotIndex(spec: BranchWorktreeSpec, git: SimpleGit, sha: string, conflicted: readonly string[]): Promise<void> {
+  let wt: string;
+  let paths: string[];
+  let base: Map<string, TreeEntry>;
+  let staged: Map<string, TreeEntry>;
+  let head: Map<string, TreeEntry>;
+  try {
+    wt = (await git.raw(['rev-parse', '--show-toplevel'])).trim();
+    // A `stash create` commit: first parent is HEAD at the time, second parent is the index.
+    paths = (await git.raw(['diff', '--name-only', '--no-renames', '-z', `${sha}^1`, `${sha}^2`])).split('\0').filter(Boolean);
+    if (paths.length === 0) return;
+    const entries = async (rev: string): Promise<Map<string, TreeEntry>> => {
+      const listing = await git.raw(['--literal-pathspecs', 'ls-tree', '-z', rev, '--', ...paths]);
+      // `<mode> <type> <id>\t<path>`
+      return new Map(listing.split('\0').filter(Boolean).map((line) => {
+        const [meta, p] = line.split('\t');
+        const [mode, , id] = meta.split(' ');
+        return [p, { mode, id }];
+      }));
+    };
+    base = await entries(`${sha}^1`);
+    staged = await entries(`${sha}^2`);
+    head = await entries('HEAD');
+  } catch (e) {
+    log.warn(
+      `Could not tell which files were staged before updating from origin (${failureReason(e)}); ` +
+        `a staged change may now be unstaged, its content kept. git stash apply --index ${sha} in that checkout restores the staging.`,
+    );
+    return;
+  }
+
+  const stage = async (p: string, entry: TreeEntry | undefined, exact: boolean): Promise<void> => {
+    if (entry === undefined) await git.raw(['update-index', '--force-remove', '--', p]);
+    else if (exact) await git.raw(['update-index', '--add', '--cacheinfo', `${entry.mode},${entry.id},${p}`]);
+    else await git.raw(['--literal-pathspecs', 'add', '--', p]);
+  };
+  const sameEntry = (a: TreeEntry | undefined, b: TreeEntry | undefined): boolean => a?.mode === b?.mode && a?.id === b?.id;
+
+  const unstaged: string[] = [];
+  for (const p of paths) {
+    const entry = staged.get(p);
+    try {
+      if (sameEntry(head.get(p), base.get(p))) {
+        await stage(p, entry, true);
+        continue;
+      }
+      const abs = path.join(wt, p);
+      const current = (await pathExists(abs)) ? (await git.raw(['hash-object', '--', abs])).trim() : undefined;
+      if (conflicted.includes(p) || current !== entry?.id) unstaged.push(p);
+      else await stage(p, entry, false);
+    } catch (e) {
+      log.debug(`[${spec.logTag}] cannot stage ${p} again: ${failureReason(e)}`);
+      unstaged.push(p);
+    }
+  }
+  if (unstaged.length > 0) {
+    log.warn(
+      `Origin changed files that were staged in ${wt}: ${unstaged.join(', ')}. They keep your content, unstaged. ` +
+        `Compare them with origin's version using git -C "${wt}" diff HEAD, then stage what you mean to keep.`,
+    );
+  }
 }
 
 /**
@@ -766,7 +916,7 @@ async function syncWorktree(spec: BranchWorktreeSpec, wt: string): Promise<void>
 
   let carried: string | null = null;
   if (dirty && ahead > 0) {
-    carried = await snapshotDirtyTree(git);
+    carried = await snapshotDirtyTree(spec, git);
     if (!carried) {
       log.debug(`[${spec.logTag}] uncommitted files block the refresh; using the local copy`);
       return;
@@ -890,6 +1040,8 @@ export interface BranchWorktree {
   checkOwner(localConfig: LocalConfig): Promise<void>;
   /** True when the checkout there is not provably this repository's; reads git's files, runs no git. */
   isForeignByFiles(localConfig: LocalConfig): Promise<boolean>;
+  /** Where this repository has the branch checked out, the old `.teamai/` place included; creates nothing. */
+  registeredCheckout(localConfig: LocalConfig): Promise<string | null>;
 }
 
 /**
@@ -918,5 +1070,6 @@ export function createBranchWorktree(spec: BranchWorktreeSpec): BranchWorktree {
     refresh: (localConfig, options) => refreshImpl(spec, localConfig, options),
     checkOwner: (localConfig) => checkOwnerImpl(spec, localConfig),
     isForeignByFiles: (localConfig) => isForeignByFilesImpl(spec, localConfig),
+    registeredCheckout: (localConfig) => registeredCheckoutImpl(spec, localConfig),
   };
 }

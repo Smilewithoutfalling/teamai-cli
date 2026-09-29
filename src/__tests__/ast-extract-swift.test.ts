@@ -174,4 +174,19 @@ describe('Swift AST structural extraction (web-tree-sitter WASM)', () => {
     const memberCall = result.callSites.find((c) => c.receiver === 'shape');
     expect(memberCall?.calleeText).toBe('shape.draw');
   });
+
+  it('keeps the process alive while V8 would tier up the Swift grammar', async () => {
+    // Node 24 aborts the whole process with "Fatal process out of memory: Zone"
+    // shortly after a Swift parse, from V8's background optimizing compile of
+    // the grammar (nodejs/node#63421). Make the grammar hot, then give that
+    // compile time to run.
+    const source = 'import Foundation\nstruct Point: Equatable { func norm() -> Int { return 1 } }\n'.repeat(50);
+    for (let i = 0; i < 3; i++) {
+      await extract(source);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+
+    const { result } = await extract(source);
+    expect(result.stats.filesParsed).toBe(1);
+  });
 });

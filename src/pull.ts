@@ -21,6 +21,9 @@ import { isToolInstalledForConfig, ResourceHandler } from './resources/base.js';
 import { skillsDirForTool } from './resources/skills.js';
 import { ruleFileExtensionForTool } from './resources/rule-format.js';
 import { AGENT_FILE_EXTENSIONS } from './resources/agent-format.js';
+import {
+  forgetDelivered, judgeCopy, openLedger, removedCopyChanged, reportKept, type DeliveredHashes, type DeliveryLedger,
+} from './resources/delivered-copies.js';
 import { BUILTIN_SKILL_NAMES } from './builtin-skills.js';
 import type { GlobalOptions, ResourceType, ResourceItem, TeamaiConfig, LocalConfig, State } from './types.js';
 import {
@@ -305,6 +308,24 @@ async function getExistingLocalNames(
   return existing;
 }
 
+/** `--dry-run`: name each copy the sync would keep because the member changed it (#822). */
+async function reportWouldKeep(
+  handler: ResourceHandler,
+  items: readonly ResourceItem[],
+  freshConfig: TeamaiConfig,
+  localConfig: LocalConfig,
+  ledger: DeliveryLedger,
+  scopeLabel: string,
+): Promise<void> {
+  for (const item of items) {
+    for (const target of await handler.deliveryTargets(freshConfig, localConfig, item)) {
+      if ((await judgeCopy(ledger.previous, item, target)).kind === 'keep') {
+        log.info(`[${scopeLabel}] [dry-run] Would keep ${target.dest}: you changed it since teamai delivered it.`);
+      }
+    }
+  }
+}
+
 /**
  * Format pull detail output showing new vs updated items.
  */
@@ -399,11 +420,13 @@ function tombstoneExtensions(type: ResourceType, tool: string): readonly string[
  * Called from the full sync and from the "already synced" fast path: a CLI
  * upgrade that widens the extensions above must still reach a machine whose
  * team repo HEAD has not moved since it pulled the tombstone (issue #576).
+ * A copy the member changed since teamai delivered it is kept (#822).
  */
 async function cleanupTombstonedResources(
   freshConfig: TeamaiConfig,
   localConfig: LocalConfig,
   scopeLabel: string,
+  ledger: DeliveryLedger,
 ): Promise<void> {
   // Each entry maps a resource type to the field on toolPath that names the
   // tool-side directory; `tombstoneExtensions` supplies the filename suffixes.
@@ -440,7 +463,12 @@ async function cleanupTombstonedResources(
             log.warn(`[${scopeLabel}] Kept tombstoned skill "${name}" (${tool}): it has local VCS metadata (.git) that may hold unpushed history. Back it up, then delete it manually.`);
             continue;
           }
+          if (await removedCopyChanged(ledger.previous, localPath)) {
+            log.warn(`[${scopeLabel}] Kept ${localPath}: the team removed ${name}, but you changed this copy. Delete it when you no longer need it.`);
+            continue;
+          }
           await remove(localPath);
+          forgetDelivered(ledger.hashes, localPath);
           log.debug(`[${scopeLabel}] Cleaned up tombstoned ${type} ${name} from ${dir}`);
         }
       }
@@ -661,11 +689,30 @@ export async function userScopeRecord(state: State): Promise<CheckoutRecord> {
   return record;
 }
 
-/** `records` after a forced full sync: see FORCED_FULL_SYNC_REV. */
+/**
+ * What teamai last wrote at each skill, rule and agent file of the checkout
+ * `localConfig`'s pulls deliver into, or undefined when nothing is recorded
+ * yet (#822).
+ */
+export async function deliveredHashes(localConfig: LocalConfig, state?: State): Promise<DeliveredHashes | undefined> {
+  const key = await checkoutRecordKey(localConfig);
+  if (!key) return undefined;
+  return (state ?? await loadStateForScope(localConfig)).lastPullByWorkspace?.[key]?.delivered;
+}
+
+/**
+ * `records` after a forced full sync: see FORCED_FULL_SYNC_REV. Each keeps
+ * what teamai delivered into its checkout, or that checkout's next pull would
+ * overwrite the copies its member changed.
+ */
 function awaitingFullSync(records: Record<string, CheckoutRecord>): Record<string, CheckoutRecord> {
   return Object.fromEntries(Object.entries(records).map(([key, record]) => {
     const pushBaseRevs = checkoutBaseRevs(record).slice(0, MAX_PUSH_BASE_REVS);
-    const reset: CheckoutRecord = { rev: FORCED_FULL_SYNC_REV, targets: record.targets };
+    const reset: CheckoutRecord = {
+      rev: FORCED_FULL_SYNC_REV,
+      targets: record.targets,
+      ...(record.delivered ? { delivered: record.delivered } : {}),
+    };
     return [key, pushBaseRevs.length === 0 ? reset : { ...reset, pushBaseRevs }];
   }));
 }
@@ -752,11 +799,13 @@ async function pullForScope(
   // partition sync lock across this scope and the lock is not reentrant, so
   // publishing must not try to take it again. Never let it block the pull.
   try {
-    const queue = await publishQueuedLearnings(localConfig, localConfig.username, { holdsSyncLock: true });
-    if (queue.published.length > 0) {
+    const queue = await publishQueuedLearnings(localConfig, localConfig.username, { holdsSyncLock: true, dryRun: options.dryRun });
+    if (options.dryRun) {
+      if (queue.remaining > 0) log.info(`[${scopeLabel}] [dry-run] Would publish ${queue.remaining} queued learning(s)`);
+    } else if (queue.published.length > 0) {
       log.success(`Published ${queue.published.length} queued learning(s)`);
     }
-    if (queue.remaining > 0) {
+    if (queue.remaining > 0 && !options.dryRun) {
       // Say it out loud. A member whose pushes are rejected would otherwise
       // queue notes forever and never hear about it.
       reported.add('pending-learnings');
@@ -1017,7 +1066,7 @@ async function pullForScope(
           // Same reason: a machine that already pulled a tombstone with an older
           // CLI keeps the copies that CLI failed to delete, and its stored rev
           // never moves again. Re-run the cleanup so the upgrade reaches it (#576).
-          await cleanupTombstonedResources(freshConfig, localConfig, scopeLabel);
+          await cleanupTombstonedResources(freshConfig, localConfig, scopeLabel, openLedger(await deliveredHashes(localConfig, state)));
           // A repo that has not moved can still carry a malformed env.yaml, or
           // scope a variable this CLI version now withholds; the Step 2 env
           // branch below is unreachable from here.
@@ -1047,6 +1096,10 @@ async function pullForScope(
 
   const excludedSkills = new Set(localConfig.excludedSkills ?? []);
 
+  // What teamai last wrote into this checkout: a copy changed since is kept,
+  // and this pull's writes are recorded when the state is saved (#822).
+  const ledger = openLedger(await deliveredHashes(localConfig));
+
   // Step 2: Sync each resource type
   let totalSynced = 0;
   let docsSyncFailed = false;
@@ -1070,15 +1123,17 @@ async function pullForScope(
         if (items.length > 0) {
           log.info(`[${scopeLabel}] [dry-run] Would sync ${items.length} rule(s)${skippedByTags > 0 ? ` (skipped ${skippedByTags} by tags)` : ''}`);
         }
+        await reportWouldKeep(rulesHandler, items, freshConfig, localConfig, ledger, scopeLabel);
       } else {
         // Always call pullAllRules, even with an empty set: it also cleans up
         // stale local rule files and deactivates the OpenCode instructions glob
         // when the team's last rule is removed. Guarding on items.length > 0
         // would leak those artifacts on the machine after upstream deletion.
-        await rulesHandler.pullAllRules(freshConfig, localConfig, items, replaced);
+        await rulesHandler.pullAllRules(freshConfig, localConfig, items, replaced, ledger);
         if (items.length > 0) {
           log.success(`[${scopeLabel}] Synced ${items.length} rule(s)${skippedByTags > 0 ? ` (skipped ${skippedByTags} by tags)` : ''}`);
         }
+        reportKept(ledger, scopeLabel);
       }
       totalSynced += items.length;
       continue;
@@ -1184,6 +1239,7 @@ async function pullForScope(
           log.dim(`  ${item.name}`);
         }
       }
+      await reportWouldKeep(handler, items, freshConfig, localConfig, ledger, scopeLabel);
     } else {
       // Skills and agents land in a tool's own directory, which a brand-new
       // member may not have yet. The handler skips such a tool by design and
@@ -1197,7 +1253,7 @@ async function pullForScope(
         || (await getInstalledResourceTargets(freshConfig, localConfig, type)).length > 0;
 
       for (const item of items) {
-        await handler.pullItem(item, freshConfig, localConfig);
+        await handler.pullItem(item, freshConfig, localConfig, ledger);
       }
 
       if (canReceive) {
@@ -1207,6 +1263,7 @@ async function pullForScope(
           log.success(`[${scopeLabel}] Synced ${items.length} ${type}`);
         }
       }
+      reportKept(ledger, scopeLabel);
     }
 
     totalSynced += items.length;
@@ -1214,7 +1271,7 @@ async function pullForScope(
 
   // Step 3: Clean up tombstoned resources
   if (!options.dryRun) {
-    await cleanupTombstonedResources(freshConfig, localConfig, scopeLabel);
+    await cleanupTombstonedResources(freshConfig, localConfig, scopeLabel, ledger);
 
     if (roleContext) {
       if (!skillsHeld) {
@@ -1389,6 +1446,7 @@ async function pullForScope(
         ? await userScopeRecord(state)
         : state.lastPullByWorkspace?.[recordKey] ?? { rev: FORCED_FULL_SYNC_REV, targets: syncedTargets };
       addPushBaseRev(record, deliveredRev);
+      record.delivered = ledger.hashes;
       state.lastPullByWorkspace = { ...state.lastPullByWorkspace, [recordKey]: record };
     } else if (recordKey && deliveredRev) {
       // A forced full sync (lastPullRev cleared) leaves every other checkout
@@ -1402,7 +1460,7 @@ async function pullForScope(
         ? await liveCheckoutRecords(localConfig.projectRoot, state.lastPullByWorkspace)
         : undefined;
       const others = previousRev === null && live ? awaitingFullSync(live) : live;
-      const record: CheckoutRecord = { rev: deliveredRev, targets: syncedTargets };
+      const record: CheckoutRecord = { rev: deliveredRev, targets: syncedTargets, delivered: ledger.hashes };
       state.lastPullByWorkspace = {
         ...others,
         [recordKey]: keptBases.length > 0 ? { ...record, pushBaseRevs: keptBases } : record,
@@ -1863,8 +1921,13 @@ export async function pull(
     // needs no lock.
     if (config.repo.kind === 'http') return true;
     const lock = path.join(getDataHome(config), SYNC_LOCK_FILENAME);
-    if (await acquireLock(lock)) {
-      heldLocks.set(config, lock);
+    // `acquireLock` under a dry run reads the lock's state instead of creating
+    // it — taking one is itself a write (#866) — so the preview answers with
+    // what the real run would have found: a live holder reports this scope as
+    // contended and skips it, exactly as a real pull does. Nothing is recorded
+    // for release, because nothing was taken.
+    if (await acquireLock(lock, { dryRun: options.dryRun })) {
+      if (!options.dryRun) heldLocks.set(config, lock);
       return true;
     }
     // User-visible: this scope is skipped wholesale (no fetch/deploy/reconcile),
@@ -1882,7 +1945,11 @@ export async function pull(
   let projectConfig: LocalConfig | null = null;
   const unreadable: string[] = [];
   try {
-    projectConfig = await detectProjectConfig(undefined, (configPath, error) => { unreadable.push(`${configPath}: ${error}`); });
+    projectConfig = await detectProjectConfig(
+      undefined,
+      (configPath, error) => { unreadable.push(`${configPath}: ${error}`); },
+      { dryRun: options.dryRun },
+    );
   } catch (e) {
     log.warn(`Project-scope detection error: ${(e as Error).message}`);
   }
@@ -1911,7 +1978,7 @@ export async function pull(
     log.info('project scope detected, skipped user scope');
   } else {
     try {
-      const loadedUserConfig = await loadLocalConfigForScope('user');
+      const loadedUserConfig = await loadLocalConfigForScope('user', undefined, { dryRun: options.dryRun });
       if (loadedUserConfig) {
         if (inheritUserScope) {
           inheritedUserConfig = loadedUserConfig;

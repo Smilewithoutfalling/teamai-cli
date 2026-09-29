@@ -52,9 +52,9 @@ export async function readFileIfExists(filePath: string): Promise<string | null>
 }
 
 /**
- * Write a file, creating parent dirs as needed.
+ * Write a file, creating parent dirs as needed. Bytes are written as they are.
  */
-export async function writeFile(filePath: string, content: string): Promise<void> {
+export async function writeFile(filePath: string, content: string | Uint8Array): Promise<void> {
   const expanded = expandHome(filePath);
   await fse.ensureDir(path.dirname(expanded));
   await fse.writeFile(expanded, content, 'utf-8');
@@ -382,7 +382,7 @@ export async function getDirLatestMtime(dirPath: string): Promise<number> {
 /**
  * Compute SHA-256 hash of a file's contents. Returns null if file does not exist.
  */
-async function fileHash(filePath: string): Promise<string | null> {
+export async function fileHash(filePath: string): Promise<string | null> {
   try {
     const content = await fse.readFile(filePath);
     return crypto.createHash('sha256').update(content).digest('hex');

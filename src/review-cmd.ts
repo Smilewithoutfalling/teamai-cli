@@ -125,23 +125,23 @@ async function applyOne(
     item: PendingReviewItem,
 ): Promise<{ ok: boolean; reason?: string }> {
     if (item.kind !== 'codebase-section') {
-        return { ok: false, reason: `kind ${item.kind} 不支持自动应用，请人工处理` };
+        return { ok: false, reason: `kind ${item.kind} does not support auto-apply; please handle manually` };
     }
 
     const { file, section } = item.target;
     if (!section) {
-        return { ok: false, reason: 'target.section 缺失' };
+        return { ok: false, reason: 'target.section is missing' };
     }
 
     const filePath = path.isAbsolute(file) ? file : path.join(cwd, file);
     if (!await fs.pathExists(filePath)) {
-        return { ok: false, reason: `目标文件不存在：${filePath}` };
+        return { ok: false, reason: `target file not found: ${filePath}` };
     }
 
     const oldMd = await fs.readFile(filePath, 'utf8');
     const body = String(item.payload['content'] ?? '');
     if (!body) {
-        return { ok: false, reason: 'payload.content 为空' };
+        return { ok: false, reason: 'payload.content is empty' };
     }
 
     try {
@@ -236,7 +236,7 @@ export async function reviewCmd(opts: ReviewCmdOptions): Promise<void> {
             console.log(JSON.stringify({ ok: true, action: 'reject', id: idArg }));
             return;
         }
-        console.log(chalk.yellow(`[review] 已拒绝：${idArg}`));
+        console.log(chalk.yellow(`[review] rejected: ${idArg}`));
         return;
     }
 
@@ -256,7 +256,7 @@ export async function reviewCmd(opts: ReviewCmdOptions): Promise<void> {
         if (result.ok) {
             console.log(chalk.green(`[review] applied: ${idArg} → ${item.target.file}`));
         } else {
-            console.log(chalk.red(`[review] 应用失败：${idArg} — ${result.reason}`));
+            console.log(chalk.red(`[review] apply failed: ${idArg} — ${result.reason}`));
         }
         return;
     }
