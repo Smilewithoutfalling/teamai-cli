@@ -591,6 +591,37 @@ describe('Swift module-scope resolution yields to enclosing bindings', () => {
     expect(references[0]?.to).toBe('Sources/App/Worker.swift');
   });
 
+  it('does not let an initializer mention stand in for a binding', async () => {
+    const { result } = await extractFiles([
+      ['Sources/App/Worker.swift', 'func work() -> Int { return 1 }\n'],
+      ['Sources/App/Run.swift', 'func run() {\n  let alias = work\n  work()\n}\n'],
+    ]);
+
+    // `let alias = work` binds `alias`; the name on the right is a *use*. Both
+    // sit on the same `property_declaration`, so the identifier alone cannot
+    // tell them apart -- the grammar marks them with different fields (`name`
+    // against `value`), and the walker has to read the field. Counting the
+    // mention as a binding suppressed the call on the next line.
+    const references = result.edges.filter((e) => e.relation === 'REFERENCES');
+    expect(references).toHaveLength(1);
+    expect(references[0]?.from).toBe('Sources/App/Run.swift');
+    expect(references[0]?.to).toBe('Sources/App/Worker.swift');
+  });
+
+  it('does not let an assignment target stand in for a binding', async () => {
+    const { result } = await extractFiles([
+      ['Sources/App/Worker.swift', 'func work() -> Int { return 1 }\n'],
+      ['Sources/App/Run.swift', 'func run() {\n  var alias = 0\n  alias = work()\n  work()\n}\n'],
+    ]);
+
+    // The same position in an assignment rather than a declaration, and with no
+    // `let` in sight. A rule that had to be told about one statement form after
+    // another would need a third fix here; reading the position needs none.
+    const references = result.edges.filter((e) => e.relation === 'REFERENCES');
+    expect(references).toHaveLength(2);
+    for (const reference of references) expect(reference.to).toBe('Sources/App/Worker.swift');
+  });
+
   it('resolves a call that passes its own name', async () => {
     const { result } = await extractFiles([
       ['Sources/App/Worker.swift', 'func work() -> Int { return 1 }\n'],
@@ -613,9 +644,11 @@ describe('Swift module-scope resolution yields to enclosing bindings', () => {
       ['Sources/App/Run.swift', 'func run() {\n  consume({ work in work() })\n}\n'],
     ]);
 
-    // A closure handed over as an argument opens its own scope: the argument
-    // marker must be cleared on the way in, or the parameter stops counting and
-    // the inner call resolves to the sibling function it does not mean.
+    // A closure handed over as an argument opens its own scope: its parameter
+    // binds `work` for the body, so the inner call refers to that and not to the
+    // sibling function. The binding sits on the closure's parameter, which is
+    // where the walker reads it -- reaching it through an argument does not hide
+    // it.
     expect(result.edges.filter((e) => e.relation === 'REFERENCES')).toHaveLength(0);
   });
 });

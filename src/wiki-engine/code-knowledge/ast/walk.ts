@@ -248,61 +248,82 @@ function addSwiftName(name: string, names: Set<string>): void {
  * names are gathered here — while the tree is still in hand — and carried on the
  * call site.
  *
- * The question asked is deliberately *closed*: does the name occur anywhere else
- * in this declaration? Every construct that can introduce a name — a parameter, a
- * local `let`, `if let`, `guard let`, `for … in`, `catch let`, `case let`, a
- * stored property, a generic parameter, a closure capture list — puts that name
- * somewhere else in the declaration, whether or not this walk understands the
- * construct. Enumerating the constructs instead is precisely what makes a
- * whitelist the defect: there is always one more binding form, and that was the
- * shape of every review round this file has had.
+ * What is gathered is the set of names the declaration *binds*. The version this
+ * replaces asked a different and open question — does this name occur anywhere
+ * else in the declaration? — and answered it too broadly on both sides: an
+ * argument mention (`consume(work)`) and an initializer mention
+ * (`let alias = work`) are uses, yet they were collected as bindings and
+ * suppressed the module lookup of every `work()` behind them. Each review round
+ * found one more position of that kind, because "occurs somewhere" is satisfied
+ * by every expression position there is.
  *
- * The cost is paid on the other side, deliberately. A name that merely *appears*
- * in the declaration — a value passed around rather than bound, a sibling
- * statement's local — suppresses the resolution too. Over-suppressing costs a
- * resolution; the opposite error invents an edge, and that asymmetry is the
- * point.
+ * Binding, unlike occurrence, is finite: a Swift declaration can introduce a
+ * name only in the ways `isSwiftBindingPosition` recognises, and those are fixed
+ * by the language rather than by the review round. Asking the narrower question
+ * is what lets this terminate.
  */
-function collectSwiftShadowedNames(node: Node, names: Set<string>, insideArgument = false): void {
+function collectSwiftShadowedNames(node: Node, names: Set<string>): void {
+  // A type position names a type, not a value, and must not shadow a call. The
+  // field rule below rejects these on its own — a `type_identifier` under
+  // `user_type` carries no field naming it — so this states the constraint
+  // directly rather than resting on that: a generic parameter is a
+  // `type_identifier` too, and it *does* bind, one level down at `type_parameter`.
+  if (node.type === "user_type") {
+    return;
+  }
   if (node.type === "simple_identifier" || node.type === "type_identifier") {
-    // An argument is an expression position: `consume(work)` mentions `work`, it
-    // does not bind it. Counting the mention suppresses the resolution of every
-    // `work()` in the declaration — including the call that passes its own name,
-    // `work(work)`, whose callee is the very thing the argument names.
-    if (!insideArgument) {
+    if (isSwiftBindingPosition(node)) {
       addSwiftName(node.text, names);
     }
     return;
   }
-  // A type position such as `Int` in `(work: Int)` names a type, not a value;
-  // collecting it would shadow every call to a same-named function. A generic
-  // parameter is a `type_identifier` too, but it never sits under `user_type`,
-  // so it still lands in the set.
-  if (node.type === "user_type") {
-    return;
-  }
-  // The name a *call* goes through is a use, not a binding. Without this,
-  // `work(); work()` has each call count the other one's identifier as evidence,
-  // and both cross-file resolutions are suppressed. Arguments are still walked,
-  // so a closure that does bind a name — `handler { work in work() }` — keeps
-  // counting.
-  if (node.type === "call_expression") {
-    for (const child of namedChildrenOf(node)) {
-      if (child.type === "navigation_expression" || child.type === "simple_identifier") {
-        continue;
-      }
-      collectSwiftShadowedNames(child, names, insideArgument);
-    }
-    return;
-  }
-  // A closure opens a scope, so its parameters and captures bind for real however
-  // the closure itself was reached — including as an argument — and the argument
-  // marker is cleared on the way in. Everything else keeps the marker it was
-  // given.
-  const childInsideArgument = node.type === "lambda_literal" ? false : insideArgument || node.type === "value_arguments";
   for (const child of namedChildrenOf(node)) {
-    collectSwiftShadowedNames(child, names, childInsideArgument);
+    collectSwiftShadowedNames(child, names);
   }
+}
+
+/**
+ * Whether this identifier is where a name is *bound* rather than where one is
+ * *used*.
+ *
+ * The identifier alone cannot say — `work` binds in `let work = 1` and is used
+ * in `let alias = work` — so the answer is read off its parent, which
+ * tree-sitter-swift marks in one of two ways:
+ *
+ * - a grammar **field**: `name` on a declaration, a parameter, a closure
+ *   parameter or a capture-list entry; `bound_identifier` on the name an
+ *   `if let` / `guard let` / `while let` introduces.
+ * - a **container node** with no field to key on: `pattern`, which carries the
+ *   names a `let` / `var` / `for` / `catch` / `case` binds one level down or
+ *   several (a tuple pattern nests `pattern` inside `pattern`), and
+ *   `type_parameter`, which is how a generic parameter is declared.
+ *
+ * Every other position is a use by construction — an initializer, an argument, a
+ * receiver, an assigned-to target, a bare expression — and none of them appear
+ * above, so none of them are collected. That is the point: this is an allow-list
+ * of the language's name-introduction sites, not a deny-list of the positions a
+ * review has found so far.
+ */
+function isSwiftBindingPosition(node: Node): boolean {
+  const parent = node.parent;
+  if (!parent) {
+    return false;
+  }
+  if (parent.type === "pattern" || parent.type === "type_parameter") {
+    return true;
+  }
+  return (
+    sameSpan(parent.childForFieldName("name"), node) ||
+    sameSpan(parent.childForFieldName("bound_identifier"), node)
+  );
+}
+
+/**
+ * web-tree-sitter hands out a fresh wrapper on every navigation, so two nodes
+ * that cover the same source are not `===`. Compare the spans instead.
+ */
+function sameSpan(candidate: Node | null, node: Node): boolean {
+  return candidate !== null && candidate.startIndex === node.startIndex && candidate.endIndex === node.endIndex;
 }
 
 /**
@@ -315,15 +336,13 @@ function collectSwiftShadowedNames(node: Node, names: Set<string>, insideArgumen
  * walk per call. The per-call version made a function holding N calls cost
  * O(N²) AST visits.
  *
- * Read whole, the declaration no longer excludes the call's own subtree, and
- * that side effect mattered: a name appearing only in the call's own arguments
- * used to be invisible, so `work(work)` still resolved through its callee.
- * Marking argument positions restores that — and goes one step further, since a
- * mention in a *sibling* call (`consume(work)` before a bare `work()`) was
- * counted as a binding by the older version as well. An argument is an
- * expression position: it can mention a name, never bind one. A closure reached
- * through an argument still opens its own scope, so its parameters and captures
- * are collected.
+ * Reading the declaration whole is also what forced the *position* exclusions
+ * the earlier version carried. A subtree walk from the call never entered the
+ * call's own arguments, so `work(work)` resolved even though its argument
+ * mentions its callee; reading the declaration brought that mention in, and it
+ * took one exclusion. `let alias = work` then needed a second. Collecting
+ * binding positions makes the question the whole-declaration read asks the same
+ * question as before, so nothing is left to exclude.
  *
  * Keyed by `startIndex`: top-level declarations do not overlap, and tree-sitter
  * hands out a fresh wrapper on every navigation, so node identity is not
@@ -346,9 +365,8 @@ function buildSwiftShadowedNames(root: Node): Map<number, string[]> {
  * call: it is the outermost ancestor below the file, and the file's own module
  * level is what the fallback resolves *against*, so it cannot also be what
  * shadows the name. A call that *is* a top-level statement has no such
- * declaration above it, and the map holds only its own bare callee — which is
- * skipped as a callee position, leaving the empty set the per-call walk
- * produced.
+ * declaration above it, so nothing was keyed under it and the lookup yields the
+ * empty set — its bare callee is not a binding position in any case.
  */
 function swiftShadowedNamesAt(node: Node, byDeclaration: Map<number, string[]>): string[] {
   let scope: Node = node;

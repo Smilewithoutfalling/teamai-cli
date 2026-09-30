@@ -41,12 +41,14 @@ export interface AstCallSite {
    * tree knows this, which is why it is recorded here and not recomputed in the
    * resolver.
    *
-   * Collected per declaration rather than per call site, so it is deliberately
-   * coarse: the declaration is read whole, and a name that merely occurs in it —
-   * passed around as an argument rather than bound — counts. Both directions of
-   * error are not equal here: an extra name costs a resolution, a missing one
-   * invents a cross-file edge. Absent for non-Swift files and for sites with no
-   * such binding.
+   * Collected per declaration rather than per call site: the declaration is read
+   * whole, and what it yields is the names the declaration *binds* — the
+   * positions the grammar marks as introductions. A name that merely occurs in
+   * the declaration, such as one passed as an argument or used as an
+   * initializer, is a use and does not count. Both directions of error are not
+   * equal here: an extra name costs a resolution, a missing one invents a
+   * cross-file edge. Absent for non-Swift files and for sites with no such
+   * binding.
    */
   localBindings?: string[];
   resolvedTargetId?: string;
