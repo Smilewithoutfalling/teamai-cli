@@ -608,20 +608,38 @@ describe('Swift module-scope resolution yields to enclosing bindings', () => {
     expect(references[0]?.to).toBe('Sources/App/Worker.swift');
   });
 
-  it('does not let an assignment target stand in for a binding', async () => {
+  it('does not let an assignment value mention stand in for a binding', async () => {
     const { result } = await extractFiles([
       ['Sources/App/Worker.swift', 'func work() -> Int { return 1 }\n'],
       ['Sources/App/Run.swift', 'func run() {\n  var alias = 0\n  alias = work\n  work()\n}\n'],
     ]);
 
-    // `alias = work` binds `alias`, not the name on the right of the `=`. Reading
-    // that name as if the assignment declared it shadowed the module-level `work`,
-    // and the call on the next line then resolved to nothing. A rule that had to
-    // be told about one statement form after another would need a third fix here;
-    // reading the position needs none.
+    // `alias = work` assigns to `alias`; `work` on the right is a *mention*.
+    // Reading that mention as if the assignment declared it shadowed the
+    // module-level `work`, and the call on the next line then resolved to
+    // nothing. A rule that had to be told about one statement form after another
+    // would need a third fix here; reading the position needs none.
     const references = result.edges.filter((e) => e.relation === 'REFERENCES');
     expect(references).toHaveLength(1);
     expect(references[0]?.to).toBe('Sources/App/Worker.swift');
+  });
+
+  it('does not let an assignment target stand in for a binding', async () => {
+    const { result } = await extractFiles([
+      ['Sources/App/Alias.swift', 'func alias() -> Int { return 1 }\n'],
+      ['Sources/App/Run.swift', 'func run() {\n  alias = work\n  alias()\n}\n'],
+    ]);
+
+    // The same statement read from the other side. `alias` is the assignment
+    // *target* and `work` on the right is a mention, so neither side is a
+    // binding and `alias()` answers to the sibling file. The value-position case
+    // above cannot see this one: its target is a name a real `var` already
+    // bound, so a rule that read assignment targets as declarations too would
+    // leave that test green.
+    const references = result.edges.filter((e) => e.relation === 'REFERENCES');
+    expect(references).toHaveLength(1);
+    expect(references[0]?.from).toBe('Sources/App/Run.swift');
+    expect(references[0]?.to).toBe('Sources/App/Alias.swift');
   });
 
   it('resolves a call that passes its own name', async () => {
