@@ -527,4 +527,32 @@ describe('--dry-run on a fresh self-mode clone (#866)', () => {
     // A dry run may parse the remote, but nothing else may reach a provider.
     expect(providerCalls).toEqual([]);
   });
+
+  // `pull` also refreshes the team repo, and in self mode that refresh self-heals
+  // an older `.teamai/.gitignore` — a TRACKED file in the member's own checkout.
+  // The fixture above has no `.teamai/.gitignore` at all, and the migration
+  // returns early when the file is missing, so this was the one path in the
+  // refresh the assertion above could not reach (#866 review).
+  it('pull --dry-run does not rewrite an existing .teamai/.gitignore (#866)', async () => {
+    const project = process.cwd();
+    const gitignore = path.join(project, '.teamai', '.gitignore');
+    // A pre-beta.5 shape: a bare `env` line, the one the self-heal drops so team
+    // env vars can reach main. Present and committed, as it would be for a
+    // teammate who cloned before the migration landed.
+    const preBeta5 = 'token\nenv\nenv.local\n';
+    fs.writeFileSync(gitignore, preBeta5);
+    const git = (...args: string[]) =>
+      execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd: project, stdio: 'ignore' });
+    git('add', '-A');
+    git('commit', '-q', '-m', 'pre-beta.5 gitignore');
+
+    const before = snapshotTree(root);
+    const error = await pull({ dryRun: true }).then(() => null, (e: unknown) => e);
+
+    expect(error).toBeNull();
+    expect(fs.readFileSync(gitignore, 'utf-8')).toBe(preBeta5);
+    const after = snapshotTree(root);
+    for (const key of Object.keys(before)) expect(after[key]).toBe(before[key]);
+    expect(providerCalls).toEqual([]);
+  });
 });

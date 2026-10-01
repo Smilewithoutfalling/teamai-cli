@@ -83,9 +83,14 @@ const FILE_NOT_FOUND_ERROR_CODE = 'ENOENT';
  * `submodulesChanged` marks a run whose submodule update succeeded but moved the
  * tree on disk: the caller must then NOT take that same fast path *this* run,
  * because the parent rev alone cannot see the change (issue #525).
+ *
+ * `options.dryRun` marks a preview. The refresh still reads the tree, but the
+ * self-mode `.gitignore` self-heal is skipped: it rewrites a tracked file in the
+ * member's checkout, and a preview writes nothing (#866).
  */
 async function refreshTeamRepo(
   localConfig: LocalConfig,
+  options: { dryRun?: boolean } = {},
 ): Promise<{ label: string; version: string | null; submodulesFailed: boolean; submodulesChanged: boolean }> {
   if (localConfig.repo.kind === 'http') {
     const { resolveApiKey } = await import('./api-key.js');
@@ -108,10 +113,15 @@ async function refreshTeamRepo(
     // Self-heal an older .teamai/.gitignore that still ignores `env` (pre-beta.5),
     // which would keep team env vars off main. Best-effort; prompts the user to
     // commit the change.
-    try {
-      const { migrateSelfModeGitignore } = await import('./init.js');
-      await migrateSelfModeGitignore(localConfig);
-    } catch { /* best-effort */ }
+    //
+    // It rewrites a TRACKED file, so a preview must not run it. The migration is
+    // idempotent, so the next real pull performs it (#866).
+    if (!options.dryRun) {
+      try {
+        const { migrateSelfModeGitignore } = await import('./init.js');
+        await migrateSelfModeGitignore(localConfig);
+      } catch { /* best-effort */ }
+    }
 
     let version: string | null = null;
     try {
@@ -913,7 +923,7 @@ async function pullForScope(
   // unchanged-rev fast path for THIS run — the parent rev cannot see it (#525).
   let submodulesChanged = false;
   try {
-    const refresh = await refreshTeamRepo(localConfig);
+    const refresh = await refreshTeamRepo(localConfig, options);
     currentRev = refresh.version;
     submodulesFailed = refresh.submodulesFailed;
     submodulesChanged = refresh.submodulesChanged;
