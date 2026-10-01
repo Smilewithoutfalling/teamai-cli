@@ -611,15 +611,17 @@ describe('Swift module-scope resolution yields to enclosing bindings', () => {
   it('does not let an assignment target stand in for a binding', async () => {
     const { result } = await extractFiles([
       ['Sources/App/Worker.swift', 'func work() -> Int { return 1 }\n'],
-      ['Sources/App/Run.swift', 'func run() {\n  var alias = 0\n  alias = work()\n  work()\n}\n'],
+      ['Sources/App/Run.swift', 'func run() {\n  var alias = 0\n  alias = work\n  work()\n}\n'],
     ]);
 
-    // The same position in an assignment rather than a declaration, and with no
-    // `let` in sight. A rule that had to be told about one statement form after
-    // another would need a third fix here; reading the position needs none.
+    // `alias = work` binds `alias`, not the name on the right of the `=`. Reading
+    // that name as if the assignment declared it shadowed the module-level `work`,
+    // and the call on the next line then resolved to nothing. A rule that had to
+    // be told about one statement form after another would need a third fix here;
+    // reading the position needs none.
     const references = result.edges.filter((e) => e.relation === 'REFERENCES');
-    expect(references).toHaveLength(2);
-    for (const reference of references) expect(reference.to).toBe('Sources/App/Worker.swift');
+    expect(references).toHaveLength(1);
+    expect(references[0]?.to).toBe('Sources/App/Worker.swift');
   });
 
   it('resolves a call that passes its own name', async () => {
