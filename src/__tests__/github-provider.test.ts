@@ -217,6 +217,65 @@ describe('ghRepoClone', () => {
     });
     expect(() => ghRepoClone('org/repo', '/tmp/clone')).toThrow(/x-access-token:\*\*\*@/);
   });
+
+  it('injects the token via http.extraHeader and persists a credential helper, never the token in the URL', () => {
+    mockedResolveCliPath.mockReturnValue('/usr/bin/gh');
+    process.env.GITHUB_TOKEN = 'ghp_secret';
+    mockedSpawnSync
+      .mockReturnValueOnce({ status: 0, stdout: '', stderr: '' }) // clone
+      .mockReturnValueOnce({ status: 0, stdout: '', stderr: '' }); // config
+
+    ghRepoClone('org/repo', '/tmp/clone');
+
+    // The clone carries the token in an http.extraHeader (-c) arg, so the URL
+    // stays clean and nothing is written to remote.origin.url.
+    const cloneArgs = mockedSpawnSync.mock.calls[0][1] as string[];
+    const expectedHeader = `http.extraHeader=Authorization: Basic ${Buffer.from('x-access-token:ghp_secret').toString('base64')}`;
+    expect(cloneArgs).toContain('-c');
+    expect(cloneArgs).toContain(expectedHeader);
+    expect(cloneArgs).toContain('clone');
+    expect(cloneArgs).toContain('https://github.com/org/repo.git');
+    expect(cloneArgs.join(' ')).not.toContain('ghp_secret');
+    // -c must precede `clone`: `git -c K=V clone` is a temporary git-level
+    // option, whereas `git clone -c K=V` is --config and persists K=V into the
+    // new repo's .git/config — i.e. the token leak this change removes.
+    expect(cloneArgs.indexOf('-c')).toBeLessThan(cloneArgs.indexOf('clone'));
+
+    // The credential source is then persisted so the push/pull that `init` runs
+    // right after cloning authenticate without the token on disk.
+    const cfgCall = mockedSpawnSync.mock.calls[1];
+    expect(cfgCall[0]).toEqual('git');
+    expect(cfgCall[1]).toEqual(['config', '--local', 'credential.helper', '!gh auth git-credential']);
+    expect(cfgCall[2]?.cwd).toBe('/tmp/clone');
+  });
+
+  it('falls back to an env-reading helper when gh is not installed', () => {
+    mockedResolveCliPath.mockReturnValue(null);
+    process.env.GITHUB_TOKEN = 'ghp_secret';
+    mockedSpawnSync
+      .mockReturnValueOnce({ status: 0, stdout: '', stderr: '' })
+      .mockReturnValueOnce({ status: 0, stdout: '', stderr: '' });
+
+    ghRepoClone('org/repo', '/tmp/clone');
+
+    const cfgCall = mockedSpawnSync.mock.calls[1];
+    expect(cfgCall[1]).toEqual([
+      'config',
+      '--local',
+      'credential.helper',
+      '!f() { echo username=x-access-token; echo "password=${GITHUB_TOKEN:-$GH_TOKEN}"; }; f',
+    ]);
+  });
+
+  it('writes no credential helper when there is no token', () => {
+    mockedResolveCliPath.mockReturnValue(null);
+    mockedSpawnSync.mockReturnValue({ status: 0, stdout: '', stderr: '' });
+
+    ghRepoClone('org/repo', '/tmp/clone');
+
+    expect(mockedSpawnSync).toHaveBeenCalledTimes(1);
+    expect(mockedSpawnSync.mock.calls.some((c) => c[1]?.[0] === 'config')).toBe(false);
+  });
 });
 
 // ─── ghCreateRepo ───────────────────────────────────────

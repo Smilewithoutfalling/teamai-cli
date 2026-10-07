@@ -251,17 +251,56 @@ export class RepoNotFoundError extends Error {
 }
 
 /**
- * Clone a GitHub repo using `git clone` with an embedded OAuth token so
- * subsequent pull/push operations work without a separate credential helper.
- * Throws RepoNotFoundError when the remote does not exist.
+ * HTTP Basic auth value for a GitHub token, passed to git as
+ * `-c http.extraHeader=...` so the token never appears in the clone URL.
+ * Mirrors the value clone.ts builds for its github clone path.
+ */
+function ghAuthHeader(token: string): string {
+  const encoded = Buffer.from(`x-access-token:${token}`).toString('base64');
+  return `Authorization: Basic ${encoded}`;
+}
+
+/**
+ * The credential helper persisted into the clone so later `git push` / `git
+ * pull` authenticate without the token being stored in `.git/config`.
+ *
+ * `gh auth git-credential` resolves the token at run time — from gh's login
+ * state, or from GH_TOKEN / GITHUB_TOKEN (gh gives those precedence over stored
+ * credentials) — so nothing secret is written. When gh is not installed, fall
+ * back to a helper that reads the same env vars at run time; again only the
+ * command is persisted, never the token.
+ */
+function ghCredentialHelper(): string {
+  return isGhInstalled()
+    ? '!gh auth git-credential'
+    : '!f() { echo username=x-access-token; echo "password=${GITHUB_TOKEN:-$GH_TOKEN}"; }; f';
+}
+
+/**
+ * Clone a GitHub repo to localPath.
+ *
+ * The token is injected for the clone itself via `http.extraHeader` rather than
+ * embedded in the URL, so it never reaches `remote.origin.url`: `git remote -v`,
+ * `git config --list` and a copied `.git/config` all stay free of the token.
+ *
+ * A `-c` option applies to that one invocation only, so the credential source is
+ * then persisted to the clone's local config as a credential helper — the
+ * push/pull that `init` runs right after cloning then authenticate without the
+ * token being stored anywhere on disk. Throws RepoNotFoundError when the remote
+ * does not exist.
  */
 export function ghRepoClone(repo: string, localPath: string): void {
   const token = ghGetOAuthToken();
-  const cloneUrl = token
-    ? `https://x-access-token:${token}@github.com/${repo}.git`
-    : `https://github.com/${repo}.git`;
+  const cloneUrl = `https://github.com/${repo}.git`;
 
-  const result = spawnSync('git', ['clone', cloneUrl, localPath], {
+  // `-c <key>=<val>` is a git-level option, so it must precede `clone`.
+  const args: string[] = [];
+  if (token) {
+    args.push('-c', `http.extraHeader=${ghAuthHeader(token)}`);
+  }
+  args.push('clone', cloneUrl, localPath);
+
+  const result = spawnSync('git', args, {
     encoding: 'utf-8',
     stdio: ['pipe', 'pipe', 'pipe'],
     timeout: 120_000,
@@ -279,6 +318,23 @@ export function ghRepoClone(repo: string, localPath: string): void {
   if (result.status !== 0) {
     const sanitized = allOutput.replace(/x-access-token:[^@]+@/g, 'x-access-token:***@');
     throw new Error(`git clone failed: ${sanitized.trim()}`);
+  }
+
+  // Persist the credential source into the clone: the `-c` above covered only
+  // the clone itself, so without this the push/pull that follow would have no
+  // credentials for a remote URL that (deliberately) carries none.
+  if (token) {
+    const cfg = spawnSync('git', ['config', '--local', 'credential.helper', ghCredentialHelper()], {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      cwd: localPath,
+      windowsHide: true,
+    });
+    if (cfg.status !== 0) {
+      log.warn(
+        `Could not persist the GitHub credential helper: ${(cfg.stderr ?? '').trim()}. Push/pull may prompt for credentials.`,
+      );
+    }
   }
 }
 
