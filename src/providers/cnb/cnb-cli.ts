@@ -231,10 +231,12 @@ export function cnbParseRepoInput(input: string): RepoInfo {
  * itself: `git -c credential.helper=... clone` only applies for that one
  * invocation, so the cloned repo's `remote.origin.url` carries no credentials
  * and the next push/pull falls back to an interactive Username/Password prompt.
- * GitHub/TGit solve this by embedding the token in the clone URL; CNB has no
- * user-readable token in the interactive path, so we persist the helper into
- * the repo's local config instead, making every later git operation on it auth
- * transparently.
+ * CNB has no user-readable token in the interactive path, so we persist the
+ * helper into the repo's local config instead, making every later git operation
+ * on it auth transparently. TGit solves the same problem by embedding the token
+ * in the clone URL; GitHub did that too, but now injects the token with a
+ * one-shot `http.extraHeader` and persists a URL-scoped `credential.helper` —
+ * the same shape used here (see `ghRepoClone`).
  */
 export function cnbRepoClone(repo: string, localPath: string): void {
   const token = getCnbToken();
