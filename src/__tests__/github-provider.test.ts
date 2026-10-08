@@ -294,8 +294,30 @@ describe('ghRepoClone', () => {
     // ghExec goes through cross-spawn, which is not mocked here, so the gh
     // branch itself is covered by the built-CLI harness (fake gh on PATH)
     // rather than a unit test. This pins the decision rule.
-    expect(ghCredentialHelperFor(false)).toBe('!gh auth git-credential');
-    expect(ghCredentialHelperFor(true)).toBe(
+    expect(ghCredentialHelperFor('/usr/local/bin/gh', false)).toBe(
+      '!"/usr/local/bin/gh" auth git-credential',
+    );
+    expect(ghCredentialHelperFor('/usr/local/bin/gh', true)).toBe(
+      '!f() { echo username=x-access-token; echo "password=${GITHUB_TOKEN:-$GH_TOKEN}"; }; f',
+    );
+  });
+
+  it('persists the ABSOLUTE gh path, never a bare `gh`', () => {
+    // resolveCliPath falls back to `bash -lc` / `zsh -lc` — a LOGIN shell that
+    // sources profiles — while git runs `!`-helpers through a non-login
+    // `sh -c`. A gh only reachable from a login shell (nvm, ~/.local/bin …)
+    // would resolve at detection time and then fail the push with
+    // "gh: command not found" if the bare name were persisted.
+    expect(ghCredentialHelperFor('/opt/homebrew/bin/gh', false)).toBe(
+      '!"/opt/homebrew/bin/gh" auth git-credential',
+    );
+    // Windows paths usually contain a space, hence the quoting.
+    expect(ghCredentialHelperFor('C:\\Program Files\\GitHub CLI\\gh.exe', false)).toBe(
+      '!"C:\\Program Files\\GitHub CLI\\gh.exe" auth git-credential',
+    );
+    // No gh resolvable → there is nothing to call back, so the env helper is
+    // the only shape left that can still authenticate.
+    expect(ghCredentialHelperFor(null, false)).toBe(
       '!f() { echo username=x-access-token; echo "password=${GITHUB_TOKEN:-$GH_TOKEN}"; }; f',
     );
   });

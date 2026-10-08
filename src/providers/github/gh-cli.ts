@@ -283,16 +283,25 @@ const GH_ENV_CREDENTIAL_HELPER =
  * Either way only the command is persisted, never the token.
  */
 function ghCredentialHelper(): string {
-  return ghCredentialHelperFor(Boolean(getGitHubToken()));
+  return ghCredentialHelperFor(getGhPath(), Boolean(getGitHubToken()));
 }
 
 /**
- * The helper to persist given whether an env token is set. Split out so the
- * decision rule can be asserted in a unit test: reaching the gh branch would
- * otherwise require spawning a real `gh` (ghExec goes through cross-spawn).
+ * The helper to persist given the resolved `gh` path and whether an env token is
+ * set. Split out so the decision rule can be asserted in a unit test: reaching
+ * the gh branch would otherwise require spawning a real `gh` (ghExec goes
+ * through cross-spawn).
+ *
+ * The gh branch uses the ABSOLUTE path rather than a bare `gh`, and that is not
+ * cosmetic: `resolveCliPath` falls back to `bash -lc` / `zsh -lc`, a LOGIN shell
+ * that sources profiles, while git runs `!`-helpers through a non-login `sh -c`
+ * that does not. A `gh` reachable only from a login shell (nvm, ~/.local/bin …)
+ * therefore resolves at detection time and still fails the first push with
+ * "gh: command not found". The quotes keep paths containing spaces intact.
  */
-export function ghCredentialHelperFor(hasEnvToken: boolean): string {
-  return hasEnvToken ? GH_ENV_CREDENTIAL_HELPER : '!gh auth git-credential';
+export function ghCredentialHelperFor(ghPath: string | null, hasEnvToken: boolean): string {
+  if (hasEnvToken || !ghPath) return GH_ENV_CREDENTIAL_HELPER;
+  return `!"${ghPath}" auth git-credential`;
 }
 
 /** Run `git config --local …` in `cwd`. */
