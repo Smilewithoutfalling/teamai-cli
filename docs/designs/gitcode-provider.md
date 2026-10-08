@@ -65,11 +65,11 @@
 
 `teamai push` 的分支 push 走 `pushRepoBranch` → 裸 `git push`（无 auth 注入），依赖 clone 时持久化的凭据。
 GitLab 的 clone 用一次性 `-c http.extraHeader`（不持久化）——照搬会导致 push 报 **Access denied**（实机复现）。
-GitHub / TGit 的做法是把 token 内嵌进 remote URL（持久化到 `.git/config`）。
+GitHub / TGit 的做法是把 token 内嵌进 remote URL（持久化到 `.git/config`）——GitHub 已改为「一次性 `-c http.extraHeader` 完成 clone + 把 `credential.helper` 持久化进克隆仓库」，token 不再进入 URL（[#978](https://github.com/Tencent/teamai-cli/issues/978)）。
 
 **修复**：`gitcodeRepoClone`（团队仓 clone）内嵌 `https://oauth2:<token>@gitcode.com/...`，
 使 `git push`（分支 + PR 流程）能认证。token 只落在 `~/.teamai/team-repo` 的私有 clone 中，
-与 GitHub / TGit 一致。（`clone.ts` 的浅克隆路径非 push 目标，沿用 extraHeader。）
+与 TGit 一致。（`clone.ts` 的浅克隆路径非 push 目标，沿用 extraHeader。）
 
 ## 6. 端到端验证（真实 CLI + 真实 GitCode 仓）
 

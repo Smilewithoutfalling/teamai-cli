@@ -260,20 +260,49 @@ function ghAuthHeader(token: string): string {
   return `Authorization: Basic ${encoded}`;
 }
 
+/** Local-config key under which the credential helper is persisted. */
+const GH_HELPER_KEY = 'credential.https://github.com.helper';
+
+/** Credential helper that resolves the token from the environment at run time. */
+const GH_ENV_CREDENTIAL_HELPER =
+  '!f() { echo username=x-access-token; echo "password=${GITHUB_TOKEN:-$GH_TOKEN}"; }; f';
+
 /**
  * The credential helper persisted into the clone so later `git push` / `git
  * pull` authenticate without the token being stored in `.git/config`.
  *
- * `gh auth git-credential` resolves the token at run time — from gh's login
- * state, or from GH_TOKEN / GITHUB_TOKEN (gh gives those precedence over stored
- * credentials) — so nothing secret is written. When gh is not installed, fall
- * back to a helper that reads the same env vars at run time; again only the
- * command is persisted, never the token.
+ * The helper is picked so that it resolves the SAME token ghGetOAuthToken()
+ * used for the clone:
+ *  - an env token is set → read that env var at run time, with the same
+ *    precedence ghGetOAuthToken() applies (GITHUB_TOKEN before GH_TOKEN).
+ *    `gh auth git-credential` is NOT equivalent here: gh reads GH_TOKEN first —
+ *    the reverse order — so with both set the clone and the push right after it
+ *    could authenticate as two different accounts.
+ *  - no env token → the clone token came from gh's own login, so let `gh auth
+ *    git-credential` resolve it at run time.
+ * Either way only the command is persisted, never the token.
  */
 function ghCredentialHelper(): string {
-  return isGhInstalled()
-    ? '!gh auth git-credential'
-    : '!f() { echo username=x-access-token; echo "password=${GITHUB_TOKEN:-$GH_TOKEN}"; }; f';
+  return ghCredentialHelperFor(Boolean(getGitHubToken()));
+}
+
+/**
+ * The helper to persist given whether an env token is set. Split out so the
+ * decision rule can be asserted in a unit test: reaching the gh branch would
+ * otherwise require spawning a real `gh` (ghExec goes through cross-spawn).
+ */
+export function ghCredentialHelperFor(hasEnvToken: boolean): string {
+  return hasEnvToken ? GH_ENV_CREDENTIAL_HELPER : '!gh auth git-credential';
+}
+
+/** Run `git config --local …` in `cwd`. */
+function gitConfigLocal(cwd: string, ...args: string[]) {
+  return spawnSync('git', ['config', '--local', ...args], {
+    encoding: 'utf-8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+    cwd,
+    windowsHide: true,
+  });
 }
 
 /**
@@ -323,16 +352,23 @@ export function ghRepoClone(repo: string, localPath: string): void {
   // Persist the credential source into the clone: the `-c` above covered only
   // the clone itself, so without this the push/pull that follow would have no
   // credentials for a remote URL that (deliberately) carries none.
+  //
+  // `credential.helper` is multi-valued: git accumulates helpers from system,
+  // global and local config and calls them in order, so a plain --local write
+  // would only APPEND to a helper the user already has globally (Git Credential
+  // Manager, say) — which would answer first and authenticate as the wrong
+  // account. Reset the inherited list for github.com first (empty value), then
+  // add ours: the same two steps `gh auth setup-git` performs. Scoped to
+  // github.com so helpers configured for other hosts are left untouched.
   if (token) {
-    const cfg = spawnSync('git', ['config', '--local', 'credential.helper', ghCredentialHelper()], {
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-      cwd: localPath,
-      windowsHide: true,
-    });
-    if (cfg.status !== 0) {
+    const reset = gitConfigLocal(localPath, '--replace-all', GH_HELPER_KEY, '');
+    const persisted =
+      reset.status === 0
+        ? gitConfigLocal(localPath, '--add', GH_HELPER_KEY, ghCredentialHelper())
+        : reset;
+    if (persisted.status !== 0) {
       log.warn(
-        `Could not persist the GitHub credential helper: ${(cfg.stderr ?? '').trim()}. Push/pull may prompt for credentials.`,
+        `Could not persist the GitHub credential helper: ${(persisted.stderr ?? '').trim()}. Push/pull may prompt for credentials.`,
       );
     }
   }

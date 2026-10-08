@@ -39,6 +39,7 @@ import {
   ghPrCreate,
   ghCreateRepo,
   ghRepoClone,
+  ghCredentialHelperFor,
   ghIsAuthenticated,
   getGitHubToken,
   ensureGhAuthenticated,
@@ -218,12 +219,13 @@ describe('ghRepoClone', () => {
     expect(() => ghRepoClone('org/repo', '/tmp/clone')).toThrow(/x-access-token:\*\*\*@/);
   });
 
-  it('injects the token via http.extraHeader and persists a credential helper, never the token in the URL', () => {
+  it('injects the token via http.extraHeader, keeps the URL clean, and persists an env credential helper', () => {
     mockedResolveCliPath.mockReturnValue('/usr/bin/gh');
     process.env.GITHUB_TOKEN = 'ghp_secret';
     mockedSpawnSync
       .mockReturnValueOnce({ status: 0, stdout: '', stderr: '' }) // clone
-      .mockReturnValueOnce({ status: 0, stdout: '', stderr: '' }); // config
+      .mockReturnValueOnce({ status: 0, stdout: '', stderr: '' }) // config --replace-all
+      .mockReturnValueOnce({ status: 0, stdout: '', stderr: '' }); // config --add
 
     ghRepoClone('org/repo', '/tmp/clone');
 
@@ -241,30 +243,61 @@ describe('ghRepoClone', () => {
     // new repo's .git/config — i.e. the token leak this change removes.
     expect(cloneArgs.indexOf('-c')).toBeLessThan(cloneArgs.indexOf('clone'));
 
-    // The credential source is then persisted so the push/pull that `init` runs
-    // right after cloning authenticate without the token on disk.
-    const cfgCall = mockedSpawnSync.mock.calls[1];
-    expect(cfgCall[0]).toEqual('git');
-    expect(cfgCall[1]).toEqual(['config', '--local', 'credential.helper', '!gh auth git-credential']);
-    expect(cfgCall[2]?.cwd).toBe('/tmp/clone');
+    // credential.helper is multi-valued: git calls helpers from system, global
+    // and local config in order, so the local config has to RESET the inherited
+    // list before adding ours. A plain write would only append, letting the
+    // user's global helper (Git Credential Manager) answer first — and the push
+    // that follows would authenticate as the wrong account.
+    const resetCall = mockedSpawnSync.mock.calls[1];
+    expect(resetCall[0]).toEqual('git');
+    expect(resetCall[1]).toEqual([
+      'config',
+      '--local',
+      '--replace-all',
+      'credential.https://github.com.helper',
+      '',
+    ]);
+    expect(resetCall[2]?.cwd).toBe('/tmp/clone');
+
+    // Then ours, resolving the SAME token ghGetOAuthToken() used for the clone
+    // (GITHUB_TOKEN before GH_TOKEN). `gh auth git-credential` reads GH_TOKEN
+    // first — the reverse order — so it is only used when no env token is set.
+    const addCall = mockedSpawnSync.mock.calls[2];
+    expect(addCall[0]).toEqual('git');
+    expect(addCall[1]).toEqual([
+      'config',
+      '--local',
+      '--add',
+      'credential.https://github.com.helper',
+      '!f() { echo username=x-access-token; echo "password=${GITHUB_TOKEN:-$GH_TOKEN}"; }; f',
+    ]);
+    expect(addCall[2]?.cwd).toBe('/tmp/clone');
   });
 
-  it('falls back to an env-reading helper when gh is not installed', () => {
-    mockedResolveCliPath.mockReturnValue(null);
-    process.env.GITHUB_TOKEN = 'ghp_secret';
-    mockedSpawnSync
-      .mockReturnValueOnce({ status: 0, stdout: '', stderr: '' })
-      .mockReturnValueOnce({ status: 0, stdout: '', stderr: '' });
+  it('uses the env helper whenever an env token is set, even with gh installed', () => {
+    // Regression guard: choosing `gh auth git-credential` whenever gh exists made
+    // the clone and the push right after it resolve the token in opposite orders
+    // (GITHUB_TOKEN vs GH_TOKEN first), i.e. potentially two different accounts.
+    mockedResolveCliPath.mockReturnValue('/usr/bin/gh');
+    process.env.GH_TOKEN = 'ghp_alias_only';
+    mockedSpawnSync.mockReturnValue({ status: 0, stdout: '', stderr: '' });
 
     ghRepoClone('org/repo', '/tmp/clone');
 
-    const cfgCall = mockedSpawnSync.mock.calls[1];
-    expect(cfgCall[1]).toEqual([
-      'config',
-      '--local',
-      'credential.helper',
+    const addCall = mockedSpawnSync.mock.calls[2];
+    expect(addCall[1]?.[4]).toBe(
       '!f() { echo username=x-access-token; echo "password=${GITHUB_TOKEN:-$GH_TOKEN}"; }; f',
-    ]);
+    );
+  });
+
+  it('falls back to `gh auth git-credential` when the token comes from gh login', () => {
+    // ghExec goes through cross-spawn, which is not mocked here, so the gh
+    // branch itself is covered by the built-CLI harness (fake gh on PATH)
+    // rather than a unit test. This pins the decision rule.
+    expect(ghCredentialHelperFor(false)).toBe('!gh auth git-credential');
+    expect(ghCredentialHelperFor(true)).toBe(
+      '!f() { echo username=x-access-token; echo "password=${GITHUB_TOKEN:-$GH_TOKEN}"; }; f',
+    );
   });
 
   it('writes no credential helper when there is no token', () => {
