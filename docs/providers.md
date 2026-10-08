@@ -316,7 +316,7 @@ GitCode 命名空间为单层（用户或组织），仓库地址形如 `owner/r
 
 > 注：仅支持公有云 `gitcode.com`，暂不支持自托管 GitCode 企业版。
 
-**关键方言**：GitCode 的 git-over-HTTPS 端点**拒绝 `Authorization: Bearer`**，只接受 Basic `oauth2:<token>`（已实机验证）。而 REST API 用 Bearer。因此团队仓 clone 把 token 内嵌进 remote URL（`oauth2:<token>@`），使 `git push`（分支 + PR 流程）能通过认证——与 GitHub / TGit 一致。
+**关键方言**：GitCode 的 git-over-HTTPS 端点**拒绝 `Authorization: Bearer`**，只接受 Basic `oauth2:<token>`（已实机验证）。而 REST API 用 Bearer。因此团队仓 clone 把 token 内嵌进 remote URL（`oauth2:<token>@`），使 `git push`（分支 + PR 流程）能通过认证——与 TGit 一致。（GitHub 原先也这么做，现已改为克隆时一次性 `-c http.extraHeader` + 持久化 URL 作用域的 `credential.helper`，token 不再进入 `.git/config`，见上一节。）
 
 ### 默认 email 域
 
