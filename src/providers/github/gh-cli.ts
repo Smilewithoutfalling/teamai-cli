@@ -304,6 +304,35 @@ export function ghCredentialHelperFor(ghPath: string | null, hasEnvToken: boolea
   return `!"${ghPath}" auth git-credential`;
 }
 
+/**
+ * Strip anything that could carry the credential out of git's combined output
+ * before it is embedded in an exception message.
+ *
+ * Two shapes matter:
+ *  - a token embedded in a URL (`https://x-access-token:<token>@…`), matched
+ *    generically in case a caller ever hands us such a URL;
+ *  - the exact `Authorization: Basic <base64>` value passed via
+ *    `-c http.extraHeader`. Git prints its own argv at start-up when a trace2
+ *    sink is enabled (`GIT_TRACE2`, `GIT_TRACE2_EVENT`, `GIT_TRACE2_PERF`), so
+ *    a failed clone echoes the whole `-c` argument back on stderr. Base64 is
+ *    reversible, i.e. that is the token in disguise. (Plain `GIT_TRACE` does
+ *    not print argv, and git redacts the header it sends on the wire — but the
+ *    trace2 sinks do print argv, verified on git 2.x.)
+ *
+ * Redacting by VALUE rather than by pattern is deliberate: it covers the argv
+ * form, the JSON `argv` array GIT_TRACE2_EVENT emits, and anything else git
+ * may decide to print, without having to enumerate those shapes.
+ */
+export function redactCredential(output: string, token: string | null): string {
+  let redacted = output.replace(/x-access-token:[^@]+@/g, 'x-access-token:***@');
+  if (token) {
+    const encoded = Buffer.from(`x-access-token:${token}`).toString('base64');
+    redacted = redacted.split(encoded).join('***');
+    redacted = redacted.split(token).join('***');
+  }
+  return redacted;
+}
+
 /** Run `git config --local …` in `cwd`. */
 function gitConfigLocal(cwd: string, ...args: string[]) {
   return spawnSync('git', ['config', '--local', ...args], {
@@ -354,7 +383,7 @@ export function ghRepoClone(repo: string, localPath: string): void {
     throw new RepoNotFoundError(repo);
   }
   if (result.status !== 0) {
-    const sanitized = allOutput.replace(/x-access-token:[^@]+@/g, 'x-access-token:***@');
+    const sanitized = redactCredential(allOutput, token);
     throw new Error(`git clone failed: ${sanitized.trim()}`);
   }
 

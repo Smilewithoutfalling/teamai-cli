@@ -40,6 +40,7 @@ import {
   ghCreateRepo,
   ghRepoClone,
   ghCredentialHelperFor,
+  redactCredential,
   ghIsAuthenticated,
   getGitHubToken,
   ensureGhAuthenticated,
@@ -219,6 +220,33 @@ describe('ghRepoClone', () => {
     expect(() => ghRepoClone('org/repo', '/tmp/clone')).toThrow(/x-access-token:\*\*\*@/);
   });
 
+  it('redacts the trace2 argv dump of the injected header from a failed clone', () => {
+    // `GIT_TRACE2*` makes git print its own argv at start-up, which includes
+    // the whole `-c http.extraHeader=Authorization: Basic <base64>` argument.
+    // A failed clone then carries that reversible blob into the thrown error.
+    const token = 'ghp_probe_abcdefghijklmnopqrstuvwxyz';
+    const encoded = Buffer.from(`x-access-token:${token}`).toString('base64');
+    process.env.GITHUB_TOKEN = token;
+    mockedSpawnSync.mockReturnValue({
+      status: 128,
+      stdout: '',
+      stderr:
+        `start git -c 'http.extraHeader=Authorization: Basic ${encoded}' clone x\n` +
+        'fatal: destination path already exists and is not an empty directory.',
+    });
+
+    let message = '';
+    try {
+      ghRepoClone('org/repo', '/tmp/clone');
+    } catch (e) {
+      message = (e as Error).message;
+    }
+
+    expect(message).toContain('git clone failed');
+    expect(message).not.toContain(encoded);
+    expect(message).not.toContain(token);
+  });
+
   it('injects the token via http.extraHeader, keeps the URL clean, and persists an env credential helper', () => {
     mockedResolveCliPath.mockReturnValue('/usr/bin/gh');
     process.env.GITHUB_TOKEN = 'ghp_secret';
@@ -330,6 +358,46 @@ describe('ghRepoClone', () => {
 
     expect(mockedSpawnSync).toHaveBeenCalledTimes(1);
     expect(mockedSpawnSync.mock.calls.some((c) => c[1]?.[0] === 'config')).toBe(false);
+  });
+});
+
+// ─── redactCredential ───────────────────────────────────
+
+describe('redactCredential', () => {
+  const token = 'ghp_abcdefghijklmnopqrstuvwxyz0123456789';
+  const encoded = Buffer.from(`x-access-token:${token}`).toString('base64');
+
+  it('redacts the base64 header echoed by the GIT_TRACE2 argv dump', () => {
+    const traced = `start git -c 'http.extraHeader=Authorization: Basic ${encoded}' clone https://github.com/x/y.git`;
+    const out = redactCredential(traced, token);
+    expect(out).not.toContain(encoded);
+    expect(out).not.toContain(token);
+    expect(out).toContain('-c');
+  });
+
+  it('redacts the JSON argv form GIT_TRACE2_EVENT emits', () => {
+    const evt = `{"event":"start","argv":["git","-c","http.extraHeader=Authorization: Basic ${encoded}","clone"]}`;
+    expect(redactCredential(evt, token)).not.toContain(encoded);
+  });
+
+  it('still redacts a token embedded in a URL', () => {
+    const url = `fatal: unable to access 'https://x-access-token:${token}@github.com/org/repo.git/'`;
+    const out = redactCredential(url, token);
+    expect(out).not.toContain(token);
+    expect(out).toContain('x-access-token:***@');
+  });
+
+  it('blanks the bare token if git ever prints it on its own', () => {
+    expect(redactCredential(`fatal: something ${token} something`, token)).not.toContain(token);
+  });
+
+  it('leaves output without a credential untouched', () => {
+    const clean = "Cloning into 'repo'...\nfatal: destination path already exists";
+    expect(redactCredential(clean, token)).toBe(clean);
+  });
+
+  it('still applies the URL pattern when there is no token to match by value', () => {
+    expect(redactCredential('x-access-token:abc@host', null)).toBe('x-access-token:***@host');
   });
 });
 
