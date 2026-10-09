@@ -43,8 +43,8 @@ written into its project config (`.mcp.json`, `.cursor/mcp.json`, ...). Before
 that write, teamai lists the file in the clone's `.git/info/exclude`, inside a
 `# [teamai:mcp-exclude:start]` block; the committed `.gitignore` is never touched.
 A file under a symlinked directory is listed and checked where the write lands
-(`.cursor/` linking to `config/`: `/config/mcp.json`); a symlink at the file
-itself is replaced by the write.
+(`.cursor/` linking to `config/`: `/config/mcp.json`); a config that is itself a
+symlink stays one, and its target is listed in, and checked by, its own repository.
 When it cannot (git already tracks the file, a rule in the member's git ignore
 files re-includes it, `.git/info` is not writable, the exclude file is held by
 another teamai command, or git errors), it leaves the file as it was, warns, and

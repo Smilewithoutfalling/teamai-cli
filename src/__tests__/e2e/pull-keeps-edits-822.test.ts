@@ -5,8 +5,9 @@
  * Pull records the sha256 of the bytes it writes at each destination in the
  * checkout's record. A copy is edited when it has a record and no longer
  * matches it; it is kept and named, per tool, while the other tools' copies
- * update. A copy teamai has no record of (the first pull on this version) is
- * overwritten as before, and protected from then on.
+ * update. A copy teamai has no record of is teamai's only when it holds a
+ * version from the team repo's history, and is updated; any other is kept
+ * as the member's (#993).
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawn } from 'node:child_process';
@@ -338,7 +339,7 @@ describe('pull keeps a delivered copy the member changed (#822 item 5)', () => {
     expect(output).toContain(`Kept ${worktreeRule}: you changed it, and the version teamai would deploy there (rules/team-rule.md) has changed since.`);
   });
 
-  it('overwrites an edited copy teamai has no record of, as before, and protects it from then on', async () => {
+  it('keeps an edited copy teamai has no record of as the member\'s, and updates the unedited ones (#993)', async () => {
     await pull();
     // The state an older CLI leaves: a checkout record without `delivered`.
     const state = JSON.parse(read(statePath())) as { lastPullByWorkspace: Record<string, { delivered?: unknown }> };
@@ -349,13 +350,12 @@ describe('pull keeps a delivered copy the member changed (#822 item 5)', () => {
 
     const upgraded = await pull();
 
-    expect(upgraded).not.toContain('Kept');
-    expect(read(claudeRule())).toContain('Version two.');
-
-    fs.writeFileSync(claudeRule(), '# Team rule\n\nMy version again.\n');
-    teamCommit((repo) => fs.writeFileSync(path.join(repo, 'rules', 'team-rule.md'), '# Team rule\n\nVersion three.\n'));
-    const protectedPull = await pull();
-    expect(read(claudeRule())).toContain('My version again.');
-    expect(protectedPull).toContain(`Kept ${claudeRule()}: you changed it, and the version teamai would deploy there (rules/team-rule.md) has changed since.`);
+    // No team version holds the member's bytes, so nothing proves the copy teamai's.
+    expect(read(claudeRule())).toContain('My version.');
+    expect(upgraded).toContain(
+      `Kept ${claudeRule()}: it is not teamai's (no delivery record, and it matches no team version of rules/team-rule.md).`,
+    );
+    // An unedited copy holds an earlier team version, which proves it teamai's.
+    expect(read(cursorRule())).toContain('Version two.');
   });
 });

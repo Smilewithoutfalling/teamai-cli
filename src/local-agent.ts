@@ -45,9 +45,14 @@ import {
   isTeamaiBareCopy,
   ownsJsonMcpEntry,
   writeJsonDoc,
+  writeMcpJson,
   writeCodexAtomic,
   spliceCodexBlock,
   codexServerNames,
+  recordedFileOf,
+  sameMcpFile,
+  userMcpFile,
+  USER_MCP_LOOKUP,
 } from './mcp-reconcile.js';
 import { normalizeAgentType } from './utils/tool-names.js';
 import { logHttpRequest, logHttpResponse } from './utils/http-log.js';
@@ -83,6 +88,7 @@ import {
 } from './types.js';
 import { getUserHome } from './utils/home.js';
 import { resolveAnchors } from './utils/git.js';
+import { acquireLock, releaseLock } from './update.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -310,6 +316,30 @@ function getLocalAgentHome(): string {
   return path.join(getTeamaiHomePath(), LOCAL_AGENT_DIR);
 }
 
+function localAgentLockPath(): string {
+  // Source cleanup removes the local-agent directory's contents, so keep its lock outside it.
+  return path.join(getTeamaiHomePath(), '.local-agent-sync-lock');
+}
+
+/** Set on a command a sync runs while it holds the lock: the pid of that sync. */
+const LOCK_HOLDER_ENV = 'TEAMAI_LOCAL_AGENT_LOCK_HOLDER';
+
+/** Whether this process runs as a command of the sync that holds the lock, so holds it too. */
+async function holdsParentLocalAgentLock(): Promise<boolean> {
+  if (process.env[LOCK_HOLDER_ENV] !== String(process.ppid)) return false;
+  return (await readJson<{ pid?: number }>(localAgentLockPath()))?.pid === process.ppid;
+}
+
+async function acquireLocalAgentLock(waitMs = 0): Promise<boolean> {
+  if (await acquireLock(localAgentLockPath())) return true;
+  const deadline = Date.now() + waitMs;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    if (await acquireLock(localAgentLockPath())) return true;
+  }
+  return false;
+}
+
 function getConfigPath(): string {
   return path.join(getLocalAgentHome(), CONFIG_FILE);
 }
@@ -488,8 +518,9 @@ async function claudeUserRoot(): Promise<string> {
 }
 
 /** Resolve the current tool's settings file absolute path (user scope, $HOME base). */
-async function resolveToolSettingsPath(config: LocalAgentConfig, tool: string): Promise<string> {
-  const teamConfig = createLocalAgentTeamConfig(config.endpoint);
+async function resolveToolSettingsPath(config: LocalAgentConfig | null, tool: string): Promise<string> {
+  // Hook cleanup also runs after the source configuration has been cleared.
+  const teamConfig = createLocalAgentTeamConfig(config?.endpoint ?? 'local-agent');
   const toolPath = applyToolRoots(teamConfig.toolPaths, await memberToolRoots())[tool];
   if (!toolPath?.settings) {
     throw new Error(`unsupported tool: ${tool} (no settings path)`);
@@ -588,8 +619,10 @@ function mergeWorkspaceBindings(
 }
 
 export async function loadLocalAgentConfig(options: { dryRun?: boolean } = {}): Promise<LocalAgentConfig | null> {
-  const fileConfig = await readJson<LocalAgentConfig>(getConfigPath());
-  if (fileConfig?.endpoint) {
+  const fileConfig = await readJson<LocalAgentConfig | { disabled: true }>(getConfigPath());
+  // A removed source must not reconnect through legacy config or environment fallback.
+  if (fileConfig && 'disabled' in fileConfig && fileConfig.disabled === true) return null;
+  if (fileConfig && 'endpoint' in fileConfig && fileConfig.endpoint) {
     const config = {
       ...fileConfig,
       endpoint: normalizeEndpoint(fileConfig.endpoint),
@@ -915,31 +948,14 @@ async function maybeReconcilePlugins(context: LocalAgentContext): Promise<void> 
   } catch (e) { log.debug(`[local-agent] plugin reconcile spawn skipped: ${(e as Error).message}`); }
 }
 
-/** Detached worker: pull get-config and reconcile plugins once, guarded by a reconcile lock. */
+/** Detached worker: reconcile plugins while sharing the HTTP source lifecycle lock. */
 export async function runPluginReconcileWorker(): Promise<void> {
-  const config = await loadLocalAgentConfig();
-  if (!config) return;
-  const lockPath = path.join(getLocalAgentHome(), 'plugin-reconcile.lock');
-  await ensureDir(path.dirname(lockPath));
-  let acquired = false;
+  if (!await loadLocalAgentConfig({ dryRun: true })) return;
+  // A session-start sync spawns this worker while holding the same lifecycle lock.
+  if (!await acquireLocalAgentLock(30_000)) return;
   try {
-    try {
-      const fd = await fs.promises.open(lockPath, 'wx');
-      await fd.close();
-      acquired = true;
-    } catch (e) {
-      if ((e as { code?: string }).code !== 'EEXIST') throw e;
-      try {
-        const st = await fs.promises.stat(lockPath);
-        if (Date.now() - st.mtimeMs > 30 * 60 * 1000) {
-          await fs.promises.rm(lockPath, { force: true });
-          const fd = await fs.promises.open(lockPath, 'wx');
-          await fd.close();
-          acquired = true;
-        }
-      } catch { /* ignore */ }
-      if (!acquired) return;
-    }
+    const config = await loadLocalAgentConfig();
+    if (!config) return;
     const tag = '[local-agent] [plugin-reconcile]';
     const statePath = getPluginPullStatePath();
     try {
@@ -981,7 +997,7 @@ export async function runPluginReconcileWorker(): Promise<void> {
       log.debug(`${tag} reconcile failed: ${(e as Error).message}`);
     }
   } finally {
-    if (acquired) await fs.promises.rm(lockPath, { force: true });
+    await releaseLock(localAgentLockPath());
   }
 }
 
@@ -2168,14 +2184,12 @@ async function syncClaudemd(
     }
 
     const claudeMdPath = resolvedAbsPath ?? path.resolve(baseDir, targetFile);
-    // OpenCode's Claude fallback already carries the blocks, as in pull (#945).
+    // OpenCode V1's Claude fallback already carries the blocks, as in pull
+    // (#945), so OpenCode's file is written for V2's plugin but not listed.
     const claudeUserFile = path.join(getUserHome(), '.claude', 'CLAUDE.md');
-    if (tool === 'opencode' && localConfig.scope === 'user'
-      && (await readFileSafe(claudeUserFile))?.includes(TEAMAI_CLAUDEMD_START)
-      && await opencodeClaudeFallback(getUserHome(), [claudeUserFile])) {
-      log.debug(`local-agent: OpenCode reads the team instructions from ${claudeUserFile}; skipped`);
-      continue;
-    }
+    const viaClaude = tool === 'opencode' && localConfig.scope === 'user'
+      && (await readFileSafe(claudeUserFile))?.includes(TEAMAI_CLAUDEMD_START) === true
+      && await opencodeClaudeFallback(getUserHome(), [claudeUserFile]) !== null;
     const target = await instructionTargetAt(tool, claudeMdPath, localConfig.scope, toolPath);
     const plan = await planInstructionFiles([target], { claudemd: block });
     // A warning means the file was left as it was: nothing reached the tool.
@@ -2191,9 +2205,9 @@ async function syncClaudemd(
       continue;
     }
     if (tool === 'opencode') {
-      await registerOpencodeContext(teamConfig, localConfig, { targets: [target], stale: [] }, false, files);
-      // OpenCode reads the file only through its `instructions` entry.
-      if (block) {
+      await registerOpencodeContext(teamConfig, localConfig, { targets: [target], stale: [], opencodeFallback: viaClaude ? claudeUserFile : null }, false, files);
+      // OpenCode V1 reads the file only through its `instructions` entry.
+      if (block && !viaClaude) {
         const { opencodeContextReference, readOpencodeInstructionList } = await import('./resources/opencode-config.js');
         const { config, entry } = opencodeContextReference(claudeMdPath, localConfig.scope, baseDir);
         if (!(await readOpencodeInstructionList(config))?.includes(entry)) {
@@ -2232,7 +2246,7 @@ async function syncClaudemd(
     const verification = await planInstructionFiles([target], { claudemd: block });
     if (verification.files[0]?.status !== 'current') continue;
     for (const tool of target.tools) {
-      if (tool === 'opencode' && block) {
+      if (tool === 'opencode' && block && !resolved.opencodeFallback) {
         const { opencodeContextReference, readOpencodeInstructionList } = await import('./resources/opencode-config.js');
         const { config, entry } = opencodeContextReference(target.path, localConfig.scope, resolveToolBaseDir(tool, localConfig));
         if (!(await readOpencodeInstructionList(config))?.includes(entry)) continue;
@@ -2819,7 +2833,8 @@ async function runCmdCommand(
     const { stdout } = await execFileAsync(
       process.execPath,
       [entry, ...argv.slice(1)],
-      { timeout: 120_000, env: process.env, maxBuffer: 4 * 1024 * 1024 },
+      // The sync holds the lifecycle lock until this returns; an uninstall must not wait for it.
+      { timeout: 120_000, env: { ...process.env, [LOCK_HOLDER_ENV]: String(process.pid) }, maxBuffer: 4 * 1024 * 1024 },
     );
     const summary = stdout.trim().split('\n').slice(0, 3).join(' | ');
     log.debug(`${tag} cmd OK: ${command.cmd}${summary ? ` — ${summary}` : ''}`);
@@ -2992,10 +3007,14 @@ function updateManifestRecord(
   /** Project scope: whether the entry carries a credential, as `resolved` notes for a pull's (#882). */
   resolved?: boolean,
   bare?: boolean,
+  /** User scope, CodeBuddy: the file it wrote (#993). */
+  file?: string,
 ): void {
   const records = manifest[key] ?? [];
   const idx = records.findIndex((r: ManagedMcpRecord) => r.name === name);
-  const record: ManagedMcpRecord = { name, hash, ...resolved === undefined ? {} : { resolved }, ...bare === undefined ? {} : { bare } };
+  const record: ManagedMcpRecord = {
+    name, hash, ...resolved === undefined ? {} : { resolved }, ...bare === undefined ? {} : { bare }, ...file === undefined ? {} : { file },
+  };
   if (idx >= 0) {
     records[idx] = record;
   } else {
@@ -3042,7 +3061,12 @@ async function installMcpServer(
   }
 
   const baseDir = resolveToolBaseDir(tool, localConfig);
-  const targetFile = path.join(baseDir, mcpRel);
+  const mappedFile = path.join(baseDir, mcpRel);
+  // CodeBuddy reads only the first of its user MCP files that exists (#993), as a pull writes it.
+  const lookup = !projectScope && USER_MCP_LOOKUP[tool] !== undefined;
+  const targetFile = lookup ? await userMcpFile(tool, mcpRel, baseDir) : mappedFile;
+  const fileOf = (record: ManagedMcpRecord): string =>
+    recordedFileOf({ file: targetFile, ...(lookup ? { mappedFile } : {}) }, record);
 
   const { resolveDataHomeForScope } = await import('./config.js');
   const dataHome = await resolveDataHomeForScope(projectScope ? 'project' : 'user', projectScope ? workspacePath : undefined);
@@ -3059,8 +3083,14 @@ async function installMcpServer(
     manifest = (await readJson<ManagedMcpManifest>(manifestPath)) ?? {};
   }
   const manifestKey = managedMcpManifestKey(tool, projectScope);
-  const owned = manifest[manifestKey] ?? [];
+  // Only records of this file: a server an earlier install left in a file CodeBuddy no longer reads moves below.
+  // By real path, as reconciliation compares them: a lookup file linked to another is that file.
+  const records = manifest[manifestKey] ?? [];
+  const inTarget = await Promise.all(records.map((r: ManagedMcpRecord) => sameMcpFile(fileOf(r), targetFile)));
+  const owned = records.filter((_, i) => inTarget[i]);
   const ownedNames = new Set(owned.map((r: ManagedMcpRecord) => r.name));
+  const movedFrom = records.find((r: ManagedMcpRecord, i) => r.name === slug && !inTarget[i]);
+  const file = lookup ? targetFile : undefined;
 
   if (format === 'codex') {
     const block = renderCodexBlock(def);
@@ -3091,12 +3121,13 @@ async function installMcpServer(
     const bareCopy = isTeamaiBareCopy(doc, slug, owned);
     // Check Git without changing it until ownership is persisted. Recheck protection before writing the credential (#882).
     const credential = projectScope && await keepCredentialOutOfGit({ ...localConfig, dataHome }, tool, slug, targetFile, entry, true);
-    const previousRecord = owned.find((record) => record.name === slug);
+    // A record of this server in the file CodeBuddy no longer reads is existing ownership too (#993).
+    const previousRecord = owned.find((record) => record.name === slug) ?? movedFrom;
     const previousData = previousRecord ? structuredClone(doc.data) : undefined;
     // Existing ownership stays valid until the config write completes. New installs
     // still persist a provisional record before adding a Git exclusion (#882).
     if (!previousRecord) {
-      updateManifestRecord(manifest, manifestKey, slug, hash, projectScope ? credential : undefined);
+      updateManifestRecord(manifest, manifestKey, slug, hash, projectScope ? credential : undefined, undefined, file);
       await writeJsonAtomic(manifestPath, manifest);
     }
     if (credential) await keepCredentialOutOfGit({ ...localConfig, dataHome }, tool, slug, targetFile, entry);
@@ -3105,13 +3136,13 @@ async function installMcpServer(
     await writeJsonDoc(targetFile, serverKey, doc);
     if (allowBare || previousRecord) {
       // Placement is evidence of a completed write, not just an attempted install.
-      updateManifestRecord(manifest, manifestKey, slug, hash, projectScope ? credential : undefined, allowBare ? doc.bare : undefined);
+      updateManifestRecord(manifest, manifestKey, slug, hash, projectScope ? credential : undefined, allowBare ? doc.bare : undefined, file);
       try {
         await writeJsonAtomic(manifestPath, manifest);
       } catch (error) {
         if (previousData) {
           try {
-            await writeJsonAtomic(targetFile, previousData);
+            await writeMcpJson(targetFile, previousData);
           } catch (restoreError) {
             throw new Error(
               `install_mcp: ownership write failed (${error instanceof Error ? error.message : String(error)}), and restoring ${targetFile} failed `
@@ -3123,9 +3154,34 @@ async function installMcpServer(
         throw error;
       }
     }
+    if (movedFrom) await removeMovedMcpEntry(fileOf(movedFrom), serverKey, slug, targetFile, movedFrom.hash);
   }
   log.debug(`local-agent: installed MCP server "${slug}" for ${tool} (scope=${scope})`);
   return command.version;
+}
+
+/**
+ * Take `slug` out of `file`, where an earlier install wrote it and which
+ * CodeBuddy no longer reads (#993): this install wrote it to `targetFile` and
+ * recorded it there. A failure leaves the old entry, and says where.
+ */
+async function removeMovedMcpEntry(file: string, serverKey: string, slug: string, targetFile: string, recordedHash: string): Promise<void> {
+  try {
+    const doc = await readJsonDoc(file, serverKey);
+    if (!doc) throw new Error('it does not parse');
+    if (doc.servers[slug] === undefined) return;
+    // A copy the member changed since teamai installed it is theirs: left where it is (#993).
+    if (entryHash(doc.servers[slug]) !== recordedHash) {
+      log.warn(`Installed MCP server ${slug} in ${targetFile}, and kept the copy in ${file}: you changed it since teamai installed it. `
+        + `Remove ${slug} from ${file} when you no longer need it.`);
+      return;
+    }
+    delete doc.servers[slug];
+    await writeJsonDoc(file, serverKey, doc);
+  } catch (error) {
+    log.warn(`Installed MCP server ${slug} in ${targetFile}, but could not remove the copy an earlier install left in ${file}: `
+      + `${error instanceof Error ? error.message : String(error)}. Remove ${slug} from ${file} yourself.`);
+  }
 }
 
 /**
@@ -3184,7 +3240,6 @@ async function uninstallMcpServer(
   if (!format) return;
 
   const baseDir = resolveToolBaseDir(tool, localConfig);
-  const targetFile = path.join(baseDir, mcpRel);
 
   const { resolveDataHomeForScope } = await import('./config.js');
   const dataHome = await resolveDataHomeForScope(projectScope ? 'project' : 'user', projectScope ? workspacePath : undefined);
@@ -3205,6 +3260,9 @@ async function uninstallMcpServer(
   const ownedNames = new Set(owned.map((r: ManagedMcpRecord) => r.name));
 
   if (!ownedNames.has(slug)) return;
+  // CodeBuddy's user servers are where the install recorded them (#993); an older one recorded no file.
+  const recordedFile = !projectScope && USER_MCP_LOOKUP[tool] ? owned.find((r) => r.name === slug)?.file : undefined;
+  const targetFile = recordedFile ?? path.join(baseDir, mcpRel);
 
   let restoreConfig: (() => Promise<void>) | undefined;
   if (format === 'codex') {
@@ -3227,7 +3285,7 @@ async function uninstallMcpServer(
       if (ownsEntry) delete doc.servers[slug];
       if (bareCopy) delete doc.data[slug];
       await writeJsonDoc(targetFile, serverKey, doc);
-      restoreConfig = () => writeJsonAtomic(targetFile, previousData);
+      restoreConfig = () => writeMcpJson(targetFile, previousData);
     }
   }
   manifest[manifestKey] = owned.filter((r: ManagedMcpRecord) => r.name !== slug);
@@ -3373,6 +3431,19 @@ async function processCommands(
 }
 
 export async function reportAndSyncLocalAgent(context: LocalAgentContext): Promise<boolean> {
+  if (!await loadLocalAgentConfig({ dryRun: true })) return false;
+  if (!await acquireLocalAgentLock()) {
+    log.debug('[local-agent] sync skipped: could not acquire the HTTP source lock');
+    return false;
+  }
+  try {
+    return await syncLocalAgent(context);
+  } finally {
+    await releaseLock(localAgentLockPath());
+  }
+}
+
+async function syncLocalAgent(context: LocalAgentContext): Promise<boolean> {
   const config = await loadLocalAgentConfig();
   if (!config) return false;
 
@@ -3680,16 +3751,19 @@ export async function teardownLocalAgentPlugins(): Promise<void> {
 
 /**
  * Remove every HTTP-source agent hook recorded in the agent-hook manifest from
- * each tool's settings, then clear the manifest. Best-effort; used by
- * `source remove-http` and `teamai uninstall` teardown (issue #238). Safe to call
- * when no config / no manifest exists.
+ * each tool's settings, then forget the ones removed. Used by `source remove-http`
+ * and `teamai uninstall` teardown (issue #238). Safe to call when no config / no
+ * manifest exists. A hook that could not be removed (its settings file does not
+ * parse, say) keeps its record, so a later run finds it (#993); its slug and tool
+ * are returned.
  */
-export async function removeAllAgentHooks(): Promise<void> {
+export async function removeAllAgentHooks(): Promise<Array<{ slug: string; tool: string }>> {
+  // Removal can leave hook records after disabling the source.
   const config = await loadLocalAgentConfig();
-  if (!config) return;
   const manifest = await loadAgentHookManifest();
   const slugs = Object.keys(manifest);
-  if (slugs.length === 0) return;
+  if (slugs.length === 0) return [];
+  const left: typeof manifest = {};
   for (const slug of slugs) {
     const rec = manifest[slug];
     try {
@@ -3710,26 +3784,63 @@ export async function removeAllAgentHooks(): Promise<void> {
         await removeAgentHook(settingsPath, rec.tool, { slug, command: rec.command });
       }
     } catch (e) {
-      log.debug(`agent hook [${slug}] teardown failed: ${(e as Error).message}`);
+      log.warn(`Could not remove agent hook ${slug} for ${rec.tool}: ${(e as Error).message}`);
+      left[slug] = rec;
     }
   }
-  await saveAgentHookManifest({});
+  await saveAgentHookManifest(left);
+  return Object.entries(left).map(([slug, rec]) => ({ slug, tool: rec.tool }));
+}
+
+export async function removeLocalAgentHttp(): Promise<void> {
+  if (await shutdownLocalAgentHttp('teamai source remove-http') === 'none') {
+    log.info('No HTTP source configured — nothing to remove.');
+  }
 }
 
 /**
  * Tear down the HTTP local-agent bypass: uninstall every resource recorded in the
  * manifest (skills/rules/claudemd, across all scopes) from the AI tool dirs, then
- * remove the whole ~/.teamai/local-agent/ directory (config + manifest).
+ * clear its config and caches. Keep a disabled config to prevent fallback from
+ * reconnecting, and any remaining hook ownership records for a retry.
+ *
+ * Holds the lifecycle lock that sync and plugin reconciliation take, so neither
+ * can reinstall what this removes. A failure names `retry` as the command to
+ * repeat: `locked` removed nothing, `incomplete` kept hook records.
  *
  * Best-effort per resource: a single failed uninstall is logged and skipped so a
  * stale entry cannot block the teardown.
  */
-export async function removeLocalAgentHttp(): Promise<void> {
+export async function shutdownLocalAgentHttp(retry: string): Promise<'none' | 'removed' | 'incomplete' | 'locked'> {
+  if (!await loadLocalAgentConfig({ dryRun: true }) && Object.keys(await loadAgentHookManifest()).length === 0) return 'none';
+  // A server-pushed uninstall runs while its sync holds the lock.
+  const inherited = await holdsParentLocalAgentLock();
+  if (!inherited && !await acquireLocalAgentLock()) {
+    log.info('Waiting for the HTTP source sync lock before removal.');
+    if (!await acquireLocalAgentLock(30_000)) {
+      log.error(`Could not lock HTTP source state at ${localAgentLockPath()}; nothing was removed. `
+        + `Wait for other HTTP source operations to finish, check directory permissions, then retry \`${retry}\`.`);
+      process.exitCode = 1;
+      return 'locked';
+    }
+  }
+  try {
+    return await removeLocalAgentHttpLocked(retry);
+  } finally {
+    if (!inherited) await releaseLock(localAgentLockPath());
+  }
+}
+
+async function removeLocalAgentHttpLocked(retry: string): Promise<'none' | 'removed' | 'incomplete'> {
   const config = await loadLocalAgentConfig();
   if (!config) {
-    log.info('No HTTP source configured — nothing to remove.');
-    return;
+    // An earlier run disabled the source but could not remove these agent hooks (#993).
+    if (Object.keys(await loadAgentHookManifest()).length > 0) return finishAgentHookTeardown(retry);
+    return 'none';
   }
+
+  // No sync or plugin worker can write after this point until teardown finishes.
+  await writeJsonAtomic(getConfigPath(), { disabled: true });
 
   // Tear down installed plugins before removing teamai's local-agent state.
   try {
@@ -3751,9 +3862,30 @@ export async function removeLocalAgentHttp(): Promise<void> {
     }
   }
 
-  await removeAllAgentHooks();
-  await remove(getLocalAgentHome());
+  return finishAgentHookTeardown(retry);
+}
+
+/**
+ * Clear the HTTP source, preserving failed hook records for a retry.
+ */
+async function finishAgentHookTeardown(retry: string): Promise<'removed' | 'incomplete'> {
+  const hooksLeft = await removeAllAgentHooks();
+  const home = getLocalAgentHome();
+  const keep = path.basename(getAgentHookManifestPath());
+  await writeJsonAtomic(getConfigPath(), { disabled: true });
+  for (const entry of await fse.readdir(home)) {
+    if (entry !== path.basename(getConfigPath()) && !(hooksLeft.length > 0 && entry === keep)) {
+      await remove(path.join(home, entry));
+    }
+  }
+  if (hooksLeft.length > 0) {
+    log.warn(`HTTP source disabled, but removal is incomplete: kept the record of agent hooks ${hooksLeft.map((h) => `${h.slug} (${h.tool})`).join(', ')} `
+      + `in ${home}, as they could not be removed. Fix the files named above, then run \`${retry}\` again.`);
+    process.exitCode = 1;
+    return 'incomplete';
+  }
   log.success('HTTP source removed (resources uninstalled, config cleared).');
+  return 'removed';
 }
 
 export async function bindCurrentProject(options?: { projectId?: number; skip?: boolean; cwd?: string }): Promise<void> {

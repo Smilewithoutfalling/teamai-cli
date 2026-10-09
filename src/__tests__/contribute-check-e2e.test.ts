@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
-import { execFile, execSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -153,10 +153,9 @@ describe('contribute-check E2E', () => {
   let tmpHome: string;
 
   beforeAll(() => {
-    execSync('npm run build', {
-      cwd: path.resolve(__dirname, '../..'),
-      stdio: 'ignore',
-    });
+    if (!fs.existsSync(CLI_PATH)) {
+      throw new Error(`CLI binary not found at ${CLI_PATH}. Run "npm run build" first.`);
+    }
   });
 
   beforeEach(() => {

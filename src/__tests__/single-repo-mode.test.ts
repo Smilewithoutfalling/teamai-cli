@@ -234,7 +234,7 @@ describe('migrateSelfModeGitignoreContent (self-heal old gitignore)', () => {
     const old = [
       'env.sh', 'env.local', 'teamai.lock',
       'learnings-wt/', '.learnings-lock', 'pending-learnings/', 'env/',
-      'usage.jsonl.*', 'usage.pending-*.jsonl', 'config.yaml.*.tmp',
+      'usage.jsonl.*', 'usage.pending-*.jsonl', 'config.yaml.*.tmp', 'managed-hooks.json',
     ].join('\n');
     const { changed, content } = migrateSelfModeGitignoreContent(old);
     expect(changed).toBe(false); // nothing to remove, env.local already present
@@ -265,7 +265,7 @@ describe('migrateSelfModeGitignoreContent (self-heal old gitignore)', () => {
     const old = [
       '# env is machine-local', 'config.yaml', 'env.local', 'teamai.lock',
       'learnings-wt/', '.learnings-lock', 'pending-learnings/',
-      'usage.jsonl.*', 'usage.pending-*.jsonl', 'config.yaml.*.tmp',
+      'usage.jsonl.*', 'usage.pending-*.jsonl', 'config.yaml.*.tmp', 'managed-hooks.json',
     ].join('\n');
     const { changed, content } = migrateSelfModeGitignoreContent(old);
     // No bare `env` line, env.local already present → unchanged.

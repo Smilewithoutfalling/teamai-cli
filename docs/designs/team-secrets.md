@@ -1,7 +1,5 @@
 # Team secrets
 
-[简体中文](team-secrets.zh-CN.md)
-
 Proposal: [#875](https://github.com/Tencent/teamai-cli/issues/875). Plan: [#879](https://github.com/Tencent/teamai-cli/issues/879).
 
 A team declares which secrets its members need, in the team repo, with no value. Each member supplies the value on their own machine. No secret value is written to the team repo.
@@ -44,7 +42,7 @@ teamai push
 
 ## Namespaces
 
-A namespace declares its own secrets in `env/<ns>/secrets.yaml`. It is active where `env/<ns>/env.yaml` is: a role or project that lists `<ns>` under `resources.env`. The rules are the env rules (see [Env, hooks and MCP servers by namespace](../usage-guide.md#env-hooks-and-mcp-servers-by-namespace)):
+A namespace declares its own secrets in `env/<ns>/secrets.yaml`. It is active where `env/<ns>/env.yaml` is: a role or project that lists `<ns>` under `resources.env`. The rules are the env rules (see [Env, hooks and MCP servers by namespace](../guide/sharing.md#env-hooks-and-mcp-servers-by-namespace)):
 
 - An active namespace entry replaces the root entry with the same key, whole.
 - The same key in two active namespaces, or twice in one file, fails the secrets.
@@ -144,7 +142,7 @@ the member's value for this team   teamai env set KEY [--from-env VAR]
 
 **Still reachable.** The resolved value is written in plaintext to each tool's MCP config, as before. A config that holds a resolved `${VAR}` value is written `0600`, an existing wider one (`.mcp.json` is often `0644`) included, and a pull that changes nothing in it still tightens it to `0600` without rewriting it, as it does any project config it keeps out of git for holding such a value (a disabled or moved tool's included); one without such a value keeps its mode, and a new one is created `0600`. A command run under `env exec` gets it in its environment, and so does every process it starts: an agent that runs `teamai env exec -- env` can read it. The agent skills forbid that, but nothing enforces it. This keeps secrets out of git, not away from the member's machine or the agent running on it.
 
-**Out of git.** A resolved value lands in a project-scope MCP config only once the clone's `.git/info/exclude` lists the file (#882). An exclude rule does not stop a file git already tracks, so no resolved value, declared secret or not, is written into a project config `git ls-files` tracks: pull leaves that file as it was (an entry an earlier pull wrote stays), and `pull` (a warning), `teamai mcp list` (`withheld:`) and `teamai doctor` (`MCP servers delivered to <tool>` fails) name the file and the fix: `git rm --cached <file>`, and rotate the token if it was ever committed. An exclusion that fails for another reason (`.git/info` or the exclude file not writable, another teamai command holding it, a git error) leaves the file as it was the same way, with that reason and its fix.
+**Out of git.** A resolved value lands in a project-scope MCP config only once the clone's `.git/info/exclude` lists the file (#882); teamai creates `.git/info/` when the repository has none (#993). An exclude rule does not stop a file git already tracks, so no resolved value, declared secret or not, is written into a project config `git ls-files` tracks: pull leaves that file as it was (an entry an earlier pull wrote stays), and `pull` (a warning), `teamai mcp list` (`withheld:`) and `teamai doctor` (`MCP servers delivered to <tool>` fails) name the file and the fix: `git rm --cached <file>`, and rotate the token if it was ever committed. An exclusion that fails for another reason (`.git/info` or the exclude file not writable, another teamai command holding it, a git error) leaves the file as it was the same way, with that reason and its fix.
 
 ## A missing secret keeps the MCP entry
 

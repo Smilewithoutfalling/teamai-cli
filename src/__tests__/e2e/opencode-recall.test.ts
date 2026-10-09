@@ -8,7 +8,6 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..', '..', '..');
 const TEAMAI_CLI = path.join(ROOT, 'dist', 'index.js');
-const OPENCODE_INSTALL = path.join(ROOT, 'node_modules', 'opencode-ai', 'postinstall.mjs');
 const OPENCODE_CLI = path.join(
   ROOT,
   'node_modules',
@@ -64,7 +63,6 @@ describe('OpenCode recall startup (#332)', () => {
     if (!fs.existsSync(TEAMAI_CLI)) {
       throw new Error(`TeamAI CLI not found at ${TEAMAI_CLI}. Run "npm run build" first.`);
     }
-    execFileSync(process.execPath, [OPENCODE_INSTALL], { cwd: ROOT, stdio: 'pipe' });
     if (!fs.existsSync(OPENCODE_CLI)) {
       throw new Error(`OpenCode CLI not found at ${OPENCODE_CLI}. Run "npm ci" first.`);
     }

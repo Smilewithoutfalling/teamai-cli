@@ -55,6 +55,7 @@ vi.mock('../hooks.js', () => ({
 
 vi.mock('../mcp-reconcile.js', () => ({
   reconcileMcpForConfig: vi.fn().mockResolvedValue({ changes: [], wrote: false }),
+  describeKeptMemberServer: vi.fn(() => ''),
 }));
 
 vi.mock('../team-push.js', () => ({
@@ -386,7 +387,7 @@ describe('pull scope isolation (issue #73)', () => {
     );
   });
 
-  it('user mode: forwards force option to MCP reconcile', async () => {
+  it('user mode: pull --force never forces MCP over a member\'s own server (#993)', async () => {
     vi.mocked(detectProjectConfig).mockResolvedValue(null);
     vi.mocked(loadLocalConfigForScope).mockResolvedValue(userConfig);
 
@@ -395,7 +396,7 @@ describe('pull scope isolation (issue #73)', () => {
     expect(reconcileMcpForConfig).toHaveBeenCalledWith(
       expect.anything(),
       expect.anything(),
-      expect.objectContaining({ force: true }),
+      expect.not.objectContaining({ force: true }),
     );
   });
 

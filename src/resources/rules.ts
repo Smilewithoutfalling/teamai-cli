@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { isToolInstalledForConfig, ResourceHandler, type PlacementRecords } from './base.js';
-import type { ResourceItem, ResourceItemStatus, DeliveryTarget, TeamaiConfig, LocalConfig } from '../types.js';
+import type { CopyOrigin, ResourceItem, ResourceItemStatus, DeliveryTarget, TeamaiConfig, LocalConfig } from '../types.js';
 import { listFilesRecursive, pathExists, copyFile, ensureDir, remove, fileContentEqual, getFileMtime, listDirs, readFileSafe, writeFile, pruneEmptyDirs, fileHash } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
 import { getUserHome } from '../utils/home.js';
@@ -15,8 +15,10 @@ import { loadStateForScope } from '../config.js';
 import { placedResourcePath } from '../push-namespaces.js';
 import { deliversEveryNamespace } from '../resource-namespaces.js';
 import { getFileContentAtRev, isPastVersionOf, listFilesAtRev } from '../utils/git.js';
+import { historicalVersions } from '../utils/team-history.js';
 import {
-  adoptRecord, contentHash, forgetDelivered, keepsEditedCopy, recordDelivered, recordedUnchanged, removedCopyChanged,
+  adoptRecord, contentHash, describeMembersDirLeft, describeMembersLink, forgetDelivered, holdsNonRegular, isLink, isTeamaiCopy, keepsEditedCopy, openLedger, recordDelivered, recordedUnchanged,
+  judgeRemoval, reportKept,
   type DeliveredHashes, type DeliveryLedger,
 } from './delivered-copies.js';
 import {
@@ -348,6 +350,7 @@ export class RulesHandler extends ResourceHandler {
         tool,
         dest,
         content,
+        origin: ruleOrigin(tool, localConfig.repo.localPath, item.relativePath),
         ...(supersededStem !== undefined ? { supersedes: path.join(destDir, `${supersededStem}${ext}`) } : {}),
         ...(stem !== localName ? { movedFrom: path.join(destDir, `${localName}${ext}`) } : {}),
       });
@@ -424,6 +427,11 @@ export class RulesHandler extends ResourceHandler {
             + 'Rename your file, then run `teamai pull --force`.');
           continue;
         }
+        // With no ledger (the local agent's install), nothing else judges a link of the member's there (#993).
+        if (!ledger && await isLink(dest)) {
+          warnOnce(describeMembersLink(dest, item.relativePath));
+          continue;
+        }
         if (!ledger || !await keepsEditedCopy(ledger, item, target)) {
           await writeFile(dest, content);
           if (ledger) await recordDelivered(ledger.hashes, dest);
@@ -433,14 +441,18 @@ export class RulesHandler extends ResourceHandler {
         // Drop the `.md` copy left by an older layout; a tool that reads a
         // derived extension does not read it, and it would outlive the rule.
         const legacyCopy = path.join(destDir, `${path.basename(dest, path.extname(dest))}.md`);
-        if (dest !== legacyCopy) await remove(legacyCopy);
+        if (dest !== legacyCopy && await isLegacyLayoutCopy(legacyCopy, item.relativePath, ledger?.previous, localConfig.repo.localPath)) {
+          await remove(legacyCopy);
+          if (ledger) forgetDelivered(ledger.hashes, legacyCopy);
+        }
         // The namespaced copy an earlier pull wrote beside the author's root
         // copy: the same rule twice, for a tool that loads rules recursively.
         // A flat name (OMP's, Kiro's `fe.style.md`) may be the member's own
         // file or an edited copy: only one holding what was recorded or the
         // render goes (#946).
         if (supersedes && ruleFormatForTool(tool)?.flat) {
-          const disk = await fileHash(supersedes);
+          // A link there is the member's: never read through or deleted (#993).
+          const disk = await isLink(supersedes) ? null : await fileHash(supersedes);
           const recorded = ledger?.previous?.[supersedes];
           if (disk !== null && (disk === recorded || disk === contentHash(content))) {
             await remove(supersedes);
@@ -449,12 +461,20 @@ export class RulesHandler extends ResourceHandler {
             warnOnce(`Kept ${supersedes}: you edited it after teamai delivered it, and ${tool} also reads ${dest}, the same rule. `
               + 'Delete it once you have saved what you need.');
           }
-        } else if (supersedes) {
-          await remove(supersedes);
+        } else if (supersedes && await pathExists(supersedes)) {
+          // Teamai's only on record or proof, like any copy (#993).
+          if (!await isLink(supersedes) && (ledger?.previous?.[supersedes] !== undefined
+            || await isTeamaiCopy(supersedes, ruleOrigin(tool, localConfig.repo.localPath, item.relativePath)))) {
+            await remove(supersedes);
+            if (ledger) forgetDelivered(ledger.hashes, supersedes);
+          } else {
+            warnOnce(describeMembersDirLeft(supersedes, item.relativePath, 'pull'));
+          }
         }
         log.debug(`Synced rule ${item.name} → ${tool}`);
       } catch (e) {
         log.warn(`Failed to sync rule ${item.name} to ${tool}: ${(e as Error).message}`);
+        ledger?.failed.push({ name: item.name, tool });
       }
     }
   }
@@ -481,6 +501,8 @@ export class RulesHandler extends ResourceHandler {
     for (const item of rules) {
       for (const target of await this.deliveryTargets(teamConfig, localConfig, item, received)) {
         const { dest, content, movedFrom } = target;
+        // A link at the copy's path is the member's: never written through (#993).
+        if (await isLink(dest)) continue;
         const recorded = ledger.previous?.[dest];
         const disk = await fileHash(dest);
         // A copy whose file name changed (OMP's flat names): the copy at the
@@ -546,10 +568,17 @@ export class RulesHandler extends ResourceHandler {
     // OMP's flat copies, judged against the team rule before it goes.
     const teamFile = path.join(localConfig.repo.localPath, 'rules', `${name}.md`);
     const { deliveredHashes } = await import('../pull.js');
+    // What this checkout's pulls recorded writing: a file with no record is
+    // teamai's only on proof, here as in pull (#993).
+    const ledger = openLedger(await deliveredHashes(localConfig));
     const flatCopies = await this.ownedFlatCopies(
       teamConfig, localConfig, [{ name, type: 'rules', sourcePath: teamFile, relativePath: `rules/${name}.md` }],
-      await deliveredHashes(localConfig),
+      ledger.previous,
     );
+    // What pull writes today from the team rule also proves a copy teamai's,
+    // so it is read before the rule goes: a checkout without history, such as
+    // the local agent's resource cache, has no other proof.
+    const current = await readFileSafe(teamFile);
 
     // Remove from team repo (always `.md`)
     if (await pathExists(teamFile)) {
@@ -599,6 +628,16 @@ export class RulesHandler extends ResourceHandler {
       for (const localName of localNames) {
         for (const extension of extensions) {
           const filePath = path.join(baseDir, toolPath.rules, `${localName}${extension}`);
+          // A link is the member's, on record or not: teamai never deletes one (#993).
+          if (await isLink(filePath)) continue;
+          // The team file is gone from the working tree only: its history still proves a copy teamai's.
+          // The author's root copy is this rule's by the placement record, which proves it here.
+          if (localName === name && await pathExists(filePath) && ledger.previous?.[filePath] === undefined
+            && !await holdsCurrentRule(filePath, tool, current)
+            && !await isTeamaiCopy(filePath, ruleOrigin(tool, localConfig.repo.localPath, `rules/${name}.md`))) {
+            log.warn(describeMembersDirLeft(filePath, `rules/${name}.md`, 'remove'));
+            continue;
+          }
           if (await pathExists(filePath)) {
             await remove(filePath);
             removed.push(filePath);
@@ -612,7 +651,8 @@ export class RulesHandler extends ResourceHandler {
     // and tag selection still applies to the files the refresh writes.
     const { buildRolePullContext, resolveDesiredRules } = await import('./desired.js');
     const { items, replaced } = await resolveDesiredRules(teamConfig, localConfig, await buildRolePullContext(localConfig));
-    await this.pullAllRules(teamConfig, localConfig, items, replaced);
+    await this.pullAllRules(teamConfig, localConfig, items, replaced, ledger);
+    reportKept(ledger, localConfig.scope);
 
     return removed;
   }
@@ -638,7 +678,7 @@ export class RulesHandler extends ResourceHandler {
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
       if (!toolPath.rules || isAgentExcluded(localConfig, tool)) continue;
       const file = path.join(resolveToolBaseDir(tool, localConfig), toolPath.rules, `${TEAMAI_CONTEXT_RULE_NAME}${ruleFileExtensionForTool(tool)}`);
-      if (!await pathExists(file) || await holdsInstructionBlocks(file)) continue;
+      if (await isLink(file) || !await pathExists(file) || await holdsInstructionBlocks(file)) continue;
       const recorded = ledger?.previous?.[file];
       deliveredRevs ??= (
         await (await import('../pull.js')).resolveCheckoutBases(localConfig, await loadStateForScope(localConfig))
@@ -670,7 +710,7 @@ export class RulesHandler extends ResourceHandler {
     const edited: FlatCopy[] = [];
     for (const rule of rules) {
       for (const { tool, dest, content, movedFrom } of await this.deliveryTargets(teamConfig, localConfig, rule)) {
-        if (movedFrom === undefined || !await pathExists(dest)) continue;
+        if (movedFrom === undefined || await isLink(dest) || !await pathExists(dest)) continue;
         const hash = await fileHash(dest);
         if (previous?.[dest] === hash || (content !== undefined && hash === contentHash(content))) {
           owned.push({ tool, file: dest });
@@ -836,8 +876,12 @@ export class RulesHandler extends ResourceHandler {
         // active, and ahead of the built-in check, since built-ins now deploy to
         // target tool as `.mdc` too.
         if (isLegacyCursorRuleFile(tool, localFile)) {
-          await remove(path.join(destDir, localFile));
-          log.debug(`Removed legacy .md rule ${localFile} from ${tool}`);
+          const legacyFile = path.join(destDir, localFile);
+          if (await isLegacyLayoutCopy(legacyFile, `rules/${ruleName}.md`, ledger?.previous, localConfig.repo.localPath)) {
+            await remove(legacyFile);
+            if (ledger) forgetDelivered(ledger.hashes, legacyFile);
+            log.debug(`Removed legacy .md rule ${localFile} from ${tool}`);
+          }
           continue;
         }
 
@@ -846,12 +890,22 @@ export class RulesHandler extends ResourceHandler {
         if (EXCLUDED_RULE_NAMES.has(ruleName)) continue;
         if (!deliveredStems.has(ruleName)) {
           const fullPath = path.join(destDir, localFile);
-          // A copy the member changed since teamai delivered it stays (#822);
-          // the tombstone cleanup names one of a rule the team removed.
-          if (await removedCopyChanged(ledger?.previous, fullPath)) {
+          // A copy the member changed since teamai delivered it stays (#822),
+          // and so does one with no record that holds no team version of the
+          // rule (#993); the tombstone cleanup names one of a rule the team
+          // removed. A file of a name the team never had is the member's own
+          // rule, which needs no word.
+          const teamFile = `rules/${ruleName}.md`;
+          const removal = await judgeRemoval(ledger?.previous, fullPath, ruleOrigin(tool, localConfig.repo.localPath, teamFile), ledger?.otherRecords);
+          if (removal === 'edited') {
             if (!tombstones.has(ruleName)) {
               log.warn(`Kept ${fullPath}: teamai no longer delivers ${ruleName} here, but you changed this copy. Delete it when you no longer need it.`);
             }
+            continue;
+          }
+          if (removal === 'notTeamais') {
+            const wasTeamRule = ((await historicalVersions(localConfig.repo.localPath, teamFile))?.length ?? 0) > 0;
+            if (wasTeamRule && !tombstones.has(ruleName)) log.warn(describeMembersDirLeft(fullPath, teamFile, 'pull'));
             continue;
           }
           await remove(fullPath);
@@ -1027,7 +1081,8 @@ export class RulesHandler extends ResourceHandler {
       for (const file of [...owned, ...edited]) {
         const target = delivery.get(file);
         if (target === undefined || target.dest === file || target.content === undefined) continue;
-        if (!await pathExists(target.dest)) await write(target.dest, target.content);
+        // A link there, dangling or not, is the member's: never written through (#993).
+        if (!await isLink(target.dest) && !await pathExists(target.dest)) await write(target.dest, target.content);
       }
       const kept: string[] = [];
       for (const file of edited) {
@@ -1106,7 +1161,8 @@ export class RulesHandler extends ResourceHandler {
         // can remain beside it, so check both against the same delivery proof.
         for (const name of new Set([rule.name, await this.localNameFor(rule.name, localConfig)])) {
           const file = path.join(dir, `${name}${ext}`);
-          if (!await pathExists(file)) continue;
+          // A link is the member's, whatever its target holds (#993).
+          if (await isLink(file) || !await pathExists(file)) continue;
           deliveredRevs ??= (
             await (await import('../pull.js')).resolveCheckoutBases(localConfig, await loadStateForScope(localConfig))
           ).revs;
@@ -1119,14 +1175,14 @@ export class RulesHandler extends ResourceHandler {
       for (const name of tombstoned) {
         for (const localName of new Set([name, await this.localNameFor(name, localConfig)])) {
           const file = path.join(dir, `${localName}${ext}`);
-          if (!await pathExists(file)) continue;
+          if (await isLink(file) || !await pathExists(file)) continue;
           (await onRecord(file) ? owned : edited).push(file);
         }
       }
       // A directory the tool reads gets teamai's built-in rules too.
       if (entry.copiedFrom === undefined) {
         const recall = path.join(dir, `teamai-recall${ext}`);
-        const recallContent = await readFileSafe(recall);
+        const recallContent = await isLink(recall) ? null : await readFileSafe(recall);
         if (recallContent !== null) (isDeployedRecallRule(recallContent) ? owned : edited).push(recall);
       }
       out.push({ entry, dir, copiedFrom, owned: [...new Set(owned)], edited: [...new Set(edited)].filter((file) => !owned.includes(file)) });
@@ -1279,7 +1335,8 @@ export class RulesHandler extends ResourceHandler {
       // After cleaning children, check if this dir is now empty
       const remaining = await listFilesRecursive(subPath);
       const remainingDirs = await listDirs(subPath);
-      if (remaining.length === 0 && remainingDirs.length === 0) {
+      // A link the member put there is not listed, and keeps the directory (#993).
+      if (remaining.length === 0 && remainingDirs.length === 0 && !await holdsNonRegular(subPath)) {
         await remove(subPath);
       }
     }
@@ -1371,6 +1428,63 @@ function keptNestedCopyMessage(tool: string, file: string, name: string, flatCop
 }
 
 /**
+ * How a file with no record in `tool`'s rules directory is proven teamai's
+ * (#993): it holds a version of the team rule at `relativePath`, verbatim or
+ * in one of the tool's `deliveredRenders`.
+ */
+export function ruleOrigin(tool: string, repoPath: string, relativePath: string): CopyOrigin {
+  const renders = ruleFormatForTool(tool) ? deliveredRenders(tool) : [];
+  return {
+    repoPath,
+    pathspec: relativePath,
+    ...(renders.length > 0 ? { renders: renders.map((render) => (content: Buffer) => render(content.toString('utf-8'))) } : {}),
+  };
+}
+
+/**
+ * Whether `file` holds the team rule `raw` as pull writes it for `tool` today,
+ * or verbatim, as an older layout's `.md` copy does.
+ */
+async function holdsCurrentRule(file: string, tool: string, raw: string | null): Promise<boolean> {
+  if (raw === null) return false;
+  const disk = await readFileSafe(file);
+  return disk === raw || disk === renderRuleForTool(tool, raw);
+}
+
+/**
+ * Whether `file`, a copy of the team rule at `relativePath` in `tool`'s rules
+ * directory, is teamai's to delete in a command the member ran (`uninstall`;
+ * #993): a built-in rule's name, on `previous`, the checkout's record, edited
+ * since or not, or a version of that rule by the team history (`ruleOrigin`).
+ * Read-only.
+ */
+export async function ownsRuleCopy(
+  file: string, tool: string, relativePath: string, repoPath: string, previous: DeliveredHashes | undefined,
+): Promise<boolean> {
+  if (await isLink(file)) return false;
+  if (previous?.[file] !== undefined) return true;
+  if (EXCLUDED_RULE_NAMES.has(relativePath.replace(/^rules\//, '').replace(/\.md$/, ''))) return true;
+  return isTeamaiCopy(file, ruleOrigin(tool, repoPath, relativePath));
+}
+
+/**
+ * Whether `file`, a `.md` in the rules directory of a tool that reads only
+ * its own extension (`.cursor/rules/`), is a copy an older teamai layout wrote
+ * there, so pull, remove and uninstall may delete it: on record, or a version
+ * of the team rule at `pathspec` verbatim, as that layout wrote it (#993). A
+ * built-in rule's name is teamai's own. Any other file is the member's and is
+ * kept silently: the tool never reads it, so there is nothing to resolve.
+ */
+export async function isLegacyLayoutCopy(
+  file: string, pathspec: string, previous: DeliveredHashes | undefined, repoPath: string,
+): Promise<boolean> {
+  if (await isLink(file) || !await pathExists(file)) return false;
+  if (previous?.[file] !== undefined) return true;
+  if (EXCLUDED_RULE_NAMES.has(pathspec.replace(/^rules\//, '').replace(/\.md$/, ''))) return true;
+  return isTeamaiCopy(file, { repoPath, pathspec });
+}
+
+/**
  * Whether `file` is there with other bytes than `content` and no record of
  * teamai writing it: a file of the member's own at a path teamai now writes.
  */
@@ -1401,6 +1515,8 @@ async function isDeliveredRender(
   repoPath: string,
   deliveredRevs: readonly string[],
 ): Promise<boolean> {
+  // teamai writes files, never links: a link is the member's, whatever its target holds (#993).
+  if (await isLink(deployed)) return false;
   const current = await readFileSafe(deployed);
   if (current === null) return false;
   const matches = (raw: string): boolean => renders.some((render) => current === render(raw));

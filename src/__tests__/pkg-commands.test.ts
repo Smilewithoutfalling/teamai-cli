@@ -172,8 +172,8 @@ describe('pkgInstall npm target options', () => {
     });
     expect((await loadPackageLock(path.join(projectRoot, '.teamai')))
       ?.declarationHash).toBeUndefined();
-    expect(fs.readFileSync(path.join(projectRoot, '.teamai', '.gitignore'), 'utf8'))
-      .toContain('teamai.lock');
+    // The lock lives in the data home, so nothing in the tree needs ignoring (#993).
+    expect(fs.existsSync(path.join(projectRoot, '.teamai', '.gitignore'))).toBe(false);
     expect(mocks.assertNotReadOnly).toHaveBeenCalled();
   });
 

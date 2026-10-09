@@ -49,8 +49,12 @@ function runCLI(args: string[], cwd: string, home: string, env: NodeJS.ProcessEn
   });
 }
 
-function git(args: string[], cwd: string): string {
-  return execFileSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, ...GIT_ENV } });
+/**
+ * Pass `home` when the command fires teamai's git hooks: they run the CLI, and
+ * a member's hooks share the member's HOME.
+ */
+function git(args: string[], cwd: string, home?: string): string {
+  return execFileSync('git', args, { cwd, encoding: 'utf8', env: { ...process.env, ...GIT_ENV, ...(home ? { HOME: home } : {}) } });
 }
 
 interface Project {
@@ -1343,6 +1347,8 @@ function writeGitInstall(install: { teamRemote: string }, checkout: string): str
     '',
   ].join('\n'));
   fs.writeFileSync(path.join(legacyDir, 'state.json'), JSON.stringify({ lastPullRev: null }));
+  // A release with #964 stamps each fetch beside the clone.
+  fs.writeFileSync(path.join(legacyDir, 'last-fetch.json'), JSON.stringify({ lastFetch: new Date().toISOString() }));
   return legacyDir;
 }
 
@@ -1447,7 +1453,7 @@ describe('a checkout an older git-mode install left (#808)', () => {
 
     // The worktree's branch takes the knowledge init committed on main, next
     // to its own old install.
-    git(['merge', '-q', 'main'], worktree);
+    git(['merge', '-q', 'main'], worktree, home);
     const teamaiYaml = fs.readFileSync(path.join(worktree, '.teamai', 'teamai.yaml'), 'utf8');
     expect(teamaiYaml).toContain('mode: self');
     expect(fs.existsSync(path.join(legacyDir, 'config.yaml'))).toBe(true);

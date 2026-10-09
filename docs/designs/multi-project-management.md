@@ -383,9 +383,11 @@ inactive `checkout` on every filesystem. When a namespace stops being active,
 pull removes the local copies that are byte-equal to the team file, or to any
 earlier commit of it (`isPastVersionOf`: the team edited it after delivery), and keeps
 edited ones, naming them. The docs mirror (#817) targets this resolved set: it
-copies only the delivered files and prunes every local file the team repo does
-not have, inside a withheld namespace too, but never a local copy of a withheld
-namespace's team doc; those follow the byte-equal rule. The search index and
+copies only the delivered files and prunes a local file the team repo no longer
+has only when it is a version of that doc from the team history (#993), inside a
+withheld namespace too, but never a local copy of a withheld namespace's team doc;
+those follow the byte-equal rule. A file at a path the team history never had is
+the member's and stays. The search index and
 `doctor`'s `Team docs delivered` use the same filter as pull: doctor expects
 only the delivered files, and does not report a withheld namespace's team doc
 as stale, since pull names the edited copies it keeps.
@@ -489,19 +491,74 @@ skill directory is one unit, and files only the member added are not recorded.
 Tombstone cleanup keeps an edited copy the same way, and so does the rules
 sweep of a rule no longer delivered (deleted from the team repo, or of a
 namespace the member left). `--force` keeps edits;
-deleting the copy and running `pull --force` takes the team version. A record
-without `delivered` (the first pull on this version, a new worktree) protects
-nothing, and a copy teamai never delivered to that path is overwritten as
-before. A forced full sync elsewhere keeps each checkout's `delivered`.
+deleting the copy and running `pull --force` takes the team version. A rule or
+agent file, or a skill directory, with no entry in `delivered` (the first pull on this version, a new
+worktree, a restored checkout whose `.git` key changed, the member's own file)
+is teamai's only on proof (#993): its bytes, by git blob id, equal a version of
+the resource's team file in the team repo's history, or teamai's render of one
+for that tool (`isTeamaiCopy`, the target's `origin`). The proof runs only for
+a file that exists without a record. Otherwise it is the member's: neither
+written nor deleted, named (with the kept-edit wording when another checkout's
+record lists the path, else `describeMembersFile`), listed by `doctor`, and the
+pull does not count as synced, so the next one retries. No record is carried
+over to a new key. A skill directory (`isTeamaiSkillCopy`) is decided only when
+no file under it has a record: it is teamai's when every file in it but
+CONTRIBUTORS is today's team file or a version of that file of a team skill of
+that name (root or any namespace, SKILL.md also with its frontmatter repaired),
+so one file of the member's makes it the member's, whole. The docs mirror keeps
+no record: a file at a team doc's path is teamai's only when it is a version
+of that doc (`membersDocs`), and the mirror prune deletes a file at a removed
+team doc's path only on the same proof (`isPrunableDoc`). teamai writes files,
+never links: a link at any delivered path (skill directory, rule or agent file,
+docs mirror entry, source skill destination), or anywhere inside a delivered
+skill directory, is the member's, never followed, written through, replaced or
+deleted by pull, `remove`, `uninstall` or a cleanup sweep, and pull names it
+(`describeMembersLink`). The mirror prune keeps any file or link at a path the
+team never had, and delivery skips a link inside a team or source skill. A forced
+full sync elsewhere keeps each checkout's `delivered`.
 `doctor` does not fail on a kept copy; next to another problem it lists one
-as "changed by you (kept by pull)".
+as "changed by you (kept by pull)". A member's own file fails the delivery
+check, as the team version does not reach that tool: it is listed as "not
+teamai's (kept by pull)" with pull's line for each file.
+
+Codex's shared `.agents/skills/<name>` is a destination only for a copy that
+is teamai's under the same rule (#993): `resolveSkillDestination` takes the
+ownership predicate, `judgeCopy` against the checkout's record in pull, the
+history proof alone (`isTeamaiSkillCopy`) in doctor, and `ownsSkillDir` in
+`teamai remove` and `uninstall` (below). Any other copy there is the member's
+or another tool's, and is
+not "kept" in the sense above: Codex gets `.codex/skills/<name>` instead, the
+team skill is delivered, and every full sync names the conflict (Codex sees two
+skills of that name). Source skills use the same rule with the source repo
+as origin (#993 bug 8): a shared copy is the source's when its installation
+manifest records it, or it is the source skill as pulled now or a version in
+the source repo's history (`isTeamaiSkillCopy` against the source cache).
+The built-in stub still takes an existing shared copy as its own.
+
+The commands that delete skill directories by a team skill's name apply the
+same rule in every tool's skills root (#993): `teamai remove skills <name>` and
+`uninstall` delete a directory only when a file under it is on the checkout's
+record (edited or not) or `isTeamaiSkillCopy` proves it (`ownsSkillDir`), and
+name each one they leave; uninstall also deletes a built-in's name and a name
+the local agent's manifest lists. `uninstall` removes from the docs mirror only
+what the history proves teamai's (`removeTeamDocs`: a file or link at `<rel>`
+that is a version of `docs/<rel>`), keeps and names the rest, and leaves the
+directories holding it, inside the data home too. Pull's sweep of the namespace-nested copies
+earlier releases left of an excluded skill deletes one only when
+`judgeRemoval` returns `remove`, and leaves the rest silently, as pull never
+delivers there. `judgeRemoval` sorts a copy of a resource no longer
+delivered into `remove`, `edited` (changed since teamai delivered it, or on
+another checkout's record) and `notTeamais` (no record, no team version), so
+each caller names a kept copy for what it is.
 
 ### Known gaps
 
-- `teamai remove`'s rules refresh and local-agent installs deliver rules and
-  skills as before: they overwrite a changed copy and record nothing. If the
-  team changes a copy they wrote before the next pull, that pull keeps it as an
-  edit.
+- `teamai remove`'s rules refresh judges copies against the checkout's record
+  and the team history as pull does (#993), and deletes a copy of the removed
+  rule only when it is on record or proven teamai's (the author's root copy by
+  its placement record); it records nothing. Local-agent installs deliver rules
+  and skills as before: they overwrite a changed copy and record nothing. The
+  next pull judges a skill, rule or agent copy either wrote by the team history.
 - Step 3b and the inactive-namespace cleanup of skills and agents still compare
   with the team source, not the record, so an untouched copy delivered at an
   older revision stays there with a warning.

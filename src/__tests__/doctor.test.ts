@@ -28,6 +28,7 @@ vi.mock('../utils/fs.js', () => ({
     listFiles: vi.fn().mockResolvedValue([]),
     listFilesRecursive: vi.fn().mockResolvedValue([]),
     expandHome: vi.fn((p: string) => p),
+    symlinkTarget: vi.fn(async (p: string) => p),
 }));
 
 vi.mock('../utils/logger.js', () => ({
@@ -61,6 +62,8 @@ vi.mock('../providers/tgit/index.js', () => ({
 vi.mock('../hooks.js', async (importOriginal) => ({
     ...(await importOriginal<typeof import('../hooks.js')>()),
     readCodexHookTrustForScope: vi.fn().mockResolvedValue(null),
+    // The hook entries a pull keeps as the member's (#993): covered end to end by config-entry-ownership-993.
+    keptTeamHookEntries: vi.fn().mockResolvedValue([]),
 }));
 
 // ── Imports (after mocks) ────────────────────────────────

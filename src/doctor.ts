@@ -12,6 +12,7 @@ import {
   resolveToolRootDir,
   toolRootRejection,
   resolveHookScope,
+  legacyManagedHooksPath,
   resolveToolBaseDir,
   isAgentExcluded,
   scopedToolPaths,
@@ -21,7 +22,7 @@ import {
 import { isToolInstalledForConfig } from './resources/base.js';
 import { skillsDirForTool } from './resources/skills.js';
 import { isCodexTool } from './utils/tool-names.js';
-import { TEAMAI_HOOK_SUBCOMMANDS, isCodexTrustGatedTool, codexTrustReminder, readCodexHookTrustForScope } from './hooks.js';
+import { TEAMAI_HOOK_SUBCOMMANDS, isCodexTrustGatedTool, codexTrustReminder, keptTeamHookEntries, readCodexHookTrustForScope } from './hooks.js';
 import {
   buildDeliveryChecks,
   buildRulesDeliveryChecks,
@@ -29,6 +30,7 @@ import {
   buildInstructionDeliveryChecks,
   buildNamespaceNotes,
   buildMcpDeliveryChecks,
+  buildMcpReadFileChecks,
   buildCodexProjectTrustCheck,
   buildMcpGitExcludeCheck,
   buildEnvDeliveryCheck,
@@ -550,6 +552,7 @@ export async function buildChecks(ctx: DoctorContext, stage: CheckStage = 'docto
         + 'can push to the team repo (run with --verbose to see the push error).',
     },
     ...await buildGitHookChecks(localConfig, stage),
+    ...await buildTrackedHookIndexCheck(localConfig),
     ...buildToolRootChecks(localConfig, teamConfig),
     ...await buildEnabledToolChecks(ctx),
     ...await buildHookChecks(toolPaths, hookToolPaths, baseDir, localConfig),
@@ -561,6 +564,7 @@ export async function buildChecks(ctx: DoctorContext, stage: CheckStage = 'docto
     ...(stage === 'doctor' ? await buildInstructionDeliveryChecks(ctx) : []),
     ...await buildAgentModelChecks(ctx, stage),
     ...await buildMcpDeliveryChecks(ctx),
+    ...await buildMcpReadFileChecks(ctx),
     ...await buildCodexProjectTrustCheck(ctx),
     ...await buildMcpGitExcludeCheck(ctx),
     ...await buildDocsCheck(ctx),
@@ -604,6 +608,37 @@ async function buildGitHookChecks(localConfig: LocalConfig, stage: CheckStage): 
       }
       : { name: 'No git hook failure recorded', source: 'local', check: async () => true },
   ];
+}
+
+/**
+ * Project scope: the hook index and the package lock a release before #993
+ * kept in the working tree, when git tracks them. Pull moves the index's
+ * records to the data home, and the lock is copied there, but a tracked file
+ * is left for the member to untrack (`migrateLegacyManagedHooks`,
+ * `packageLockDir`).
+ */
+async function buildTrackedHookIndexCheck(localConfig: LocalConfig): Promise<Check[]> {
+  if (localConfig.scope !== 'project' || !localConfig.projectRoot) return [];
+  const root = localConfig.projectRoot;
+  const { gitTracks } = await import('./mcp-git-exclude.js');
+  const legacyFiles = [
+    { file: legacyManagedHooksPath(root), what: 'hook index', after: 'teamai pull deletes it once nothing in it is needed' },
+    { file: path.join(root, '.teamai', 'teamai.lock'), what: 'package lock', after: 'the next `teamai packages install` or session start deletes it' },
+  ];
+  const checks: Check[] = [];
+  for (const { file, what, after } of legacyFiles) {
+    if (!await pathExists(file) || (await gitTracks(file)).kind !== 'tracked') continue;
+    const rel = path.relative(root, file).split(path.sep).join('/');
+    checks.push({
+      name: `${file} is tracked by git`,
+      source: 'local',
+      informational: true,
+      check: async () => false,
+      fix: `teamai keeps its ${what} in its data home now; this copy is left over from an older release. `
+        + `Run \`git rm --cached ${rel}\` in ${root} and commit, so it leaves the repository; ${after}.`,
+    });
+  }
+  return checks;
 }
 
 /**
@@ -692,6 +727,8 @@ export async function doctor(options: DoctorOptions): Promise<boolean> {
   const notes = [
     ...await buildNamespaceNotes(ctx),
     ...await entryNamespaceNotes(ctx),
+    // Hook entries a pull keeps as the member's (#993): the team's own entries are written beside them.
+    ...ctx.teamConfig ? await keptTeamHookEntries(ctx.teamConfig, localConfig) : [],
     ...await aliasNamespaceNotes(ctx),
     ...await agentModelNotes(ctx),
     ...(await envAdvisories(localConfig, ctx.teamConfig, ctx.teamEnv)).map(describeEnvAdvisory),

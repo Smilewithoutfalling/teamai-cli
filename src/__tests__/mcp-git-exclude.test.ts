@@ -39,7 +39,7 @@ vi.mock('../utils/fs.js', async (importOriginal) => {
   };
 });
 
-import { MCP_EXCLUDE_END, MCP_EXCLUDE_START, carriesLocalAgentCredential, ensureExcludedFromGit, excludeFromGit, removeMcpGitExclude } from '../mcp-git-exclude.js';
+import { MCP_EXCLUDE_END, MCP_EXCLUDE_START, carriesLocalAgentCredential, ensureExcludedFromGit, excludeFromGit, removeMcpGitExclude, updateFileLocked } from '../mcp-git-exclude.js';
 import { acquireLock, releaseLock } from '../update.js';
 import { log } from '../utils/logger.js';
 
@@ -108,6 +108,71 @@ describe('teamai block in .git/info/exclude (#882)', () => {
 
       expect(log.warn).toHaveBeenCalledWith(expect.stringContaining(path.join(repo, '.mcp.json')));
       expect(log.warn).toHaveBeenCalledWith(expect.stringMatching(/config/));
+    });
+  });
+
+  // `git init --template=` leaves no info/ (#993).
+  describe('in a repository without .git/info/', () => {
+    beforeEach(async () => {
+      await fse.remove(path.join(repo, '.git', 'info'));
+    });
+
+    it('creates it and lists the file', async () => {
+      expect(await ensureExcludedFromGit(path.join(repo, '.mcp.json'))).toEqual({ kind: 'excluded', added: true });
+      expect(await fse.readFile(excludeFile, 'utf8')).toBe(`${MCP_EXCLUDE_START}\n/.mcp.json\n${MCP_EXCLUDE_END}\n`);
+    });
+
+    it('finds nothing in the way on a dry run, and creates nothing', async () => {
+      expect(await ensureExcludedFromGit(path.join(repo, '.mcp.json'), { dryRun: true })).toEqual({ kind: 'pending' });
+      expect(await fse.pathExists(path.join(repo, '.git', 'info'))).toBe(false);
+    });
+
+    it.skipIf(process.getuid?.() === 0)('names the exclude file, and the directory that denies the write, when .git is read-only', async () => {
+      const gitDir = path.join(await fse.realpath(repo), '.git');
+      const realExclude = path.join(gitDir, 'info', 'exclude');
+      await fse.chmod(gitDir, 0o555);
+
+      try {
+        expect(await ensureExcludedFromGit(path.join(repo, '.mcp.json'))).toEqual({
+          kind: 'failed',
+          reason: `${realExclude} is not writable, as ${gitDir} is not`,
+          fix: `Make ${gitDir} writable, or add \`/.mcp.json\` to ${realExclude} yourself, then run \`teamai pull\` again.`,
+        });
+      } finally {
+        await fse.chmod(gitDir, 0o755);
+      }
+      expect(await fse.pathExists(path.join(repo, '.git', 'info'))).toBe(false);
+    });
+
+    it.each([
+      ['a pull', {}],
+      ['a dry run', { dryRun: true }],
+    ])('names the exclude file as not writable on %s when .git/info is a regular file, without waiting on a lock', async (_label, options) => {
+      const info = path.join(await fse.realpath(repo), '.git', 'info');
+      await fse.writeFile(info, 'not a directory\n');
+      const started = Date.now();
+
+      const exclusion = await ensureExcludedFromGit(path.join(repo, '.mcp.json'), options);
+
+      expect(exclusion).toEqual({
+        kind: 'failed',
+        reason: `${path.join(info, 'exclude')} is not writable, as ${info} is not a directory`,
+        fix: `Move ${info} aside, then run \`teamai pull\` again.`,
+      });
+      // The lock wait is 25 attempts 100 ms apart.
+      expect(Date.now() - started).toBeLessThan(1500);
+      expect(await fse.readFile(info, 'utf8')).toBe('not a directory\n');
+    });
+
+    it('rejects a locked update whose directory is a regular file, without waiting on the lock', async () => {
+      const info = path.join(repo, '.git', 'info');
+      await fse.writeFile(info, 'not a directory\n');
+      const started = Date.now();
+
+      await expect(updateFileLocked(path.join(info, 'exclude'), () => 'x\n')).rejects.toThrow(
+        `${path.join(info, 'exclude')} is not writable, as ${info} is not a directory`,
+      );
+      expect(Date.now() - started).toBeLessThan(1500);
     });
   });
 
@@ -346,14 +411,24 @@ describe('teamai block in .git/info/exclude (#882)', () => {
       await expect(fse.ensureDir(path.join(repo, '.dangling'))).rejects.toThrow();
     });
 
-    it('judges a symlink at the file itself as the file: the write replaces it', async () => {
+    it('judges a symlink at the file itself by the file it points to: the write lands there', async () => {
+      await fse.writeJson(path.join(repo, 'config', 'mcp.json'), {});
+      await fse.symlink(path.join('config', 'mcp.json'), path.join(repo, '.mcp.json'));
+
+      expect(await ensureExcludedFromGit(path.join(repo, '.mcp.json'))).toEqual({ kind: 'excluded', added: true });
+      expect(await fse.readFile(excludeFile, 'utf8')).toMatch(/^\/config\/mcp\.json$/m);
+      expect(await fse.readFile(excludeFile, 'utf8')).not.toMatch(/^\/\.mcp\.json$/m);
+    });
+
+    it('fails for a symlink at the file itself whose target git tracks, naming the target', async () => {
       await fse.writeJson(path.join(repo, 'config', 'mcp.json'), {});
       commit('config');
       await fse.symlink(path.join('config', 'mcp.json'), path.join(repo, '.mcp.json'));
 
-      expect(await ensureExcludedFromGit(path.join(repo, '.mcp.json'))).toEqual({ kind: 'excluded', added: true });
-      expect(await fse.readFile(excludeFile, 'utf8')).toMatch(/^\/\.mcp\.json$/m);
-      expect(await fse.readFile(excludeFile, 'utf8')).not.toContain('/config/');
+      const result = await ensureExcludedFromGit(path.join(repo, '.mcp.json'));
+
+      expect(result).toMatchObject({ kind: 'failed', reason: `git already tracks ${path.join(await fse.realpath(repo), 'config', 'mcp.json')} (where ${path.join(repo, '.mcp.json')} is written)` });
+      expect(await fse.pathExists(excludeFile) ? await fse.readFile(excludeFile, 'utf8') : '').not.toContain('teamai');
     });
   });
 });

@@ -28,6 +28,11 @@ import {
   formatAstStatsSummary,
 } from './wiki-engine/adapters/index.js';
 import type { CodeFact, InterfaceInventory, CallChain } from './wiki-engine/adapters/index.js';
+import type { CodeCollectedFile } from './wiki-engine/code-knowledge/code-collector.js';
+import { CODE_COLLECTION_VERSION } from './wiki-engine/code-knowledge/code-collector.js';
+import type { ExtractorContext } from './wiki-engine/code-knowledge/extractors/index.js';
+import { SCALA_DECL_PREFIX, SCALA_WILDCARD_PREFIX } from './wiki-engine/code-knowledge/extractors/index.js';
+import { isMetadataRelation } from './wiki-engine/code-knowledge/code-extractors.js';
 import {
   loadFactsCache,
   saveFactsCache,
@@ -82,6 +87,11 @@ interface KnowledgeGap {
   source: string;
 }
 
+/** 用户可见的 facts：元数据 relation（通配包名、顶层声明标记）不进任何统计。 */
+function visibleFactsOf(facts: CodeFact[]): CodeFact[] {
+  return facts.filter((f) => f.kind !== 'relation' || !isMetadataRelation(f.name));
+}
+
 function detectKnowledgeGaps(
   facts: CodeFact[],
   graph: GraphIndex,
@@ -96,7 +106,7 @@ function detectKnowledgeGaps(
   }
 
   // 1. 未解析的外部依赖：import target 不在扫描范围内
-  const relationFacts = facts.filter((f) => f.kind === 'relation');
+  const relationFacts = facts.filter((f) => f.kind === 'relation' && !isMetadataRelation(f.name));
   const unresolvedImports = new Set<string>();
   for (const rel of relationFacts) {
     const target = rel.name;
@@ -216,7 +226,7 @@ function buildEvidencePages(
     pages.set(`${kind}.md`, lines.join('\n'));
   }
 
-  const relationFacts = facts.filter((f) => f.kind === 'relation');
+  const relationFacts = facts.filter((f) => f.kind === 'relation' && !isMetadataRelation(f.name));
   if (relationFacts.length > 0) {
     const byDir = new Map<string, CodeFact[]>();
     for (const fact of relationFacts) {
@@ -298,7 +308,7 @@ function buildEvidencePages(
     '',
     `# ${project}`,
     '',
-    `Facts: ${facts.length} | Pages: ${pages.size}`,
+    `Facts: ${visibleFactsOf(facts).length} | Pages: ${pages.size}`,
     '',
   ];
 
@@ -467,7 +477,7 @@ function buildOverview(
     '',
     `# ${project}`,
     '',
-    `**${facts.length} facts** extracted from ${new Set(facts.map(f => f.file)).size} files.`,
+    `**${visibleFactsOf(facts).length} facts** extracted from ${new Set(facts.map(f => f.file)).size} files.`,
     `Graph: ${graph.nodes.length} nodes, ${graph.edges.length} edges.`,
     '',
     '## Module Structure',
@@ -565,7 +575,7 @@ export async function extractCodebase(opts: ExtractCodebaseOptions): Promise<voi
   let deletedFiles: string[] = [];
   if (opts.incremental) {
     try {
-      const changes = await detectCodeIncrementalChanges(root, manifestPath, project);
+      const changes = await detectCodeIncrementalChanges(root, manifestPath, project, maxFiles);
       if (changes.added.length === 0 && changes.changed.length === 0 && changes.deleted.length === 0) {
         if (opts.json) {
           console.log(JSON.stringify({ status: 'up-to-date', project }));
@@ -586,6 +596,39 @@ export async function extractCodebase(opts: ExtractCodebaseOptions): Promise<voi
     }
   }
 
+  // 增量模式下，import 在提取时物化为具体文件（通配 → 各成员、具名 → 声明
+  // 文件）；若本次只变更了被指向的文件而 importer 未变，物化结果已过期。
+  // 缓存的 scala-wildcard: 标记记录通配 importer 及其包；其余以 .scala/.java
+  // 结尾的 relation 名就是物化目标文件本身——两者任一受影响都重提取 importer
+  const indicesDir = path.join(wikiRoot, '.indices');
+  let cachedFacts: CodeFact[] | undefined;
+  if (changedFiles !== undefined) {
+    cachedFacts = await loadFactsCache(indicesDir);
+    const changedSet = new Set([...changedFiles, ...deletedFiles]);
+    const originalChangedFiles = changedFiles;
+    const staleImporters = new Set<string>();
+    for (const fact of cachedFacts) {
+      if (fact.kind !== 'relation' || fact.name.startsWith(SCALA_DECL_PREFIX)) continue;
+      const touchedPackage = (pkg: string): boolean =>
+        originalChangedFiles.some((f) => f.includes(`/${pkg}/`) || f.startsWith(`${pkg}/`)) ||
+        deletedFiles.some((f) => f.includes(`/${pkg}/`) || f.startsWith(`${pkg}/`));
+      if (fact.name.startsWith(SCALA_WILDCARD_PREFIX)) {
+        if (touchedPackage(fact.name.slice(SCALA_WILDCARD_PREFIX.length))) staleImporters.add(fact.file);
+      } else if (/\.(?:scala|java)$/.test(fact.name)) {
+        // 物化目标本身变了——importer 必须重新解析
+        if (changedSet.has(fact.name)) staleImporters.add(fact.file);
+      } else {
+        // 未物化的常规路径（com/demo/core/Invoice）：包目录里有文件增删时，
+        // 原本解析不到的目标可能已经可解析
+        const pkg = fact.name.split('/').slice(0, -1).join('/');
+        if (pkg && touchedPackage(pkg)) staleImporters.add(fact.file);
+      }
+    }
+    if (staleImporters.size > 0) {
+      changedFiles = [...new Set([...changedFiles, ...staleImporters])];
+    }
+  }
+
   const { files, manifest: collectionManifest } = await collectCode({ root, maxFiles, changedFiles });
   if (files.length === 0 && !changedFiles) {
     // 全量模式下无文件
@@ -597,17 +640,39 @@ export async function extractCodebase(opts: ExtractCodebaseOptions): Promise<voi
     return;
   }
 
-  // 提取变更文件的新 facts
-  const newFacts = files.length > 0 ? extractCodeFacts(files) : [];
+  // 增量模式下，跨文件解析（通配展开、符号定位到声明文件）需要未变更文件的
+  // 路径与声明；两者都能从上一轮 facts 缓存得到，未变更文件无需重新读取。
+  // 声明只从 scala-decl: 标记重建——component facts 分不出嵌套成员，
+  // 标记在提取时就只记包级名字
+  let extractionContext: ExtractorContext | undefined;
+  if (changedFiles !== undefined) {
+    const priorDeclarations = new Map<string, Set<string>>();
+    const stubs = new Map<string, CodeCollectedFile>();
+    const removed = new Set([...changedFiles, ...deletedFiles]);
+    for (const fact of cachedFacts ?? []) {
+      if (!removed.has(fact.file)) {
+        stubs.set(fact.file, { path: fact.file, relativePath: fact.file, language: 'text', sha256: '', content: '' });
+      }
+      if (fact.kind === 'relation' && fact.name.startsWith(SCALA_DECL_PREFIX)) {
+        const names = new Set(fact.name.slice(SCALA_DECL_PREFIX.length).split(','));
+        priorDeclarations.set(fact.file, names);
+      }
+    }
+    for (const file of files) {
+      stubs.delete(file.relativePath); // 变更文件以本批为准
+    }
+    extractionContext = { allFiles: [...files, ...stubs.values()], priorDeclarations };
+  }
+
+  const newFacts = files.length > 0 ? extractCodeFacts(files, extractionContext) : [];
 
   // 增量模式：加载缓存 → 剪除 → 合并
   let facts: CodeFact[];
   let interfaceInventory: InterfaceInventory;
-  const indicesDir = path.join(wikiRoot, '.indices');
 
   if (changedFiles !== undefined) {
     // 增量模式（含 changedFiles=[] 即仅删除场景）
-    const oldFacts = await loadFactsCache(indicesDir);
+    const oldFacts = cachedFacts ?? (await loadFactsCache(indicesDir));
     const oldInterfaces = await loadInterfacesCache(indicesDir);
 
     // 剪除已变更/删除的旧数据
@@ -823,7 +888,7 @@ export async function extractCodebase(opts: ExtractCodebaseOptions): Promise<voi
     ifByType[e.type] = (ifByType[e.type] ?? 0) + e.count;
   }
   const indexStats: IndexStats = {
-    totalFacts: facts.length,
+    totalFacts: visibleFactsOf(facts).length,
     totalNodes: repoGraph.nodes.length,
     totalEdges: repoGraph.edges.length,
     interfaces: Object.keys(ifByType).length > 0 ? ifByType : undefined,
@@ -908,7 +973,7 @@ export async function extractCodebase(opts: ExtractCodebaseOptions): Promise<voi
 
   const headSha = collectionManifest.commit;
   const manifestObject: Record<string, unknown> = {
-    version: 1,
+    version: CODE_COLLECTION_VERSION,
     lastScan: new Date().toISOString(),
     files: allManifestFiles,
   };
@@ -929,14 +994,14 @@ export async function extractCodebase(opts: ExtractCodebaseOptions): Promise<voi
   await writeFile(manifestPath, manifestContent, 'utf-8');
 
   const byKind: Record<string, number> = {};
-  for (const fact of facts) {
+  for (const fact of visibleFactsOf(facts)) {
     byKind[fact.kind] = (byKind[fact.kind] ?? 0) + 1;
   }
 
   const result: ExtractResult = {
     project,
     filesScanned: files.length,
-    facts: { total: facts.length, byKind },
+    facts: { total: visibleFactsOf(facts).length, byKind },
     graph: { nodes: repoGraph.nodes.length, edges: repoGraph.edges.length },
     incremental: !!opts.incremental && !!changedFiles,
     outputDir: wikiRoot,

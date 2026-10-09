@@ -117,15 +117,20 @@ Every other command, every flag, and the flags `--help` hides live in the
 generated reference below. Read it instead of guessing a flag.
 
 `teamai pull` mirrors the non-hidden docs you receive into `sharing.docs.localDir`,
-removing stale and local-only documents; an edited doc of a docs namespace you left
-is kept and named. Use a dedicated directory; preview with `--dry-run`.
+removing teamai's copies of documents the team removed; the user's own files there
+stay, and an edited doc of a docs namespace you left is kept and named. Preview
+with `--dry-run`.
 
 `teamai pull` keeps a skill, rule or agent copy the user changed since teamai
 delivered it, `--force` included, and names it (`Kept <path>: ...`). To share
 the change, `teamai push`; when pull says the version teamai would deploy has
 changed since, or push says so for that copy, merge that change into the copy first, or the push replaces it. To take the team version instead, delete
-the copy and run `teamai pull --force`. The first pull after upgrading, and a
-new worktree's first pull, still overwrite: nothing is recorded yet.
+the copy and run `teamai pull --force`. A skill, rule, agent or docs-mirror
+file that teamai has no record of (first pull after upgrading, a new or restored
+checkout, the user's own) is teamai's only if it holds a team version from the team repo's
+history (a skill: every file in it); any other is kept as the user's
+(`Kept <path>: it is not teamai's ...`): rename or delete it, then `teamai pull`,
+to receive the team version.
 
 In project scope, `init` and `pull` also install a git hook in the repository's
 local git config (`hook.teamai-post-checkout`, `hook.teamai-post-merge`, `hook.teamai-post-rewrite`; Git

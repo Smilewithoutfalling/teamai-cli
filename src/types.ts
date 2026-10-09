@@ -270,6 +270,8 @@ export interface SourceInstallManifest {
   installedPaths?: Record<string, string[]>;
   /** Original physical destination for each recorded relative deployment path. */
   installedPhysicalPaths?: Record<string, string>;
+  /** For each absolute destination, the tool home it lay in when recorded (#993): a home that moved since leaves the copy unmanaged. */
+  installedHomes?: Record<string, string>;
 }
 
 /** TTL for source repo pull: don't re-pull within this duration (ms). */
@@ -791,9 +793,15 @@ export const StateSchema = z.object({
    * tool when teamai last wrote that copy, by agent stem (copies deploy
    * flattened, one file per stem) and tool (#830). An older CLI drops it too,
    * which the next pull reads as agents it has to redeploy.
+   * `root` is the project checkout the record belongs to, the path its key
+   * was computed from, written by that checkout's full pulls. A full pull in
+   * another checkout drops the record once that root is no longer a checkout
+   * of the repository under the same key; a record without one, from an older
+   * CLI, is kept (#993).
    */
   lastPullByWorkspace: z.record(z.string(), z.object({
     rev: z.string(),
+    root: z.string().optional(),
     targets: z.array(z.string()),
     pushBaseRevs: z.array(z.string()).optional(),
     delivered: z.record(z.string(), z.string()).optional(),
@@ -942,6 +950,28 @@ export interface DeliveryTarget {
    * cannot say, and only the destination's existence can be judged.
    */
   content?: string;
+  /**
+   * The team file `dest` is rendered from, for proving that a file already
+   * at `dest` with no delivery record is teamai's (#993). Absent: the handler
+   * offers no proof, and such a file is written over as before.
+   */
+  origin?: CopyOrigin;
+}
+
+/**
+ * A resource's file in the repo it comes from, and how teamai renders one
+ * version of it (`DeliveryTarget.origin`). A file is teamai's when its bytes
+ * equal a version `pathspec` held in `repoPath`'s history, or one of
+ * `renders` of such a version. For a skill, `pathspec` names the skill
+ * directory, and `renders` apply to its SKILL.md (`isTeamaiSkillCopy`).
+ */
+export interface CopyOrigin {
+  /** The team clone (`repo.localPath`), or a source repo. */
+  repoPath: string;
+  /** Repo-relative, `/`-separated. */
+  pathspec: string;
+  /** teamai's renders of one version; null when that version renders nothing here. */
+  renders?: ReadonlyArray<(content: Buffer, version: { path: string; blob: string }) => string | Uint8Array | null>;
 }
 
 // ─── Hook definitions (unified model, issue #19) ─────────
@@ -1032,6 +1062,12 @@ export interface ManagedMcpRecord {
    * notes them, the file counts as having no record.
    */
   unnoted?: true;
+  /**
+   * User scope, a tool that reads the first of several files (CodeBuddy,
+   * #993): the file holding this server. Absent in records an older teamai
+   * wrote, whose server is in the tool's mapped file (`McpTarget.mappedFile`).
+   */
+  file?: string;
 }
 
 /** ~/.teamai/managed-mcp.json — team MCP servers injected per tool+scope key. */
@@ -2511,12 +2547,38 @@ export function getStatePath(localConfig: LocalConfig): string {
 }
 
 /**
- * Get the managed-hooks manifest path for a given scope. This file indexes the
- * team (B) hooks injected into each tool, so reconcile can clean up hooks that
- * were removed from hooks.yaml (esp. for Cursor, whose entries carry no marker).
+ * The managed-hooks manifest: the team (B) hooks teamai injected into each
+ * tool, so reconcile can clean up hooks removed from hooks.yaml (esp. for
+ * Cursor and Copilot, whose entries carry no marker).
+ *
+ * User scope keeps one file in `~/.teamai`. A project scope's hook files are
+ * per checkout (Copilot's `.github/hooks/`, self mode's tool dirs), so its
+ * manifest is too, in the data home beside `managed-mcp.json`
+ * (`workspaces/<id>/`), never in the working tree (#993).
  */
-export function getManagedHooksPath(scope: Scope, projectRoot?: string): string {
-  return path.join(getTeamaiHome(scope, projectRoot), 'managed-hooks.json');
+export function getManagedHooksPath(localConfig: LocalConfig): string {
+  if (localConfig.scope !== 'project') return getUserManagedHooksPath();
+  if (!localConfig.projectRoot) {
+    throw new Error('getManagedHooksPath: scope is "project" but projectRoot is missing.');
+  }
+  return path.join(
+    getDataHome(localConfig), 'workspaces', managedMcpWorkspaceId(localConfig.projectRoot), 'managed-hooks.json',
+  );
+}
+
+/** `~/.teamai/managed-hooks.json`: user scope, and a non-self project scope's HOME hooks (#370). */
+export function getUserManagedHooksPath(): string {
+  return path.join(getTeamaiHome('user'), 'managed-hooks.json');
+}
+
+/**
+ * Where releases before #993 kept a project's managed-hooks manifest, in the
+ * working tree. Read by the pre-#370 Codex import, the legacy hook scope and
+ * uninstall; the first pull moves the Copilot records (every record in self
+ * mode) out of it (`migrateLegacyManagedHooks`).
+ */
+export function legacyManagedHooksPath(projectRoot: string): string {
+  return path.join(projectRoot, '.teamai', 'managed-hooks.json');
 }
 
 /**
@@ -2555,11 +2617,11 @@ export function resolveHookScope(
     // one (OpenCode, Qoder CN) would otherwise be written under the project
     // prefix, inside HOME. `scope` is returned so callers resolve paths and
     // base dir from one decision instead of re-deriving it (#370, #667).
-    return { baseDir: getUserHome(), manifestPath: getManagedHooksPath('user'), scope: 'user' };
+    return { baseDir: getUserHome(), manifestPath: getUserManagedHooksPath(), scope: 'user' };
   }
   return {
     baseDir: resolveBaseDir(localConfig),
-    manifestPath: getManagedHooksPath(localConfig.scope, localConfig.projectRoot),
+    manifestPath: getManagedHooksPath(localConfig),
     scope: localConfig.scope,
   };
 }
@@ -2609,7 +2671,7 @@ export function resolveLegacyProjectHookScope(
   if (path.resolve(localConfig.projectRoot) === path.resolve(getUserHome())) return null;
   return {
     baseDir: localConfig.projectRoot,
-    manifestPath: getManagedHooksPath('project', localConfig.projectRoot),
+    manifestPath: legacyManagedHooksPath(localConfig.projectRoot),
     scope: 'project',
   };
 }

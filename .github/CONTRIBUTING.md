@@ -18,7 +18,7 @@ npx tsc --noEmit       # Type check
 npm run lint           # oxlint; CI fails on any warning
 npx vitest run         # Run unit tests
 npx vitest run --coverage
-npm run test:e2e       # E2E tests (optional, requires a live test repo)
+npm run test:e2e       # Build and run E2E tests; remote cases require credentials
 ```
 
 `npm run lint` needs Node ^20.19 or >=22.12 (oxlint's requirement); the CLI itself still supports Node 20.
@@ -66,13 +66,17 @@ Giving every internet contributor write on the hub repo is not acceptable.
 src/
   providers/         # git hosting provider abstraction
     github/          # GitHub (gh CLI or GITHUB_TOKEN)
+    gitlab/          # GitLab (GITLAB_TOKEN)
+    gitcode/         # GitCode (GITCODE_TOKEN)
+    cnb/             # CNB (cnb CLI or CNB_TOKEN)
     tgit/            # Tencent TGit (gf CLI)
+    git/             # any Git host, no platform API
   resources/         # per-resource-type handlers (skills, rules, docs, env, ...)
   utils/             # shared helpers (git, fs, logger, prompt, ...)
   *.ts               # top-level command entry points (init, push, pull, ...)
 ```
 
-See [docs/providers.md](../docs/providers.md) for how to add a new git provider.
+See [docs/dev/adding-a-provider.md](../docs/dev/adding-a-provider.md) for how to add a new git provider.
 
 ## Making a Change
 
@@ -82,7 +86,7 @@ See [docs/providers.md](../docs/providers.md) for how to add a new git provider.
 4. Use conventional commits where possible: `feat:`, `fix:`, `chore:`, `docs:`, `refactor:`, `test:`.
 5. Open a PR with a clear description: what's the problem, what's the fix, anything reviewers should pay attention to.
 
-Your PR also gets an informational `Code Erosion` report (SlopCodeBench verbosity/erosion metrics) posted as a comment — it never blocks the merge and is just there to flag creeping complexity. See [docs/ci-code-erosion.md](../docs/ci-code-erosion.md).
+Your PR also gets an informational `Code Erosion` report (SlopCodeBench verbosity/erosion metrics) posted as a comment — it never blocks the merge and is just there to flag creeping complexity. See [docs/dev/ci-code-erosion.md](../docs/dev/ci-code-erosion.md).
 
 ## Coding Style
 
@@ -96,6 +100,14 @@ Your PR also gets an informational `Code Erosion` report (SlopCodeBench verbosit
 - Unit tests go in `src/__tests__/`. Mirror the source file name (`init.ts` → `init.test.ts`).
 - Mock external I/O (git, fetch, child_process) at the module boundary.
 - Avoid relying on real network access unless guarded by an env variable (like `TEAMAI_TEST_TOKEN`).
+
+Iterate on the affected E2E files; run the full suite when changing the E2E runner, shared fixtures, or test isolation:
+
+```bash
+npm run test:e2e -- <test-file> [-t "<test-name>"]   # add --maxWorkers=2 on constrained machines
+```
+
+Workers share the prepared `dist/` and OpenCode binary: never rebuild or reinstall them inside a test. Cases needing remote credentials skip without them ([CI E2E setup](../docs/dev/ci-e2e-setup.md)). PRs changing runtime behavior (not docs- or tests-only) include one real-CLI verification, such as a focused E2E run, with its command and result.
 
 ## Bug Reports & Feature Requests
 

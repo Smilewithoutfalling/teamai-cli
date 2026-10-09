@@ -47,6 +47,12 @@ This is the #1 onboarding issue. In order:
    local setup.
    In project scope, `teamai hooks remove` preserves other projects' gated team
    hooks in HOME, while removing the shared built-in hooks.
+   If `source remove-http` reports incomplete hook removal, the HTTP source is
+   disabled and the failed hooks stay on record. Fix the settings file it names,
+   then repeat `source remove-http` to finish removing them.
+   If removal cannot acquire the HTTP source lock, it leaves the source intact.
+   Wait for sync or plugin reconciliation to finish, check directory permissions,
+   then retry removal.
    If you initialized project scope but expected machine-wide resources, re-run
    with `--scope user`.
 5. **Tool has no hook surface** (e.g. Gemini CLI, JoyCode): there is no auto-sync;
@@ -227,7 +233,10 @@ unique full-definition match. Legacy records recover only a unique event, matche
 and command match; `timeout` and `additionalContextLimit` were not recorded.
 Pre-#370 project Codex ownership is imported from the main checkout's
 `.teamai/managed-hooks.json` before reconciliation or direct removal.
-Unrecorded or ambiguous legacy team-hook copies are preserved. Project hook paths follow `toolPaths`;
+An unrecorded entry equal to teamai's entry for exactly one team hook (current or
+any earlier team-repo revision) is adopted, so a lost manifest adds no second copy.
+Other unrecorded copies are preserved; pull and doctor name the ambiguous ones.
+Project hook paths follow `toolPaths`;
 Claude uses `settings.local.json` beside its configured settings file. A custom
 Codex path that Codex does not load is reported as `not loaded` by doctor.
 

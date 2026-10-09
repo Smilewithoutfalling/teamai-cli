@@ -52,9 +52,8 @@ jobs:
           name: coverage
           path: coverage/
 
-  build:
-    name: Build
-    needs: lint-and-test
+  prepare-build:
+    name: Prepare build
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -85,9 +84,19 @@ jobs:
           name: dist
           path: dist/
 
+  # Keep the existing Build check gated on the unit matrix while E2E can
+  # consume the prepared artifact as soon as it is available.
+  build:
+    name: Build
+    needs: [lint-and-test, prepare-build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Confirm build and unit matrix passed
+        run: echo "Build and unit test matrix passed."
+
   fork-e2e:
     name: E2E (fork-safe, no credentials)
-    needs: build
+    needs: prepare-build
     if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
     runs-on: ubuntu-latest
     permissions:
@@ -111,19 +120,16 @@ jobs:
           name: dist
           path: dist
 
-      - name: Configure git identity (CI commits)
-        run: |
-          git config --global user.email "ci@teamai.test"
-          git config --global user.name "TeamAI CI"
-
       # Fork code is untrusted. Never expose repository secrets to this job.
       # Remote-provider cases skip themselves when credentials are absent.
+      # The e2e setup file (src/__tests__/helpers/isolate-e2e-env.ts) gives each
+      # test file a sandbox HOME with its own git identity.
       - name: Run E2E (no remote credentials)
-        run: npm run test:e2e
+        run: npx vitest run --config vitest.e2e.config.ts
 
   e2e:
     name: E2E (GitHub provider, full surface)
-    needs: build
+    needs: prepare-build
     if: ${{ vars.TEAMAI_TEST_REPO_URL != '' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
     # E2E shares one fixture repo. Serialize across all branches/PRs so
@@ -156,40 +162,8 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Configure git identity (CI commits)
-        run: |
-          git config --global user.email "ci@teamai.test"
-          git config --global user.name "TeamAI CI"
-
-      - name: Prepare teamai config (user scope)
-        run: |
-          set -e
-          mkdir -p "$HOME/.teamai"
-          REPO_LOCAL="$HOME/.teamai/team-repo"
-          case "$TEAMAI_TEST_REPO_URL" in
-            http://*|https://*) CLONE_URL="$TEAMAI_TEST_REPO_URL" ;;
-            *) CLONE_URL="https://github.com/${TEAMAI_TEST_REPO_URL}.git" ;;
-          esac
-          AUTH_URL="${CLONE_URL/https:\/\//https:\/\/x-access-token:${TEAMAI_TEST_TOKEN}@}"
-          git clone "$AUTH_URL" "$REPO_LOCAL"
-          cat > "$HOME/.teamai/config.yaml" <<EOF
-          repo:
-            localPath: "$REPO_LOCAL"
-            remote: "$TEAMAI_TEST_REPO_URL"
-          username: ci
-          updatePolicy: auto
-          EOF
-
+      # Each test file runs in a sandbox HOME with its own git identity
+      # (src/__tests__/helpers/isolate-e2e-env.ts); the remote cases clone the
+      # fixture repo into it themselves (prepareRemoteTeamHome in e2e.test.ts).
       - name: Run E2E (full surface)
         run: npx vitest run --config vitest.e2e.config.ts --reporter=verbose
-
-      - name: Cleanup fixture repo state on failure
-        if: failure()
-        run: |
-          # Leave the fixture branch clean for the next CI run.
-          REPO_LOCAL="$HOME/.teamai/team-repo"
-          if [ -d "$REPO_LOCAL/.git" ]; then
-            cd "$REPO_LOCAL"
-            git reset --hard HEAD || true
-            git clean -fdx || true
-          fi

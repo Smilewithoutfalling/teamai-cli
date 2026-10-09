@@ -433,7 +433,7 @@ describe('OpenCode V2 built-in plugin', () => {
     expect(host.dispatches[4].payload).toMatchObject({ tool_response: 'denied', tool_status: 'failure' });
     expect(host.dispatches[5].payload).toMatchObject({ tool_name: 'task', session_link: { child: 'ses_child', parent: 'ses_v2' } });
     await host.cleanup?.();
-    expect(host.disposed.sort()).toEqual(['session.prompt', 'tool.execute.after']);
+    expect(host.disposed.sort()).toEqual(['session.compaction', 'session.context', 'session.prompt', 'tool.execute.after']);
   });
 });
 
@@ -458,6 +458,8 @@ describe('enterprise dual-host dispatch', () => {
         if (event.startsWith('session.')) await host.emit(event, { sessionID: 'ses_v2' });
         else if (event === 'chat.message') await host.callbacks['session.prompt']({ sessionID: 'ses_v2', prompt: { text: 'hello' } });
         else await host.callbacks['tool.execute.after']({ tool: 'shell', status: 'completed', input: {}, result: {} });
+        // Only teamai's own plugin adds the team context; one per agent hook would repeat it.
+        expect(host.callbacks['session.context']).toBeUndefined();
         await host.cleanup?.();
       }
       expect(spawn).toHaveBeenCalledExactlyOnceWith('sh', ['-c', 'echo enterprise'], expect.objectContaining({ cwd: '/work/proj', stdio: 'ignore' }));

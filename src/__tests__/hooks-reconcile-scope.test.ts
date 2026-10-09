@@ -1,7 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import path from 'node:path';
 import os from 'node:os';
-import { spawnSync } from 'node:child_process';
 import fse from 'fs-extra';
 
 vi.mock('../utils/git.js', async (importOriginal) => ({
@@ -15,6 +14,9 @@ vi.mock('../utils/logger.js', () => ({
 }));
 
 import { resolveAnchors, listWorktrees } from '../utils/git.js';
+import { resetBundledRuntimeCache } from '../bundled-runtime.js';
+import { findOnPath } from '../utils/lookpath.js';
+import { spawn } from 'node:child_process';
 import { CLAUDE_HOOK_OTHER_HOST_SKIP, reconcileTeamHooksForConfig } from '../hooks.js';
 import * as gitHook from '../git-hook.js';
 import type { LocalConfig, TeamaiConfig } from '../types.js';
@@ -635,6 +637,61 @@ describe('reconcileTeamHooksForConfig — team hooks in the main checkout', () =
     }
   });
 
+  it('shares one copy of the main hooks between two worktree installs when the main checkout has none', async () => {
+    await writeYaml(STOP_LINT);
+    const { main, worktree } = await mainWithWorktree();
+    const second = `${worktree}-2`;
+    await fse.ensureDir(second);
+    vi.mocked(listWorktrees).mockResolvedValue([main, worktree, second]);
+    const stops = async () => [
+      (await fse.readJson(path.join(main, '.claude', 'settings.local.json'))).hooks.Stop.length,
+      (await fse.readJson(path.join(main, '.codex', 'hooks.json'))).hooks.Stop.length,
+    ];
+    // Detection attaches each worktree's own data home.
+    const at = (root: string): LocalConfig => ({ ...localConfig(), projectRoot: root, dataHome: path.join(root, '.teamai') });
+    try {
+      for (const root of [worktree, second]) await fse.outputFile(path.join(root, '.teamai', 'config.yaml'), '');
+      await reconcileTeamHooksForConfig(teamConfig, at(worktree));
+      await reconcileTeamHooksForConfig(teamConfig, at(second));
+      expect(await stops()).toEqual([1, 1]);
+
+      await reconcileTeamHooksForConfig(teamConfig, at(worktree), { removeAll: true });
+      expect(await stops()).toEqual([1, 1]);
+      // Second worktree removal clears hooks without needing .teamai removed
+      await reconcileTeamHooksForConfig(teamConfig, at(second), { removeAll: true });
+      expect(await stops()).toEqual([0, 0]);
+    } finally {
+      await fse.remove(worktree);
+      await fse.remove(second);
+    }
+  });
+
+  it('keeps shared main hooks when main checkout removes while a linked worktree remains installed', async () => {
+    await writeYaml(STOP_LINT);
+    const { main, worktree } = await mainWithWorktree();
+    const stops = async () => [
+      (await fse.readJson(path.join(main, '.claude', '.settings.local.json').replace('.settings.local.json', 'settings.local.json'))).hooks.Stop.length,
+      (await fse.readJson(path.join(main, '.codex', 'hooks.json'))).hooks.Stop.length,
+    ];
+    const at = (root: string): LocalConfig => ({ ...localConfig(), projectRoot: root, dataHome: path.join(root, '.teamai') });
+    try {
+      for (const root of [main, worktree]) await fse.outputFile(path.join(root, '.teamai', 'config.yaml'), 'scope: project');
+      await reconcileTeamHooksForConfig(teamConfig, at(main));
+      await reconcileTeamHooksForConfig(teamConfig, at(worktree));
+      expect(await stops()).toEqual([1, 1]);
+
+      // Removing from main checkout keeps hooks for the worktree
+      await reconcileTeamHooksForConfig(teamConfig, at(main), { removeAll: true });
+      expect(await stops()).toEqual([1, 1]);
+
+      // Removing from worktree clears them once no checkouts remain
+      await reconcileTeamHooksForConfig(teamConfig, at(worktree), { removeAll: true });
+      expect(await stops()).toEqual([0, 0]);
+    } finally {
+      await fse.remove(worktree);
+    }
+  });
+
   it('removes the gated entries an older CLI left for this project, and keeps another project\'s', async () => {
     await writeYaml(STOP_LINT);
     const { main, worktree } = await mainWithWorktree();
@@ -679,7 +736,8 @@ describe('reconcileTeamHooksForConfig — team hooks in the main checkout', () =
     const legacyManifest = path.join(main, '.teamai', 'managed-hooks.json');
     const oldCommand = gated(main, 'npm run lint');
     const oldEntry = { hooks: [{ type: 'command', command: oldCommand, timeout: 30 }] };
-    const member = { hooks: [{ type: 'command', command: 'npm run lint' }] };
+    // Shares the team's command but is not its render: an exact render is teamai's (#993).
+    const member = { hooks: [{ type: 'command', command: 'npm run lint', timeout: 5 }] };
     const cursorRecords = [{ id: 'other', event: 'Stop', command: 'echo cursor' }];
     await fse.outputJson(file, { hooks: { Stop: [member, oldEntry], PreToolUse: [oldEntry] } });
     await fse.outputJson(legacyManifest, {
@@ -695,7 +753,7 @@ describe('reconcileTeamHooksForConfig — team hooks in the main checkout', () =
       ]);
       expect((await fse.readJson(file)).hooks.PreToolUse).toEqual([oldEntry]);
       expect(await fse.readJson(legacyManifest)).toEqual({ cursor: cursorRecords });
-      const ownership = await fse.readJson(path.join(root, '.teamai', 'managed-main-checkout-hooks.json'));
+      const ownership = await fse.readJson(path.join(main, '.teamai', 'managed-main-checkout-hooks.json'));
       expect((ownership.codex ?? []).map((record: { command: string }) => record.command))
         .toEqual(removeAll ? [] : ['npm run lint']);
       if (!removeAll) {
@@ -825,6 +883,50 @@ describe('reconcileTeamHooksForConfig — team hooks in the main checkout', () =
     expect((await codexProject()).hooks.Stop).toEqual([]);
     expect((await claudeLocal()).hooks.Stop).toEqual([]);
   });
+
+  it.each(['claude', 'codex'])('removeAll releases one duplicated %s main hook per ownership record', async (tool) => {
+    await writeYaml(STOP_LINT);
+    await reconcileTeamHooksForConfig(teamConfig, localConfig());
+    const file = path.join(project, tool === 'claude' ? '.claude/settings.local.json' : '.codex/hooks.json');
+    const json = await fse.readJson(file);
+    const [entry] = json.hooks.Stop;
+    json.hooks.Stop.push(entry);
+    await fse.writeJson(file, json);
+    expect((await mainManifest())[tool]).toHaveLength(1);
+
+    await reconcileTeamHooksForConfig(teamConfig, localConfig(), { removeAll: true });
+
+    expect((await fse.readJson(file)).hooks.Stop).toEqual([entry]);
+  });
+
+  it.each(['claude', 'codex'])('removeAll from main in v0.22 duplicated state releases main entry and preserves worktree entry for %s', async (tool) => {
+    const worktreeDir = await fse.mkdtemp(path.join(os.tmpdir(), 'wt-duplicated-'));
+    vi.mocked(listWorktrees).mockResolvedValue([project, worktreeDir]);
+
+    try {
+      await writeYaml(STOP_LINT);
+      await reconcileTeamHooksForConfig(teamConfig, localConfig());
+      const file = path.join(project, tool === 'claude' ? '.claude/settings.local.json' : '.codex/hooks.json');
+      const json = await fse.readJson(file);
+      const [entry] = json.hooks.Stop;
+      json.hooks.Stop.push(entry);
+      await fse.writeJson(file, json);
+
+      // Simulate worktree having its own manifest from older install
+      const wtManifestPath = path.join(worktreeDir, '.teamai', 'managed-main-checkout-hooks.json');
+      await fse.outputJson(wtManifestPath, {
+        [tool]: [{ id: 'lint', event: 'Stop', command: entry.hooks ? entry.hooks[0].command : entry.command }],
+      });
+      await fse.outputFile(path.join(worktreeDir, '.teamai', 'config.yaml'), 'scope: project');
+
+      await reconcileTeamHooksForConfig(teamConfig, localConfig(), { removeAll: true });
+
+      // One duplicated entry was released, one remains for the worktree
+      expect((await fse.readJson(file)).hooks.Stop).toEqual([entry]);
+    } finally {
+      await fse.remove(worktreeDir);
+    }
+  });
 });
 
 describe('reconcileTeamHooksForConfig — legacy projectRoot sweep', () => {
@@ -924,13 +1026,18 @@ describe('reconcileTeamHooksForConfig — legacy projectRoot sweep', () => {
   });
 });
 
-// ── Project gate rendering per host shell ────────────────────
+// ── Project gate: what it renders, and whether it actually fires ─
 //
-// A tool whose Windows hook runner is cmd.exe cannot execute a POSIX
-// `if [ "$PWD" ... ]` gate: cmd aborts on that syntax, so the whole team hook —
-// gate and payload alike — never runs. Pin the cmd rendering for those tools and
-// the POSIX rendering for everything else.
-describe('project gate rendering per host shell', () => {
+// Every hook runner is a POSIX shell — CodeBuddy's Git Bash, WorkBuddy's
+// bundled PortableGit, `bash -lc` for the rest — so the gate is always the
+// POSIX form. A cmd.exe gate would not run there at all: `findstr` errors out
+// and the `>nul` redirect leaves a file named `nul` in the project.
+//
+// On Windows that shell names its cwd `/c/proj`, never the `C:\proj` the root
+// resolves to, so the gate carries both spellings. The cases below check the
+// shape; the last one runs a rendered gate through a real shell, which is the
+// only way a gate that can never match is caught.
+describe('project gate — rendering and real-shell execution', () => {
   const codebuddyOnly = {
     toolPaths: { codebuddy: { settings: '.codebuddy/settings.json' } },
   } as unknown as TeamaiConfig;
@@ -942,6 +1049,34 @@ describe('project gate rendering per host shell', () => {
       .map((e: { hooks: Array<{ command: string }> }) => e.hooks[0].command);
   }
 
+  // findGitBashWindows() reads these off the real environment, so a Git
+  // installed on a non-standard drive (or found only via the HKLM registry key)
+  // would decide whether these cases run at all. Clear them and stage the one
+  // candidate under the mocked home instead, so the gate assertions below are
+  // the same on any developer box and on CI. WorkBuddy resolves its own MSYS
+  // sh under ~/.workbuddy, which needs no environment at all.
+  const winEnvKeys = ['ProgramFiles', 'ProgramFiles(x86)', 'LOCALAPPDATA'];
+  let savedEnv: Record<string, string | undefined>;
+
+  beforeEach(async () => {
+    savedEnv = {};
+    for (const key of winEnvKeys) {
+      savedEnv[key] = process.env[key];
+      delete process.env[key];
+    }
+    resetBundledRuntimeCache();
+    await fse.ensureFile(path.join(home, 'AppData', 'Local', 'Programs', 'Git', 'bin', 'bash.exe'));
+    await fse.ensureFile(path.join(home, '.workbuddy', 'binaries', 'PortableGit', 'versions', '9.9.9', 'bin', 'sh.exe'));
+  });
+
+  afterEach(async () => {
+    for (const key of winEnvKeys) {
+      if (savedEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = savedEnv[key];
+    }
+    resetBundledRuntimeCache();
+  });
+
   const telemetryYaml = (tool: string): string => `
 hooks:
   - id: telemetry
@@ -952,7 +1087,7 @@ hooks:
     tools: [${tool}]
 `;
 
-  it('renders a cmd.exe gate for a tool whose Windows hook runner is cmd.exe', async () => {
+  it('renders the POSIX gate for codebuddy, which runs hooks through Git Bash', async () => {
     const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
     try {
       await writeYaml(telemetryYaml('codebuddy'));
@@ -960,17 +1095,23 @@ hooks:
       await reconcileTeamHooksForConfig(codebuddyOnly, localConfig());
 
       const [command] = await teamStopCommands('.codebuddy/settings.json');
-      // `cd` prints the cwd into the pipe — never `%CD%` interpolated into a
-      // parsed command — and the root is caret-escaped inside `^"…^"` quotes.
-      expect(command.startsWith('cd| findstr /i /b /l /c:^"')).toBe(true);
-      expect(command).toContain(' >nul || cd| findstr /i /e /l /c:^"');
-      // Outside the project the gate must exit 0 (a non-zero status would make
-      // CodeBuddy treat UserPromptSubmit as allowed:false and block the prompt),
-      // while the payload's own status is passed through inside it.
-      expect(command.endsWith('^" >nul & if not errorlevel 1 (python3 .docs/script/inject-telemetry.py) else exit /b 0')).toBe(true);
-      expect(command).not.toContain('echo %CD%');
-      expect(command).not.toContain('&& (python3');
-      expect(command).not.toContain('$PWD');
+      expect(command.startsWith('if [ "$PWD" = ')).toBe(true);
+      expect(command.endsWith('); fi')).toBe(true);
+      // The runner names its cwd the MSYS way: on Windows that is `/c/...`,
+      // never the `C:\...` this root resolves to, so the gate must carry both
+      // spellings or it silently never fires. A root without a drive letter is
+      // already the shell's spelling and the gate carries a single test, which
+      // is what the suite's Linux and macOS jobs exercise.
+      if (/^[A-Za-z]:[\\/]/.test(project)) {
+        expect(command, 'a Windows root is tested in both spellings').toMatch(/\] \|\| \[ "\$PWD" = '\/[a-z]\//);
+      } else {
+        expect(command, 'a POSIX root needs one spelling').not.toContain(' || [ "$PWD" = ');
+      }
+      // 0.26.0 rendered a cmd.exe gate here. Git Bash cannot run it: `findstr`
+      // errors out, the gate never matches, and the `>nul` redirect leaves a
+      // file literally named `nul` in the project.
+      expect(command).not.toContain('findstr');
+      expect(command).not.toContain('exit /b 0');
     } finally {
       platformSpy.mockRestore();
     }
@@ -993,77 +1134,104 @@ hooks:
       platformSpy.mockRestore();
     }
   });
-});
 
-// ── The rendered cmd gate, executed by a real cmd.exe ────────
-//
-// The assertions above pin only the shape of the gate. These run it in real
-// directories whose names carry the characters cmd.exe re-parses — `&`, which
-// otherwise executes the rest of the directory name, plus `^`, `%` and a space
-// — because a gate that merely looks right can still run part of a path as a
-// command or silently stop matching. Windows-only: cmd.exe is the point.
-describe('project gate — real cmd.exe execution (win32)', () => {
-  const codebuddyOnly = {
-    toolPaths: { codebuddy: { settings: '.codebuddy/settings.json' } },
-  } as unknown as TeamaiConfig;
+  /**
+   * A real POSIX shell to run the gate with. Deliberately not the placeholder
+   * `bash.exe` staged above: that file only has to make
+   * `resolveCodebuddyShell()` report a shell and cannot execute anything. This
+   * is the MSYS bash the machine actually has on PATH, found through the real
+   * environment the staging did not touch.
+   */
+  const executor = process.platform === 'win32' ? findOnPath('bash') : '/bin/sh';
 
-  /** Render the gate for `root`, then run it from `cwd` through cmd.exe. */
-  async function renderGate(root: string, sandboxHome: string): Promise<string> {
+  /**
+   * Where these cases build their directories — deliberately outside
+   * `os.tmpdir()`. MSYS mounts the Windows temp directory at `/tmp`, so a root
+   * under it is reported as `/tmp/...` and no gate rendered from its native
+   * path can ever match it. `node_modules` sits on the workspace drive, which
+   * is what a real project looks like, and is never committed.
+   */
+  const execBase = path.join(process.cwd(), 'node_modules');
+
+  /** Render the gate for `root` and read it back off the tool's settings file. */
+  async function renderGate(root: string): Promise<string> {
+    // A fresh file per call: entries for another root are kept by design, and
+    // this reads back exactly the gate just rendered.
+    await fse.remove(path.join(home, '.codebuddy', 'settings.json'));
     await writeYaml(`
 hooks:
   - id: gate
     description: gate probe
     event: Stop
+    matcher: "*"
     command: echo TEAMAI_GATE_PAYLOAD
     tools: [codebuddy]
 `);
-    await fse.ensureDir(path.join(sandboxHome, '.codebuddy'));
+    await fse.ensureDir(path.join(home, '.codebuddy'));
     await reconcileTeamHooksForConfig(codebuddyOnly, { ...localConfig(), projectRoot: root } as LocalConfig);
-    const settings = await fse.readJson(path.join(sandboxHome, '.codebuddy', 'settings.json'));
-    const commands = (settings.hooks.Stop ?? [])
-      .filter((e: { description?: string }) => e.description?.startsWith('[teamai:hook:'))
-      .map((e: { hooks: Array<{ command: string }> }) => e.hooks[0].command);
-    expect(commands).toHaveLength(1);
-    return commands[0];
+    const [command] = await teamStopCommands('.codebuddy/settings.json');
+    expect(command).toBeDefined();
+    return command;
   }
 
-  /** Run a rendered hook command the way CodeBuddy's hook runner does. */
-  function runCommand(command: string, cwd: string): { status: number | null; stdout: string } {
-    const result = spawnSync(command, { cwd, shell: true, encoding: 'utf8' });
-    return { status: result.status, stdout: result.stdout ?? '' };
+  /**
+   * Run a rendered hook command the way the runner does: through its shell.
+   * Async rather than `spawnSync` because a sandbox can fail the synchronous
+   * spawn with EBUSY, which would show up here as an empty stdout — the exact
+   * signature of a gate that never matched.
+   */
+  function runCommand(command: string, cwd: string): Promise<{ status: number | null; stdout: string }> {
+    return new Promise((resolve) => {
+      const child = spawn(executor!, ['-c', command], { cwd });
+      let stdout = '';
+      child.stdout.on('data', (chunk: Buffer) => { stdout += chunk; });
+      child.on('close', (status) => resolve({ status, stdout }));
+      child.on('error', () => resolve({ status: null, stdout }));
+    });
   }
 
-  it.skipIf(process.platform !== 'win32')(
-    'fires only inside the project and never executes part of the path',
+  it.skipIf(!executor)(
+    'fires inside the project and stays an exit-0 no-op outside it, under a real shell',
     async () => {
-      for (const name of ['plain', 'sp&x', 'a^b', 'a%b', 'a%TEMP%b', 'sp ace', 'x&echo CANARY&y']) {
-        const root = path.join(project, name);
-        const sub = path.join(root, 'sub');
-        const sibling = path.join(project, `${name}-sibling`);
-        await fse.ensureDir(sub);
-        await fse.ensureDir(sibling);
-        // A fresh HOME per project keeps the shared settings file free of the
-        // previous iteration's project-scoped entries.
-        const sandboxHome = path.join(project, 'home', name);
-        vi.stubEnv('HOME', sandboxHome);
-        const command = await renderGate(root, sandboxHome);
+      const execRoot = await fse.mkdtemp(path.join(execBase, '.teamai-gate-'));
+      try {
+        // `sp&x` and `x&echo CANARY&y` carry the characters that would split the
+        // command if the gate did not quote the root; `sp ace` covers the space.
+        for (const name of ['plain', 'sp&x', 'sp ace', 'x&echo CANARY&y']) {
+          const root = path.join(execRoot, name);
+          const sub = path.join(root, 'sub');
+          const sibling = path.join(execRoot, `${name}-sibling`);
+          await fse.ensureDir(sub);
+          await fse.ensureDir(sibling);
+          const command = await renderGate(root);
 
-        for (const cwd of [root, sub]) {
-          const { status, stdout } = runCommand(command, cwd);
-          expect(stdout, `${name} inside ${cwd}`).toContain('TEAMAI_GATE_PAYLOAD');
-          expect(status, `${name} inside ${cwd}`).toBe(0);
+          // Inside: the gate matches and the payload runs. A gate rendered in
+          // the native spelling only would silently never do this.
+          for (const cwd of [root, sub]) {
+            const { status, stdout } = await runCommand(command, cwd);
+            expect(stdout, `${name} inside ${cwd}`).toContain('TEAMAI_GATE_PAYLOAD');
+            expect(status, `${name} inside ${cwd}`).toBe(0);
+            // A `&` in the directory name must never split the gate into
+            // commands — the payload's own output is the canary for that.
+            expect(stdout, `${name} injection canary`).not.toMatch(/^\s*CANARY\s*$/m);
+          }
+          // Outside: nothing runs, and the gate still exits 0 — CodeBuddy reads
+          // a non-zero hook status as `allowed:false` and would block every
+          // prompt typed outside the project.
+          for (const cwd of [execRoot, sibling]) {
+            const { status, stdout } = await runCommand(command, cwd);
+            expect(stdout, `${name} outside ${cwd}`).not.toContain('TEAMAI_GATE_PAYLOAD');
+            expect(status, `${name} outside ${cwd}`).toBe(0);
+          }
         }
-        for (const cwd of [project, sibling]) {
-          const { status, stdout } = runCommand(command, cwd);
-          expect(stdout, `${name} outside ${cwd}`).not.toContain('TEAMAI_GATE_PAYLOAD');
-          // A mismatch must stay an exit-0 no-op: CodeBuddy reads a non-zero
-          // hook status as allowed:false and would block every prompt typed
-          // outside the project.
-          expect(status, `${name} outside ${cwd}`).toBe(0);
-        }
-        // `&` in the directory name must never split the gate into commands.
-        expect(runCommand(command, root).stdout, `${name} injection canary`).not.toMatch(/^\s*CANARY\s*$/m);
+      } finally {
+        // Some sandboxes refuse the bulk delete; a leftover empty directory
+        // under node_modules is harmless.
+        await fse.remove(execRoot).catch(() => {});
       }
     },
+    // A Windows runner starts a fresh MSYS bash per call, which is far slower
+    // than the cmd.exe the gate used to be tested with.
+    60_000,
   );
 });

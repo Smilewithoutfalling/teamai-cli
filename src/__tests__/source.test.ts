@@ -998,7 +998,7 @@ describe('source', () => {
       expect(deployed).toBe(false);
     });
 
-    it('removes a source skill from its recorded path when a shared Codex skill appears later', async () => {
+    it('keeps the member\'s shared Codex skill that appears later, delivering to the recorded path (#993)', async () => {
       teamConfig.sources = [{ name: 'platform', repo: 'git@git.woa.com:platform/repo.git' }];
       teamConfig.toolPaths = { codex: { skills: '.codex/skills' } };
       const YAML = (await import('yaml')).default;
@@ -1024,12 +1024,13 @@ describe('source', () => {
 
       await pullSources(localConfig, { force: true });
 
+      // The shared copy is no version of the source skill: the member's.
       const updatedManifest = await fse.readJson(getSourceManifestPath('platform', localConfig)) as SourceInstallManifest;
       expect(updatedManifest.installedPaths?.['old-skill']).toEqual([
-        '.agents/skills/old-skill',
+        '.codex/skills/old-skill',
       ]);
-
-      expect(await fse.pathExists(path.join(homeDir, '.codex/skills/old-skill'))).toBe(false);
+      expect(await fse.readFile(path.join(homeDir, '.codex/skills/old-skill/SKILL.md'), 'utf8')).toBe('# Updated source');
+      expect(await fse.readFile(path.join(homeDir, '.agents/skills/old-skill/SKILL.md'), 'utf8')).toBe('# User copy');
       await fse.ensureDir(path.join(fixtureSourceRepoDir(), 'skills', 'new-skill'));
       await fse.writeFile(path.join(fixtureSourceRepoDir(), 'skills', 'new-skill', 'SKILL.md'), '# New');
       await fse.writeFile(path.join(fixtureSourceRepoDir(), 'teamai.yaml'), YAML.stringify({
@@ -1039,7 +1040,7 @@ describe('source', () => {
       await pullSources(localConfig, { force: true });
 
       expect(await fse.pathExists(path.join(homeDir, '.codex', 'skills', 'old-skill'))).toBe(false);
-      expect(await fse.pathExists(path.join(homeDir, '.agents', 'skills', 'old-skill'))).toBe(false);
+      expect(await fse.readFile(path.join(homeDir, '.agents/skills/old-skill/SKILL.md'), 'utf8')).toBe('# User copy');
     });
   });
 });

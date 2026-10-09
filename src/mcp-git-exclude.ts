@@ -5,7 +5,7 @@ import type { McpServerDef } from './types.js';
 import type { McpTarget } from './mcp-reconcile.js';
 import { referencedVars, supportsEnvExpansion } from './resources/mcp-format.js';
 import { execCommand } from './utils/exec.js';
-import { pathExists, readFileSafe, writeFileAtomic } from './utils/fs.js';
+import { pathExists, readFileSafe, symlinkTarget, writeFileAtomic } from './utils/fs.js';
 import { listWorktrees } from './utils/git.js';
 import { log } from './utils/logger.js';
 
@@ -105,15 +105,18 @@ export async function existingAncestor(file: string): Promise<string> {
 }
 
 /**
- * Where a write to `file` lands: the real path of its closest existing
- * directory, the rest appended. The appliers replace the file itself (tmp +
- * rename) but follow its directories, so every check of whether git would
- * commit the file judges this path (#886), and reads keep `file`.
+ * Where a write to `file` lands: the file a symlink at `file` points to (a
+ * member's dotfiles link stays, and the write goes to its target), then the
+ * real path of its closest existing directory, the rest appended. Every check
+ * of whether git would commit the file judges this path, in the repository
+ * holding it (#886), and reads keep `file`.
  */
 export async function realFilePath(file: string): Promise<string> {
-  const dir = await existingAncestor(file);
+  // A link loop or an unreadable path: judged as the file itself, as the write would fail.
+  const target = await symlinkTarget(file).catch(() => file);
+  const dir = await existingAncestor(target);
   const real = await fs.promises.realpath(dir).catch(() => dir);
-  return path.join(real, path.relative(dir, file));
+  return path.join(real, path.relative(dir, target));
 }
 
 /**
@@ -129,14 +132,15 @@ export type GitTracking =
 
 /**
  * `file` as a message names it, and the path to give git for it: the one a
- * write lands in, named with `file`, when a directory inside its checkout is a
- * symlink (#886), where git refuses `file` ("beyond a symbolic link"). A
- * symlink above the checkout (macOS /var) changes no path git uses.
+ * write lands in, named with `file`, when `file` is a symlink or a directory
+ * inside its checkout is one (#886), where git refuses `file` ("beyond a
+ * symbolic link"). A symlink above the checkout (macOS /var) changes no path git uses.
  */
 export async function gitPathOf(file: string): Promise<{ label: string; path: string }> {
   const landed = await realFilePath(file);
   if (landed === file) return { label: file, path: file };
-  const location = await gitExcludeFile(await existingAncestor(landed));
+  const linked = await symlinkTarget(file).catch(() => file) !== file;
+  const location = linked ? null : await gitExcludeFile(await existingAncestor(landed));
   const inCheckout = location ? path.relative(location.root, landed) : '';
   if (inCheckout && !inCheckout.startsWith('..') && file.endsWith(`${path.sep}${inCheckout}`)) return { label: file, path: file };
   return { label: `${landed} (where ${file} is written)`, path: landed };
@@ -248,10 +252,26 @@ export async function ensureExcludedFromGit(
   const rel = path.relative(dir, landed).split(path.sep).join('/');
   const pattern = `/${location.prefix}${rel}`.replace(/[\\*?[\]!#]/g, '\\$&');
   const retry = `Make it writable, or add \`${pattern}\` to it yourself, then ${rerun}.`;
+  const notWritable = ({ message, blocker, notDirectory }: NotWritableError): GitExclusion => ({
+    kind: 'failed',
+    reason: message,
+    fix: notDirectory
+      ? `Move ${blocker} aside, then ${rerun}.`
+      : `Make ${blocker} writable, or add \`${pattern}\` to ${excludeFile} yourself, then ${rerun}.`,
+  });
   // A read-only exclude file is the member's choice; the atomic write would replace it all the same.
-  for (const writable of [path.dirname(excludeFile), ...(await pathExists(excludeFile) ? [excludeFile] : [])]) {
-    const denied = await fse.access(writable, fse.constants.W_OK).then(() => false, () => true);
-    if (denied) return { kind: 'failed', reason: `${writable} is not writable`, fix: retry };
+  // A missing `info/` (`git init --template=`) is created by the write, so its closest existing directory is checked (#993).
+  const ancestor = await existingAncestor(excludeFile);
+  // A file where a directory belongs (`.git/info` a regular file): no write can create it, a dry run included.
+  if (await fse.stat(ancestor).then((s) => !s.isDirectory(), () => false)) return notWritable(new NotWritableError(excludeFile, ancestor, true));
+  for (const writable of [ancestor, ...(await pathExists(excludeFile) ? [excludeFile] : [])]) {
+    const denied = await fse.access(writable, fse.constants.W_OK).then(
+      () => false,
+      (e: NodeJS.ErrnoException) => ['EACCES', 'EPERM', 'EROFS'].includes(e.code ?? ''),
+    );
+    if (!denied) continue;
+    if (writable === excludeFile) return { kind: 'failed', reason: `${excludeFile} is not writable`, fix: retry };
+    return notWritable(new NotWritableError(excludeFile, writable, false));
   }
   const add = (content: string): string | null => {
     const block = splitBlock(content);
@@ -275,6 +295,7 @@ export async function ensureExcludedFromGit(
       result = await updateFileLocked(excludeFile, add);
     }
   } catch (e) {
+    if (e instanceof NotWritableError) return notWritable(e);
     return { kind: 'failed', reason: `adding it to ${excludeFile} failed: ${e instanceof Error ? e.message : String(e)}`, fix: retry };
   }
   if (result === 'locked') {
@@ -334,12 +355,25 @@ export async function excludeFromGit(file: string, options: { rerun?: string; ho
 export type ExcludeUpdate = 'written' | 'unchanged' | 'locked';
 
 /**
+ * `updateFileLocked` could not create `file`'s directory, which also holds its
+ * lock: `blocker`, the closest existing path above `file`, is not a directory
+ * (`notDirectory`), or denies the write.
+ */
+export class NotWritableError extends Error {
+  constructor(readonly file: string, readonly blocker: string, readonly notDirectory: boolean) {
+    super(`${file} is not writable, as ${blocker} is not${notDirectory ? ' a directory' : ''}`);
+    this.name = 'NotWritableError';
+  }
+}
+
+/**
  * Rewrite `file` with `edit` (null: leave it as it is), holding a lock
  * across the read and an atomic write: the worktrees of a repository share
  * `.git/info/exclude`, so two commands adding different paths must not drop each other's.
  * A lock still held after the wait writes nothing: an unlocked write could drop
  * the holder's pattern, leaving that path unprotected. `mode` forces the file's
- * mode; without it the file keeps its own.
+ * mode; without it the file keeps its own. Throws `NotWritableError`, without
+ * waiting, when the file's directory cannot be created.
  */
 export async function updateFileLocked(
   file: string,
@@ -348,6 +382,11 @@ export async function updateFileLocked(
 ): Promise<ExcludeUpdate> {
   const { acquireLock, releaseLock } = await import('./update.js');
   const lockPath = `${file}.teamai-lock`;
+  // acquireLock reads a lock directory it cannot create as a held lock; no wait would change that (#993).
+  await fse.ensureDir(path.dirname(file)).catch(async (e: NodeJS.ErrnoException) => {
+    if (!['EEXIST', 'ENOTDIR', 'EACCES', 'EPERM', 'EROFS'].includes(e.code ?? '')) throw e;
+    throw new NotWritableError(file, await existingAncestor(file), e.code === 'EEXIST' || e.code === 'ENOTDIR');
+  });
   let held = false;
   for (let attempt = 0; attempt < 25 && !held; attempt++) {
     held = await acquireLock(lockPath);

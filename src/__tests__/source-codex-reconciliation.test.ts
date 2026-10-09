@@ -112,12 +112,11 @@ describe('source Codex duplicate reconciliation', () => {
     expect(await candidates()).toEqual([]);
   });
 
-  it.each(['configured-differs', 'incoming-differs', 'shared-differs'])('preserves unverified local copies as push candidates: %s', async (difference) => {
+  it.each(['configured-differs', 'incoming-differs'])('preserves unverified local copies as push candidates: %s', async (difference) => {
     await publish();
     await duplicate();
     if (difference === 'configured-differs') await skill('.codex/skills/foo', '# Independent local draft\n');
     if (difference === 'incoming-differs') await publish(['foo'], '# Incoming revision\n');
-    if (difference === 'shared-differs') await skill('.agents/skills/foo', '# Older shared copy\n');
     const configured = path.join(home, '.codex/skills/foo');
     const before = await fse.readFile(path.join(configured, 'SKILL.md'), 'utf8');
 
@@ -125,6 +124,18 @@ describe('source Codex duplicate reconciliation', () => {
 
     expect(await fse.readFile(path.join(configured, 'SKILL.md'), 'utf8')).toBe(before);
     expect(await candidates()).toEqual([expect.objectContaining({ name: 'foo', sourcePath: configured })]);
+  });
+
+  it('leaves a shared copy that is no version of the source skill, delivering to the configured directory (#993)', async () => {
+    await publish();
+    await duplicate();
+    await skill('.agents/skills/foo', '# Not a source version\n');
+
+    await pullSources(config, { force: true });
+
+    expect(await fse.readFile(path.join(home, '.agents/skills/foo/SKILL.md'), 'utf8')).toBe('# Not a source version\n');
+    expect(await fse.readFile(path.join(home, '.codex/skills/foo/SKILL.md'), 'utf8')).toBe('# Source skill\n');
+    expect((await fse.readJson(getSourceManifestPath('shared', config))).installedPaths).toEqual({ foo: ['.codex/skills/foo'] });
   });
 
   it.each(['same-repository', 'different-repository', 'nested-owner'])('preserves duplicates covered by any foreign owner: %s', async (ownership) => {
@@ -190,7 +201,8 @@ describe('source Codex duplicate reconciliation', () => {
     expect(await candidates()).toEqual([]);
   });
 
-  it('reconciles the former referent when copying will replace a shared leaf link', async () => {
+  // A member's link is never replaced or deleted (#993): this changed from replacing a shared leaf link with a copy.
+  it('keeps a member\'s shared leaf link and delivers to the configured directory instead', async () => {
     await publish();
     const configured = await skill('.codex/skills/foo');
     const shared = path.join(home, '.agents/skills/foo');
@@ -199,24 +211,24 @@ describe('source Codex duplicate reconciliation', () => {
 
     await pullSources(config, { force: true });
 
-    expect(await fse.pathExists(configured)).toBe(false);
-    expect((await fse.lstat(shared)).isSymbolicLink()).toBe(false);
-    expect(await fse.readFile(path.join(shared, 'SKILL.md'), 'utf8')).toBe('# Source skill\n');
-    expect(await candidates()).toEqual([]);
+    expect((await fse.lstat(shared)).isSymbolicLink()).toBe(true);
+    expect(await fse.readlink(shared)).toBe(configured);
+    expect(await fse.readFile(path.join(configured, 'SKILL.md'), 'utf8')).toBe('# Source skill\n');
   });
 
-  it('preserves a configured leaf link referent when the link itself is a verified duplicate', async () => {
+  // Changed in #993 from deleting a configured leaf link that duplicated the shared copy.
+  it('keeps a member\'s configured leaf link even when it is a verified duplicate', async () => {
     await publish();
     await skill('.agents/skills/foo');
     const original = path.join(root, 'independent-copy');
     await fse.outputFile(path.join(original, 'SKILL.md'), '# Source skill\n');
-    await fse.symlink(original, path.join(home, '.codex/skills/foo'), 'dir');
+    const link = path.join(home, '.codex/skills/foo');
+    await fse.symlink(original, link, 'dir');
 
     await pullSources(config, { force: true });
 
-    expect(await fse.pathExists(path.join(home, '.codex/skills/foo'))).toBe(false);
+    expect((await fse.lstat(link)).isSymbolicLink()).toBe(true);
     expect(await fse.readFile(path.join(original, 'SKILL.md'), 'utf8')).toBe('# Source skill\n');
-    expect(await candidates()).toEqual([]);
   });
 
   it('does not remove a duplicate which is also another planned destination', async () => {

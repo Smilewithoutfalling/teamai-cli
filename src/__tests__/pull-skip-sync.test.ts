@@ -1268,3 +1268,37 @@ describe('enabledAgents whitelist on pull inject, skip-sync, and cleanup (#510)'
     expect(await fse.pathExists(workbuddyCopy)).toBe(false);
   });
 });
+
+describe('the inactive-namespace skill sweep (#993)', () => {
+  let tmpDir: string;
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await fse.remove(tmpDir);
+  });
+
+  it('keeps a copy that holds a link of the member\'s, even when every file matches the team skill', async () => {
+    tmpDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-inactive-link-'));
+    const homeDir = path.join(tmpDir, 'home');
+    const repoPath = path.join(tmpDir, 'team-repo');
+    const source = path.join(repoPath, 'skills', 'common', 'stale-skill');
+    await fse.outputFile(path.join(source, 'SKILL.md'), '---\nname: stale-skill\ndescription: stale\n---\n# Stale\n');
+    const copy = path.join(homeDir, '.workbuddy', 'skills', 'stale-skill');
+    await fse.copy(source, copy);
+    const notes = path.join(tmpDir, 'my-notes.md');
+    await fse.writeFile(notes, 'mine');
+    await fse.symlink(notes, path.join(copy, 'notes.md'));
+    vi.stubEnv('HOME', homeDir);
+    const teamConfig = TeamaiConfigSchema.parse({
+      team: 'test', repo: 'https://example.invalid/x/team.git', toolPaths: { workbuddy: { skills: '.workbuddy/skills' } },
+    });
+    const localConfig = {
+      repo: { localPath: repoPath, remote: 'https://example.invalid/x/team.git' },
+      username: 'u', updatePolicy: 'auto', additionalRoles: [], scope: 'user', enabledAgents: ['workbuddy'],
+    } as unknown as LocalConfig;
+
+    await cleanupInactiveNamespaceSkills(teamConfig, localConfig, new Set(), new Set(['stale-skill']), new Map([['stale-skill', source]]));
+
+    expect((await fse.lstat(path.join(copy, 'notes.md'))).isSymbolicLink()).toBe(true);
+  });
+});

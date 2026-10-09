@@ -198,7 +198,7 @@ describe('source physical destination ownership', () => {
     expect(await fse.pathExists(config.projectRoot!)).toBe(true);
   });
 
-  it('records the post-copy destination when copyDir replaces a leaf symlink', async () => {
+  it('leaves an unrecorded leaf symlink to a directory that is no copy of the source skill (#993)', async () => {
     const external = path.join(root, 'unrelated-leaf');
     await fse.outputFile(path.join(external, 'SKILL.md'), '# Unrelated leaf target\n');
     const target = path.join(config.projectRoot!, relativePath);
@@ -206,15 +206,77 @@ describe('source physical destination ownership', () => {
     await publish();
     await pullSources(config, { force: true });
 
-    expect((await fse.lstat(target)).isSymbolicLink()).toBe(false);
-    expect((await pinManifest()).installedPhysicalPaths?.[relativePath]).toBe(target);
+    expect((await fse.lstat(target)).isSymbolicLink()).toBe(true);
     expect(await fse.readFile(path.join(external, 'SKILL.md'), 'utf8')).toBe('# Unrelated leaf target\n');
+  });
+
+  // Changed in #993 from replacing the leaf link with a copy: a member's link is never replaced or deleted.
+  it('keeps a member\'s leaf link at the destination, records nothing for it, and never writes through it', async () => {
+    const external = path.join(root, 'copied-leaf');
+    await fse.outputFile(path.join(external, 'SKILL.md'), '# Original source: foo\n');
+    const target = path.join(config.projectRoot!, relativePath);
+    await fse.symlink(external, target, 'dir');
+    await publish();
+    await pullSources(config, { force: true });
+
+    expect((await fse.lstat(target)).isSymbolicLink()).toBe(true);
+    expect((await pinManifest()).installedPhysicalPaths?.[relativePath]).toBeUndefined();
     await publish(producer, ['foo'], 'Updated source');
     await pullSources(config, { force: true });
-    expect(await fse.readFile(path.join(target, 'SKILL.md'), 'utf8')).toBe('# Updated source: foo\n');
+    expect((await fse.lstat(target)).isSymbolicLink()).toBe(true);
+    expect(await fse.readFile(path.join(external, 'SKILL.md'), 'utf8')).toBe('# Original source: foo\n');
+  });
+
+  it('delivers a source skill without the links in it, and names each one once (#993)', async () => {
+    await publish();
+    const id = createHash('sha256').update(producer).digest('hex');
+    const outside = path.join(root, 'outside.md');
+    await fse.writeFile(outside, 'outside');
+    await fse.symlink(outside, path.join(home, '.teamai/source-repos', id, 'repo', 'skills', 'foo', 'linked.md'));
+    const { log } = await import('../utils/logger.js');
+    vi.mocked(log.warn).mockClear();
+
+    await pullSources(config, { force: true });
+
+    const dest = path.join(config.projectRoot!, relativePath);
+    expect(await fse.readFile(path.join(dest, 'SKILL.md'), 'utf8')).toBe('# Original source: foo\n');
+    expect(await fse.lstat(path.join(dest, 'linked.md')).catch(() => null)).toBeNull();
+    expect(vi.mocked(log.warn).mock.calls.map(([message]) => String(message))).toContain(
+      '[source:current] Skipped linked.md in current/foo: teamai does not deliver links.',
+    );
+  });
+
+  it('keeps a member\'s dangling link at the destination (#993)', async () => {
+    const target = path.join(config.projectRoot!, relativePath);
+    await fse.symlink(path.join(root, 'nowhere'), target, 'dir');
+    await publish();
+    await pullSources(config, { force: true });
+
+    expect((await fse.lstat(target)).isSymbolicLink()).toBe(true);
+    expect(await fse.pathExists(path.join(root, 'nowhere'))).toBe(false);
+  });
+
+  it('keeps a recorded copy that holds a member\'s link through pull and source remove, and names the link (#993)', async () => {
+    await publish();
+    await pullSources(config, { force: true });
+    const skillFile = path.join(config.projectRoot!, relativePath, 'SKILL.md');
+    const mine = path.join(root, 'my-skill.md');
+    await fse.writeFile(mine, '# Original source: foo\n');
+    await fse.remove(skillFile);
+    await fse.symlink(mine, skillFile);
+    const { log } = await import('../utils/logger.js');
+
+    await publish(producer, ['foo'], 'Updated source');
+    await pullSources(config, { force: true });
+
+    expect((await fse.lstat(skillFile)).isSymbolicLink()).toBe(true);
+    expect(await fse.readFile(mine, 'utf8')).toBe('# Original source: foo\n');
+    expect(vi.mocked(log.warn).mock.calls.map(([message]) => String(message))).toContain(
+      `[source:current] Kept ${skillFile}: it is a link of yours, so teamai does not replace it. Remove the link to receive current/foo from its source.`,
+    );
+
     await removeSource();
-    expect(await fse.pathExists(target)).toBe(false);
-    expect(await fse.readFile(path.join(external, 'SKILL.md'), 'utf8')).toBe('# Unrelated leaf target\n');
+    expect((await fse.lstat(skillFile)).isSymbolicLink()).toBe(true);
   });
 
   it('does not abandon an existing pin when an ancestor link becomes a leaf link', async () => {

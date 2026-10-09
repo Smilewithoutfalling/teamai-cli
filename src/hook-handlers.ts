@@ -121,6 +121,12 @@ const pullHandler: HookHandler = {
       const { findUnreadableProjectConfig } = await import('./config.js');
       if (await findUnreadableProjectConfig(cwd) !== null) return null;
     }
+    // A tool excluded here, by `uninstall --agent` or an uninstall that could not remove its hooks,
+    // syncs nothing from its hooks: a pull would restore what was removed (#993).
+    if (config) {
+      const { isAgentExcluded } = await import('./types.js');
+      if (isAgentExcluded(config, tool)) return null;
+    }
     const hintCwd = cwd ?? process.cwd();
     const packageHints = await import('./pkg/pkg-hint.js');
     const packageHashBeforePull = await packageHints.packageManifestHashForCwd(hintCwd);

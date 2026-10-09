@@ -131,8 +131,9 @@ describe('Codex hook ownership', () => {
     const project = await fse.realpath(await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-codex-owner-project-')));
     const config = userConfig({ scope: 'project', projectRoot: project });
     const file = path.join(project, '.codex', 'hooks.json');
+    // Each shares the team's command but is not its render: an exact render is teamai's (#993).
     const memberGroups = [
-      { hooks: [{ type: 'command', command: 'npm run lint' }] },
+      { hooks: [{ type: 'command', command: 'npm run lint', timeout: 5 }] },
       { matcher: 'Bash', hooks: [{ type: 'command', command: 'npm run lint', timeout: 17 }] },
     ];
     try {
@@ -158,8 +159,9 @@ describe('Codex hook ownership', () => {
   it.each(['Stop', 'PreToolUse'])('preserves and never trusts member hooks sharing a team command under %s', async (event) => {
     await writeYaml(LINT_HOOK);
     const file = path.join(codexHome(), 'hooks.json');
+    // Each shares the team's command but is not its render: an exact render is teamai's (#993).
     const memberGroups = [
-      { hooks: [{ type: 'command', command: 'npm run lint' }] },
+      { hooks: [{ type: 'command', command: 'npm run lint', timeout: 5 }] },
       { matcher: 'Bash', hooks: [{ type: 'command', command: 'npm run lint', timeout: 17, additionalContextLimit: 0 }] },
     ];
     await fse.writeJson(file, { hooks: { [event]: memberGroups } });
@@ -257,7 +259,7 @@ describe('Codex hook ownership', () => {
   it('keeps ambiguous legacy entries instead of claiming every identical command', async () => {
     await writeYaml(LINT_HOOK);
     const file = path.join(codexHome(), 'hooks.json');
-    const member = { hooks: [{ type: 'command', command: 'npm run lint' }] };
+    const member = { hooks: [{ type: 'command', command: 'npm run lint', timeout: 5 }] };
     await fse.writeJson(file, { hooks: { PreToolUse: [member, member] } });
     await fse.outputJson(path.join(home, '.teamai', 'managed-hooks.json'), {
       codex: [{ id: 'lint', event: 'PreToolUse', command: 'npm run lint' }],
@@ -268,6 +270,21 @@ describe('Codex hook ownership', () => {
     expect((await fse.readJson(file)).hooks.PreToolUse.slice(0, 2)).toEqual([member, member]);
     expect(trustedKeys()).not.toContain(`${file}:pre_tool_use:0:0`);
     expect(trustedKeys()).not.toContain(`${file}:pre_tool_use:1:0`);
+  });
+
+  it('takes unrecorded copies of the team render as its own, leaving one entry (#993)', async () => {
+    await writeYaml(LINT_HOOK);
+    const file = path.join(codexHome(), 'hooks.json');
+    const render = { hooks: [{ type: 'command', command: 'npm run lint' }] };
+    await fse.writeJson(file, { hooks: { PreToolUse: [render, render] } });
+
+    await writeAndTrust(userConfig());
+
+    expect((await fse.readJson(file)).hooks.PreToolUse).toEqual([render]);
+    expect(trustedKeys()).toContain(`${file}:pre_tool_use:0:0`);
+    await writeYaml(LINT_HOOK.replace('npm run lint', 'npm run lint:fix'));
+    await writeAndTrust(userConfig());
+    expect((await fse.readJson(file)).hooks.PreToolUse).toEqual([{ hooks: [{ type: 'command', command: 'npm run lint:fix' }] }]);
   });
 
 });

@@ -9,6 +9,7 @@ import {
   buildDesiredMcpContext,
   desiredMcpForTarget,
   mcpTargetExcluded,
+  shadowedMcpRecords,
   type McpChange,
   type McpTarget,
 } from './mcp-reconcile.js';
@@ -112,7 +113,14 @@ export async function mcpList(_options: GlobalOptions): Promise<void> {
   if (targets.length === 0) {
     console.log('  (none)');
   } else {
-    for (const t of targets) console.log(`  ${t.tool.padEnd(16)} ${displayPath(t.file)}`);
+    for (const t of targets) {
+      console.log(`  ${t.tool.padEnd(16)} ${displayPath(t.file)}`);
+      // The tool reads only the first of its user MCP files that exists (#993).
+      for (const [file, names] of await shadowedMcpRecords(localConfig, t)) {
+        console.log(`  ${''.padEnd(16)} teamai's ${names.join(', ')} ${names.length > 1 ? 'are' : 'is'} still in ${displayPath(file)}, `
+          + `which ${t.tool} does not read: run \`teamai pull\` to move ${names.length > 1 ? 'them' : 'it'}.`);
+      }
+    }
   }
   await reportMissingSecrets(localConfig, teamEnv);
 }

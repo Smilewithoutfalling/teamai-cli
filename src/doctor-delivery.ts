@@ -167,19 +167,45 @@ function hasDeliveryProblem(delivery: ToolDelivery): boolean {
 }
 
 /**
- * What `pullItem` did not write at `target`: an older render, or a copy the
- * member changed since teamai delivered it, which pull keeps. With
- * `recordedLabel`, an older render still holding what teamai recorded writing
- * gets that label instead.
+ * The label for a file at a team resource's path that teamai has no record
+ * of and that holds no team version of it (#993): the member's own, which
+ * pull keeps, so the team version does not reach the tool. Each is named in
+ * the fix with pull's own line; `pull --force` does not replace it.
+ */
+const MEMBERS_OWN = 'not teamai\'s (kept by pull)';
+
+/** The list `lines` keeps for `tool`, created on first use. */
+function linesFor(lines: Map<string, string[]>, tool: string): string[] {
+  let list = lines.get(tool);
+  if (!list) lines.set(tool, list = []);
+  return list;
+}
+
+/** Pull's line for each file of the member's own in `delivery`'s tool, when the check lists any. */
+function membersOwnFix(lines: Map<string, string[]>, delivery: ToolDelivery): string {
+  const list = delivery.problems.has(MEMBERS_OWN) ? lines.get(delivery.tool) ?? [] : [];
+  return list.map((line) => ` ${line}`).join('');
+}
+
+/**
+ * What `pullItem` did not write at `target`: an older render, a copy the
+ * member changed since teamai delivered it, or a file of the member's own,
+ * which pull keeps; the line naming one of the last goes on `memberLines`.
+ * With `recordedLabel`, an older render still holding what teamai recorded
+ * writing gets that label instead.
  */
 async function differingCopyLabel(
-  item: ResourceItem, target: DeliveryTarget, olderLabel: string, localConfig: LocalConfig, recordedLabel?: string,
+  item: ResourceItem, target: DeliveryTarget, olderLabel: string, localConfig: LocalConfig, memberLines: string[], recordedLabel?: string,
 ): Promise<string> {
   const { deliveredHashes } = await import('./pull.js');
-  const { judgeCopy, recordedUnchanged } = await import('./resources/delivered-copies.js');
+  const { describeKeptEntry, judgeCopy, recordedUnchanged } = await import('./resources/delivered-copies.js');
   const previous = await deliveredHashes(localConfig);
   const verdict = await judgeCopy(previous, item, target);
   if (verdict.kind === 'keep') return CHANGED_BY_YOU;
+  if (verdict.kind === 'member') {
+    memberLines.push(await describeKeptEntry(target.dest, item.relativePath));
+    return MEMBERS_OWN;
+  }
   return recordedLabel !== undefined && await recordedUnchanged(previous, target.dest) ? recordedLabel : olderLabel;
 }
 
@@ -236,21 +262,34 @@ export async function buildDeliveryChecks(ctx: DoctorContext): Promise<Check[]> 
   }
   if (items.length === 0) return [];
 
-  const labels = ['not delivered', 'delivered but unreadable'] as const;
-  const { byTool } = await walkDelivery(getHandler('skills'), ctx, items, async ({ dest }, item) => {
-    if (!await pathExists(dest)) return labels[0];
-    return await skillIsDiscoverable(dest, item.name) ? null : labels[1];
+  const labels = ['not delivered', 'delivered but unreadable', MEMBERS_OWN] as const;
+  // Pull's line for each skill directory of the member's own, by the tool it is in.
+  const memberLines = new Map<string, string[]>();
+  const { deliveredHashes } = await import('./pull.js');
+  const { describeKeptEntry, judgeCopy } = await import('./resources/delivered-copies.js');
+  const previous = await deliveredHashes(localConfig);
+  const { byTool } = await walkDelivery(getHandler('skills'), ctx, items, async (target, item) => {
+    if (!await pathExists(target.dest)) return labels[0];
+    if ((await judgeCopy(previous, item, target)).kind === 'member') {
+      linesFor(memberLines, target.tool).push(await describeKeptEntry(target.dest, item.relativePath));
+      return MEMBERS_OWN;
+    }
+    return await skillIsDiscoverable(target.dest, item.name) ? null : labels[1];
   });
 
   return [...byTool].map(([tool, delivery]) => ({
     name: `Skills delivered to ${tool}`,
     source: 'local',
     check: async () => delivery.problems.size === 0,
-    fix: `In ${tool}, ${describeProblems(delivery.problems, labels)}. Run \`teamai pull --force\`: `
-      + 'a plain pull skips a scope whose team repo has not changed, so it cannot restore this. '
-      + 'If a skill stays unreadable, fix its SKILL.md in the team repo — the '
-      + 'frontmatter needs a `name` matching the directory, or the agent never '
-      + 'discovers it.',
+    fix: `In ${tool}, ${describeProblems(delivery.problems, labels)}.`
+      + (delivery.problems.has(labels[0]) || delivery.problems.has(labels[1])
+        ? ' Run `teamai pull --force`: '
+          + 'a plain pull skips a scope whose team repo has not changed, so it cannot restore this. '
+          + 'If a skill stays unreadable, fix its SKILL.md in the team repo — the '
+          + 'frontmatter needs a `name` matching the directory, or the agent never '
+          + 'discovers it.'
+        : '')
+      + membersOwnFix(memberLines, delivery),
   }));
 }
 
@@ -284,7 +323,9 @@ export async function buildRulesDeliveryChecks(ctx: DoctorContext): Promise<Chec
   // scopes the rule by fields of it (Cursor `globs`, Kiro `inclusion`, …);
   // comparing against the render catches a wrong value there, which checking
   // the keys were present did not.
-  const ruleLabels = ['not delivered', 'delivered from an older copy', RECORDED_OLDER_RULE, FLAT_NAME_TAKEN, CHANGED_BY_YOU] as const;
+  const ruleLabels = ['not delivered', 'delivered from an older copy', RECORDED_OLDER_RULE, FLAT_NAME_TAKEN, CHANGED_BY_YOU, MEMBERS_OWN] as const;
+  // Pull's line for each file of the member's own, by the tool it is in.
+  const memberLines = new Map<string, string[]>();
   const { byTool } = await walkDelivery(
     getHandler('rules'),
     ctx,
@@ -295,7 +336,7 @@ export async function buildRulesDeliveryChecks(ctx: DoctorContext): Promise<Chec
       const delivered = await readFileSafe(target.dest);
       if (delivered === null) return ruleLabels[0];
       if (target.content === undefined || delivered === target.content) return null;
-      return differingCopyLabel(item, target, ruleLabels[1], localConfig, RECORDED_OLDER_RULE);
+      return differingCopyLabel(item, target, ruleLabels[1], localConfig, linesFor(memberLines, target.tool), RECORDED_OLDER_RULE);
     },
   );
   // A tool that reads only the top of its rules directory gets no file for a
@@ -347,7 +388,7 @@ export async function buildRulesDeliveryChecks(ctx: DoctorContext): Promise<Chec
             ? 'Run `teamai pull` to rewrite a copy that still holds what teamai recorded writing: it re-renders '
               + 'one even when the team repo has not changed. '
             : '')
-          + `${olderRuleCopyMeaning(delivery.tool)}${changedByYouFix(delivery)}`,
+          + `${olderRuleCopyMeaning(delivery.tool)}${changedByYouFix(delivery)}${membersOwnFix(memberLines, delivery)}`,
     });
   }
 
@@ -373,6 +414,24 @@ function olderRuleCopyMeaning(tool: string): string {
 }
 
 /**
+ * On OpenCode V2, which parses `instructions` and ignores it (#993), the check
+ * that teamai's plugin in HOME is installed as this build writes it; its
+ * context hook is what adds `what`. Null on V1, which loads `instructions`.
+ */
+async function opencodeV2PluginCheck(name: string, what: string): Promise<Check | null> {
+  const { opencodeContextPlugin, opencodeMajorVersion } = await import('./opencode-hooks.js');
+  if (await opencodeMajorVersion() < 2) return null;
+  const { file, ready } = await opencodeContextPlugin();
+  return {
+    name,
+    source: 'local',
+    check: async () => ready,
+    fix: `${file} is missing or out of date. OpenCode V2 ignores \`instructions\` and gets ${what} only through this plugin. `
+      + 'Run `teamai hooks inject` to reinstall it.',
+  };
+}
+
+/**
  * The two rule destinations that are not a file per tool.
  *
  * OpenCode does not auto-scan its rules directory: a `.md` copied there is
@@ -394,7 +453,10 @@ async function buildRulesActivationChecks(ctx: DoctorContext, items: ResourceIte
   const checks: Check[] = [];
 
   const opencode = await handler.opencodeInstructionsTarget(teamConfig, localConfig, items);
-  if (opencode !== null) {
+  const opencodeV2 = opencode === null ? null : await opencodeV2PluginCheck('Team rules are active in opencode', 'the team rules');
+  if (opencodeV2) {
+    checks.push(opencodeV2);
+  } else if (opencode !== null) {
     const { readOpencodeInstructionList } = await import('./resources/opencode-config.js');
     // A missing file just lists nothing yet; null is one the pull cannot parse.
     const instructions = await pathExists(opencode.configFile) ? await readOpencodeInstructionList(opencode.configFile) : [];
@@ -643,7 +705,9 @@ export async function buildAgentsDeliveryChecks(ctx: DoctorContext): Promise<Che
 
   // An agent whose spec reaches no tool at all is not a per-tool failure: the
   // file is in the team repo and nothing renders it anywhere.
-  const agentLabels = ['not delivered', 'delivered from an older spec', MODEL_CHANGED, CHANGED_BY_YOU] as const;
+  const agentLabels = ['not delivered', 'delivered from an older spec', MODEL_CHANGED, CHANGED_BY_YOU, MEMBERS_OWN] as const;
+  // Pull's line for each file of the member's own, by the tool it is in.
+  const memberLines = new Map<string, string[]>();
   // What the last pull wrote for each agent, its model as recorded then (#830).
   const recordedTargets = new Map<string, Promise<DeliveryTarget[]>>();
   const recordedContent = async (item: ResourceItem, tool: string): Promise<string | undefined> => {
@@ -669,7 +733,7 @@ export async function buildAgentsDeliveryChecks(ctx: DoctorContext): Promise<Che
       if (delivered === null) return agentLabels[0];
       if (target.content === undefined || delivered === target.content) return null;
       if (delivered === await recordedContent(item, target.tool)) return MODEL_CHANGED;
-      return differingCopyLabel(item, target, agentLabels[1], localConfig);
+      return differingCopyLabel(item, target, agentLabels[1], localConfig, linesFor(memberLines, target.tool));
     },
   );
   // An agent whose model cannot be resolved is held, not unreachable: the
@@ -680,7 +744,8 @@ export async function buildAgentsDeliveryChecks(ctx: DoctorContext): Promise<Che
 
   const checks: Check[] = [...byTool].map(([tool, delivery]) => {
     const modelChanged = delivery.problems.has(MODEL_CHANGED);
-    const restoredByForce = [...delivery.problems.keys()].some((label) => label !== MODEL_CHANGED && label !== CHANGED_BY_YOU);
+    const restoredByForce = [...delivery.problems.keys()]
+      .some((label) => label !== MODEL_CHANGED && label !== CHANGED_BY_YOU && label !== MEMBERS_OWN);
     return {
       name: `Agents delivered to ${tool}`,
       source: 'local',
@@ -692,7 +757,7 @@ export async function buildAgentsDeliveryChecks(ctx: DoctorContext): Promise<Che
           ? [`${modelChanged ? 'For the rest, run' : 'Run'} \`teamai pull --force\`: a plain pull skips a scope whose team repo `
             + 'has not changed, so it cannot restore this.']
           : []),
-      ].join(' ') + changedByYouFix(delivery),
+      ].join(' ') + changedByYouFix(delivery) + membersOwnFix(memberLines, delivery),
     };
   });
 
@@ -739,7 +804,7 @@ export async function buildMcpDeliveryChecks(ctx: DoctorContext): Promise<Check[
 
   const {
     resolveMcpTargets, buildDesiredMcpContext, desiredMcpForTarget,
-    mcpTargetExcluded, installedMcpEntries,
+    mcpTargetExcluded, installedMcpEntries, memberMcpServers, describeKeptMemberServer,
   } = await import('./mcp-reconcile.js');
   const { carriesResolvedValue, ensureExcludedFromGit } = await import('./mcp-git-exclude.js');
   const { mcpEntryReader, teamMcpToDef } = await import('./resources/mcp.js');
@@ -809,11 +874,15 @@ export async function buildMcpDeliveryChecks(ctx: DoctorContext): Promise<Check[
 
     if (problems.length === 0 && !withheld && desired.size === 0) continue;
 
+    // A pull keeps a server of the member's own under a team name, and names it (#993).
+    // Judged with every tool mapping the file, detected or not, as pull judges it (#993).
+    const member = problems.length === 0 ? [] : await memberMcpServers(
+      localConfig, await resolveMcpTargets(teamConfig, localConfig, { includeUndetected: true }), target, desired, desiredContext.vars);
     const delivery = problems.length === 0 ? [] : [`In ${target.file}, ${problems.join('; ')}. A server needing a variable reads it from `
       + '`env/env.yaml` or an active `env/<ns>/env.yaml`, whose top-level key is `variables:` — a plain `KEY: value` mapping '
-      + 'parses as no variables at all. Then run `teamai pull --force`: a pull leaves an entry '
-      + 'teamai does not own untouched, so a server of your own under a team name only gives '
-      + 'way to `--force`.'];
+      + 'parses as no variables at all. Then run `teamai pull`.',
+      ...member.map((name) => describeKeptMemberServer(name, target.file)),
+      ...member.length > 0 ? ['Or run `teamai mcp inject --force` to replace it with the team\'s.'] : []];
     checks.push({
       name: `MCP servers delivered to ${target.tool}`,
       source: 'local',
@@ -822,6 +891,35 @@ export async function buildMcpDeliveryChecks(ctx: DoctorContext): Promise<Check[
     });
   }
 
+  return checks;
+}
+
+/**
+ * CodeBuddy reads only the first of its user MCP files that exists (#993).
+ * Once the member creates an earlier one (`codebuddy mcp add -s user`
+ * creates ~/.codebuddy/.mcp.json), teamai's servers in a later one are not
+ * loaded, until a pull moves them. Built only while a file teamai's records
+ * name holds them. Read-only.
+ */
+export async function buildMcpReadFileChecks(ctx: DoctorContext): Promise<Check[]> {
+  const { localConfig, teamConfig } = ctx;
+  // An HTTP-backed team's servers arrive through the local agent, which a pull does not run.
+  if (!teamConfig || localConfig.scope !== 'user' || localConfig.repo.kind === 'http') return [];
+  const { resolveMcpTargets, shadowedMcpRecords, USER_MCP_LOOKUP } = await import('./mcp-reconcile.js');
+  const checks: Check[] = [];
+  for (const target of await resolveMcpTargets(teamConfig, localConfig)) {
+    const shadowed = await shadowedMcpRecords(localConfig, target);
+    if (shadowed.size === 0) continue;
+    const lookup = (USER_MCP_LOOKUP[target.tool] ?? []).map((rel) => `~/${rel}`);
+    checks.push({
+      name: `${target.tool} reads the file holding teamai's MCP servers`,
+      source: 'local',
+      check: async () => false,
+      fix: [...shadowed].map(([file, names]) => `teamai's MCP servers for ${target.tool} (${nameList(names)}) are in ${file}, `
+        + `which ${target.tool} does not read: it reads only ${target.file}, the first of ${lookup.join(', ')} that exists.`).join(' ')
+        + ' Run `teamai pull` to move them there.',
+    });
+  }
   return checks;
 }
 
@@ -1289,7 +1387,9 @@ export async function buildDocsCheck(ctx: DoctorContext): Promise<Check[]> {
   const { localConfig, teamConfig } = ctx;
   if (!teamConfig) return [];
 
-  const { listDocFiles, listStaleDocDirectories, resolveDocsForDirectory, resolveDocsDestination } = await import('./resources/docs.js');
+  const {
+    describeLinkedDocsRoot, isLinkedDocsRoot, isPrunedDoc, listDocFiles, listStaleDocDirectories, membersDocs, resolveDocsForDirectory, resolveDocsDestination,
+  } = await import('./resources/docs.js');
   // The set pull delivers: no dotfiles, nothing of a docs namespace this member
   // does not have active (#707). Manifests that cannot be read leave nothing to
   // compare against, and pull stops the scope over them.
@@ -1301,6 +1401,10 @@ export async function buildDocsCheck(ctx: DoctorContext): Promise<Check[]> {
   }
 
   const dest = resolveDocsDestination(teamConfig, localConfig);
+  // Pull delivers nothing through a linked root, and no pull can change that (#993).
+  if (await isLinkedDocsRoot(dest)) {
+    return [{ name: 'Team docs delivered', source: 'local', check: async () => false, fix: describeLinkedDocsRoot(dest, 'pull') }];
+  }
   let localFiles: string[];
   let staleDirectories: string[];
   try {
@@ -1320,7 +1424,14 @@ export async function buildDocsCheck(ctx: DoctorContext): Promise<Check[]> {
     ...teamFiles,
     ...desired.withheld.flatMap(({ dir, files }) => files.map((file) => `${dir}/${file}`)),
   ]);
-  const stale = [...localFiles.filter(file => !known.has(file)), ...staleDirectories];
+  // A file pull keeps because it is no team version of a removed doc is the member's, not stale (#993).
+  const staleFiles: string[] = [];
+  for (const file of localFiles.filter((local) => !known.has(local))) {
+    if (await isPrunedDoc(path.join(dest, file), file, localConfig.repo.localPath)) staleFiles.push(file);
+  }
+  const stale = [...staleFiles, ...staleDirectories];
+  // Only the member's own files there, and no team doc: nothing for this check to say (#993).
+  if (teamFiles.length === 0 && stale.length === 0) return [];
 
   // isFile, not merely "something is there": a directory sitting on the
   // expected name, or a symlink with nothing behind it, would satisfy a plain
@@ -1329,15 +1440,22 @@ export async function buildDocsCheck(ctx: DoctorContext): Promise<Check[]> {
   for (const file of teamFiles) {
     if (!await isReadableFile(path.join(dest, file))) missing.push(file);
   }
+  // Files at a team doc's path that hold no team version of it: pull keeps them (#993).
+  const members = await membersDocs(desired, dest, localConfig.repo.localPath);
+  const { describeKeptEntry } = await import('./resources/delivered-copies.js');
+  const memberLines = await Promise.all(members.map((file) => describeKeptEntry(path.join(dest, file), `docs/${file}`)));
 
   return [{
     name: 'Team docs delivered',
     source: 'local',
-    check: async () => missing.length === 0 && stale.length === 0,
+    check: async () => missing.length === 0 && stale.length === 0 && members.length === 0,
     fix: [
       ...(missing.length ? [`Missing from ${dest}: ${nameList(missing)}.`] : []),
       ...(stale.length ? [`Stale docs in ${dest}: ${nameList(stale)}.`] : []),
-      'Run `teamai pull --force` to restore the docs mirror; a plain pull skips an already-synced revision.',
+      ...(missing.length || stale.length
+        ? ['Run `teamai pull --force` to restore the docs mirror; a plain pull skips an already-synced revision.']
+        : []),
+      ...memberLines,
     ].join(' '),
   }];
 }
@@ -1438,7 +1556,7 @@ export async function buildInstructionDeliveryChecks(ctx: DoctorContext): Promis
   const { buildRolePullContext } = await import('./resources/desired.js');
   const { opencodeContextReference, readOpencodeInstructionList } = await import('./resources/opencode-config.js');
   const { blocks } = await resolveInstructionBlocks(teamConfig, localConfig, await buildRolePullContext(localConfig));
-  const { targets, hooks, stale } = await resolveInstructionTargets(teamConfig, localConfig);
+  const { targets, hooks, stale, opencodeFallback } = await resolveInstructionTargets(teamConfig, localConfig);
   const pullNow = 'Run `teamai pull`.';
   const checks: Check[] = [];
 
@@ -1456,8 +1574,15 @@ export async function buildInstructionDeliveryChecks(ctx: DoctorContext): Promis
 
   const opencodePaths = scopedToolPaths(teamConfig, localConfig).opencode;
   const opencodeFile = opencodePaths && await instructionTargetPath('opencode', opencodePaths, localConfig);
-  // Only a file holding the blocks needs listing; pull registers it once it writes them.
-  if (opencodeFile && targets.some((t) => t.path === opencodeFile) && await holdsInstructionBlocks(opencodeFile)) {
+  // Only a file holding the blocks needs listing; pull registers it once it
+  // writes them. Beside the Claude fallback V1 reads CLAUDE.md instead.
+  const opencodeDelivered = opencodeFile !== undefined && targets.some((t) => t.path === opencodeFile) && await holdsInstructionBlocks(opencodeFile);
+  const opencodeV2 = opencodeDelivered
+    ? await opencodeV2PluginCheck('opencode adds the team instructions to its prompt', 'the team instructions')
+    : null;
+  if (opencodeV2) {
+    checks.push(opencodeV2);
+  } else if (opencodeFile && opencodeDelivered && !opencodeFallback) {
     const { config, entry } = opencodeContextReference(opencodeFile, localConfig.scope, resolveToolBaseDir('opencode', localConfig));
     const instructions = await readOpencodeInstructionList(config);
     checks.push({

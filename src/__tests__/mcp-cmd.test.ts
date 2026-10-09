@@ -17,6 +17,7 @@ vi.mock('../mcp-reconcile.js', async (importOriginal) => {
     reconcileMcpForConfig: vi.fn(),
     releaseCleanMcpGitExcludes: vi.fn(),
     resolveMcpTargets: vi.fn().mockResolvedValue([]),
+    shadowedMcpRecords: vi.fn().mockResolvedValue(new Map()),
     buildDesiredMcpContext: vi.fn().mockResolvedValue({
       sharing: { autoApply: true, allowedCommands: [], allowedHosts: [] },
       excluded: new Set(),

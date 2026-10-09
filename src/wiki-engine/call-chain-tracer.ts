@@ -1,5 +1,5 @@
 import type { CodeCollectedFile } from './code-knowledge/code-collector.js';
-import type { CodeFact } from './code-knowledge/code-extractors.js';
+import { type CodeFact, isMetadataRelation } from './code-knowledge/code-extractors.js';
 
 export type CallChainLayer = "entry" | "orchestration" | "service" | "data";
 
@@ -24,9 +24,11 @@ const ENTRY_PATTERNS = [
   /route/i,
   /controller/i,
   /endpoint/i,
-  /main\.(ts|go|py|rs|java|swift)$/,
-  /server\.(ts|go|py|rs|java|swift)$/,
-  /app\.(ts|go|py|rs|java|swift)$/,
+  // Case-insensitive: Scala's key files are Main.scala / App.scala, and a
+  // capitalized App.ts or Main.go is just as much an entry point.
+  /main\.(ts|go|py|rs|java|swift|scala)$/i,
+  /server\.(ts|go|py|rs|java|swift|scala)$/i,
+  /app\.(ts|go|py|rs|java|swift|scala)$/i,
 ];
 
 const ORCHESTRATION_PATTERNS = [
@@ -195,7 +197,9 @@ function findEntryPoints(facts: CodeFact[], files: CodeCollectedFile[]): EntryPo
 function buildRelationsByFile(facts: CodeFact[]): Map<string, CodeFact[]> {
   const map = new Map<string, CodeFact[]>();
   for (const fact of facts) {
-    if (fact.kind !== "relation") continue;
+    // Metadata relations (wildcard packages, declaration markers) name no
+    // target and would only crowd the bounded relation slice in traversal.
+    if (fact.kind !== "relation" || isMetadataRelation(fact.name)) continue;
     const group = map.get(fact.file) ?? [];
     group.push(fact);
     map.set(fact.file, group);
@@ -237,7 +241,7 @@ function resolveRelationTarget(importPath: string, filesByModule: Map<string, st
   // Normalize import path
   const normalized = importPath
     .replace(/^\.\//, "")
-    .replace(/\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|swift)$/, "");
+    .replace(/\.(ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|swift|scala)$/, "");
 
   // Try exact match first
   const exact = filesByModule.get(normalized);

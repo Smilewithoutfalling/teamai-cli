@@ -1,9 +1,12 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import fse from 'fs-extra';
 import YAML from 'yaml';
 
-import { readFileSafe, writeFile } from '../utils/fs.js';
+import { getDataHome, getTeamaiHome, isSelfMode, type LocalConfig } from '../types.js';
+import { pathExists, readFileSafe, writeFile } from '../utils/fs.js';
+import { log } from '../utils/logger.js';
 import {
   PackageLockSchema,
   PackageManifestSchema,
@@ -22,12 +25,58 @@ export function packageLockPath(cwd: string): string {
   return path.join(cwd, PACKAGE_LOCK_FILENAME);
 }
 
-export async function ensurePackageLockIgnored(cwd: string): Promise<void> {
-  const gitignorePath = path.join(cwd, '.gitignore');
-  const content = await readFileSafe(gitignorePath);
-  if (content?.split('\n').some((line) => line.trim() === PACKAGE_LOCK_FILENAME)) return;
-  const prefix = content && !content.endsWith('\n') ? `${content}\n` : (content ?? '');
-  await writeFile(gitignorePath, `${prefix}${PACKAGE_LOCK_FILENAME}\n`);
+/**
+ * The directory holding this scope's `teamai.lock`: the data home, never the
+ * working tree (#993). A project's lock that a release before #993 wrote to
+ * `<root>/.teamai/` is moved here, and the `.teamai/.gitignore` it created to
+ * hide it is removed when that is all it holds (not in self mode, whose
+ * `.gitignore` is the team's). A lock or `.gitignore` git tracks, or may
+ * track, stays where it is, since moving it would leave a deletion in the
+ * tree: the lock is read from there until the data home has one of its own
+ * (it is copied there), and doctor names it with the command that untracks
+ * it. `readOnly` (a dry run, doctor) moves nothing and reads the old lock
+ * where it is; so does a read whose move or copy failed.
+ */
+export async function packageLockDir(localConfig: LocalConfig, options: { readOnly?: boolean } = {}): Promise<string> {
+  const dir = getDataHome(localConfig);
+  if (localConfig.scope !== 'project' || !localConfig.projectRoot) return dir;
+  const legacyDir = getTeamaiHome('project', localConfig.projectRoot);
+  // A project outside git keeps its data home in `.teamai/` itself.
+  if (path.resolve(legacyDir) === path.resolve(dir)) return dir;
+  const legacy = packageLockPath(legacyDir);
+  const { gitTracks } = await import('../mcp-git-exclude.js');
+  if (await pathExists(legacy)) {
+    if (options.readOnly) return await pathExists(packageLockPath(dir)) ? dir : legacyDir;
+    if ((await gitTracks(legacy)).kind !== 'untracked') {
+      if (await pathExists(packageLockPath(dir))) return dir;
+      try {
+        await fse.copy(legacy, packageLockPath(dir), { overwrite: false, errorOnExist: true });
+        return dir;
+      } catch (error) {
+        log.debug(`Could not copy ${legacy} to ${dir}: ${(error as Error).message}`);
+        return legacyDir;
+      }
+    }
+    try {
+      await fse.move(legacy, packageLockPath(dir), { overwrite: false });
+    } catch (error) {
+      // A lock already in the data home is the newer one.
+      if (await pathExists(packageLockPath(dir))) {
+        await fse.remove(legacy);
+      } else {
+        log.debug(`Could not move ${legacy} to ${dir}: ${(error as Error).message}`);
+        return legacyDir;
+      }
+    }
+  }
+  if (!options.readOnly && !isSelfMode(localConfig)) {
+    const gitignore = path.join(legacyDir, '.gitignore');
+    const lines = (await readFileSafe(gitignore))?.split('\n').map((line) => line.trim()).filter(Boolean);
+    if (lines?.length === 1 && lines[0] === PACKAGE_LOCK_FILENAME && (await gitTracks(gitignore)).kind === 'untracked') {
+      await fse.remove(gitignore);
+    }
+  }
+  return dir;
 }
 
 function parseYamlObject(content: string, filePath: string): Record<string, unknown> {

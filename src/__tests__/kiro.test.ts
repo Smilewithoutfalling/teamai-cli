@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import fse from 'fs-extra';
@@ -143,12 +144,15 @@ describe('Kiro support', () => {
         additionalRoles: [],
       } as unknown as LocalConfig;
 
+      // The stale .md is what teamai delivered before (on record), so it may go (#993).
+      const staleMd = path.join(home, '.kiro', 'agents', 'reviewer.md');
+      const recorded = { [staleMd]: crypto.createHash('sha256').update('stale markdown agent').digest('hex') };
       await new AgentsHandler().pullItem({
         name: 'reviewer',
         type: 'agents',
         sourcePath,
         relativePath: 'agents/reviewer.yaml',
-      }, config, localConfig);
+      }, config, localConfig, openLedger(recorded));
 
       const target = path.join(home, '.kiro', 'agents', 'reviewer.json');
       expect(await fse.pathExists(target)).toBe(true);

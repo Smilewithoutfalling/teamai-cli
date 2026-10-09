@@ -115,7 +115,10 @@ program
     // A learning queued in this checkout would go with it when the worktree is
     // removed (#808).
     if (needsQueueOutOfCheckout(actionCommand)) {
-      const kept = await queueKeptInCheckout(migration, { dryRun: !!opts.dryRun });
+      // Not for `init`: it sets the project up itself, and a clone-time
+      // self-heal here would enable every tool in HOME before `--agent`
+      // could choose them (#993).
+      const kept = await queueKeptInCheckout(migration, { dryRun: !!opts.dryRun, selfHeal: name !== 'init' });
       if (kept) {
         log.error(kept);
         process.exit(1);

@@ -3,7 +3,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { parse as parseYaml } from 'yaml';
 import matter from 'gray-matter';
 import { isToolInstalledForConfig, ResourceHandler, type PlacementRecords, type ScanForPushOptions } from './base.js';
-import type { ResourceItem, ResourceItemStatus, DeliveryTarget, TeamaiConfig, LocalConfig, AgentModelRecords, RecordedAgentModel } from '../types.js';
+import type { CopyOrigin, ResourceItem, ResourceItemStatus, DeliveryTarget, TeamaiConfig, LocalConfig, AgentModelRecords, RecordedAgentModel } from '../types.js';
 import { listFiles, listDirs, pathExists, copyFile, ensureDir, remove, fileContentEqual, getFileMtime, writeFile, readFileSafe, fileHash } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
 import { resolveToolBaseDir, isAgentExcluded, isSelfMode, scopedToolPaths } from '../types.js';
@@ -15,7 +15,9 @@ import { loadStateForScope } from '../config.js';
 import { placedResourcePath } from '../push-namespaces.js';
 import { itemCandidate, resolveNamespacedItems, type NamespaceResolution } from '../namespace-resolver.js';
 import { getFileContentAtRev, getFileContentWhenAdded, isPastVersionOf } from '../utils/git.js';
-import { keepsEditedCopy, recordDelivered, type DeliveryLedger } from './delivered-copies.js';
+import {
+  describeMembersDirLeft, forgetDelivered, isLink, isTeamaiCopy, judgeRemoval, keepsEditedCopy, recordDelivered, type DeliveredHashes, type DeliveryLedger,
+} from './delivered-copies.js';
 import { warnOnce } from '../utils/warn-once.js';
 import { TEAM_ALIASES_FILE, aliasWarningsFor, isModelAlias, loadModelAliases, localAliasesPath, resolveAgentModel, type ModelAliases, type ResolutionStep } from '../models/aliases.js';
 import {
@@ -726,10 +728,10 @@ export class AgentsHandler extends ResourceHandler {
         for (const warning of aliasWarningsFor(aliases, spec, tool)) warnOnce(`[agents] ${warning}`);
       }
     }
-    for (const { tool, dest, render } of renders) {
+    for (const { tool, dest, render, origin } of renders) {
       const destDir = path.dirname(dest);
       try {
-        if (ledger && await keepsEditedCopy(ledger, item, { tool, dest, content: render.content })) continue;
+        if (ledger && await keepsEditedCopy(ledger, item, { tool, dest, content: render.content, origin })) continue;
         await ensureDir(destDir);
         // Only a rendered spec can leave a sibling behind: its extension follows
         // the tool's format and changes when `targets` does. A legacy `.md` is
@@ -737,7 +739,7 @@ export class AgentsHandler extends ResourceHandler {
         // `.toml`, `.json` or `.agent.md` beside it is the member's own file
         // and not ours to delete (#624 review).
         if (!isLegacyAgent(agentItem)) {
-          await removeStaleAgentSiblings(destDir, item.name, render.ext);
+          await removeStaleAgentSiblings(destDir, item.name, render.ext, ledger, origin);
         }
         await writeFile(dest, render.content);
         if (ledger) {
@@ -747,6 +749,7 @@ export class AgentsHandler extends ResourceHandler {
         log.debug(`Rendered agent ${item.name} → ${tool} (${render.ext})`);
       } catch (e) {
         log.warn(`Failed to sync agent ${item.name} to ${tool}: ${(e as Error).message}`);
+        ledger?.failed.push({ name: item.name, tool });
       }
     }
   }
@@ -790,9 +793,14 @@ export class AgentsHandler extends ResourceHandler {
     // `<ns>/<stem>` resolves to exactly one file, because the root directory is
     // one of the directories probed and `<ns>/<stem>.yaml` sits under it — so
     // naming a namespace leaves the same stem in other namespaces alone.
-    for (const located of await findTeamAgentFiles(teamAgentsDir, name)) {
-      await remove(located.path);
-      removed.push(located.path);
+    const located = await findTeamAgentFiles(teamAgentsDir, name);
+    // The team file a kept copy is named against, before it goes.
+    const resource = located.length > 0
+      ? path.relative(localConfig.repo.localPath, located[0].path).split(path.sep).join('/')
+      : `agents/${name}.yaml`;
+    for (const { path: teamFile } of located) {
+      await remove(teamFile);
+      removed.push(teamFile);
     }
 
     // Only the name given. Agents deploy FLATTENED — `~/.claude/agents/<stem>` —
@@ -832,6 +840,10 @@ export class AgentsHandler extends ResourceHandler {
       }
     }
 
+    // What this checkout's pulls recorded writing: a copy with no record is
+    // teamai's only on proof, here as in pull (#993).
+    const { deliveredHashes } = await import('../pull.js');
+    const previous = await deliveredHashes(localConfig);
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
       if (!toolPath.agents) continue;
       // A tool the member excluded is not ours to write to, so it is not ours
@@ -842,6 +854,14 @@ export class AgentsHandler extends ResourceHandler {
       for (const localName of localNames) {
         for (const ext of AGENT_FILE_EXTENSIONS) {
           const filePath = path.join(baseDir, toolPath.agents, `${localName}${ext}`);
+          // A link is the member's, whatever the records say: teamai never deletes one (#993).
+          if (await isLink(filePath)) continue;
+          // The author's root copy is this agent's by the placement record, which proves it here.
+          if (localName === name && await pathExists(filePath)
+            && !await ownsAgentCopy(localConfig, filePath, stem, tool, previous)) {
+            log.warn(describeMembersDirLeft(filePath, resource, 'remove'));
+            continue;
+          }
           if (await pathExists(filePath)) {
             await remove(filePath);
             removed.push(filePath);
@@ -886,9 +906,9 @@ export class AgentsHandler extends ResourceHandler {
     for (const item of items) {
       if (isLegacyAgent(item as AgentResourceItem)) continue;
       const copies: RedeployedCopy[] = [];
-      for (const { tool, dest, render } of await this.resolveRenders(teamConfig, localConfig, item, aliases)) {
+      for (const { tool, dest, render, origin } of await this.resolveRenders(teamConfig, localConfig, item, aliases)) {
         if (!render.model) continue;
-        const target = { tool, dest, content: render.content };
+        const target = { tool, dest, content: render.content, origin };
         const recorded = ledger.agentModels[item.name]?.[tool];
         const reason = !await pathExists(dest) ? 'missing'
           : recorded ? (sameAgentModel(recorded, render.model.recorded) ? undefined : 'model')
@@ -991,6 +1011,8 @@ export class AgentsHandler extends ResourceHandler {
         const expected = await this.renderedForTool(item, tool, aliases);
         if (!expected || activeDestinations.has(`${item.name}${expected.ext}`)) continue;
         const deployed = path.join(destDir, `${item.name}${expected.ext}`);
+        // A link is the member's, whatever its target holds (#993).
+        if (await isLink(deployed)) continue;
         const current = await readFileSafe(deployed);
         if (current === null) continue;
         const recorded = records[item.name]?.[tool];
@@ -1020,16 +1042,17 @@ export class AgentsHandler extends ResourceHandler {
     item: ResourceItem,
     aliases?: ModelAliases,
     recorded?: Readonly<Record<string, RecordedAgentModel>>,
-  ): Promise<{ tool: ToolName; dest: string; render: AgentRender }[]> {
+  ): Promise<{ tool: ToolName; dest: string; render: AgentRender; origin: CopyOrigin }[]> {
     const agentItem = item as AgentResourceItem;
-    const renders: { tool: ToolName; dest: string; render: AgentRender }[] = [];
+    const renders: { tool: ToolName; dest: string; render: AgentRender; origin: CopyOrigin }[] = [];
     const modelAliases = aliases ?? await loadModelAliases(localConfig);
 
     for (const { tool, dir } of await this.agentToolDirs(teamConfig, localConfig)) {
       const render = await this.renderedForTool(agentItem, tool, modelAliases, recorded?.[tool]);
       if (!render) continue;
 
-      renders.push({ tool, dest: path.join(dir, `${item.name}${render.ext}`), render });
+      const origin = agentOrigin(localConfig.repo.localPath, item.name, tool, modelAliases);
+      renders.push({ tool, dest: path.join(dir, `${item.name}${render.ext}`), render, origin });
     }
 
     return renders;
@@ -1068,7 +1091,7 @@ export class AgentsHandler extends ResourceHandler {
     item: ResourceItem,
   ): Promise<DeliveryTarget[]> {
     return (await this.resolveRenders(teamConfig, localConfig, item))
-      .map(({ tool, dest, render }) => ({ tool, dest, content: render.content }));
+      .map(({ tool, dest, render, origin }) => ({ tool, dest, content: render.content, origin }));
   }
 
   /**
@@ -1084,7 +1107,7 @@ export class AgentsHandler extends ResourceHandler {
     const { recordedAgentModels } = await import('../pull.js');
     const records = await recordedAgentModels(localConfig);
     return (await this.resolveRenders(teamConfig, localConfig, item, undefined, records[item.name]))
-      .map(({ tool, dest, render }) => ({ tool, dest, content: render.content }));
+      .map(({ tool, dest, render, origin }) => ({ tool, dest, content: render.content, origin }));
   }
 
   /** Whether `item`'s team file can be read and, for a YAML spec, parses. */
@@ -1491,6 +1514,77 @@ interface DeployedModel {
 }
 
 /**
+ * The extras each tool's copy carried before #830 gave every tool its own
+ * key: Qoder, Qoder CN, ZCode and OMP rendered Claude's, tclaude and tcodex
+ * their base tool's only. 0.26.0 and earlier wrote these, with the spec's
+ * `model` as written and no delivery record.
+ */
+const PRE_830_EXTRAS_TOOL: Readonly<Partial<Record<ToolName, ToolName>>> = {
+  qoder: 'claude', 'qoder-cn': 'claude', zcode: 'claude', omp: 'claude', tclaude: 'claude', tcodex: 'codex',
+};
+
+/**
+ * How a file with no record in `tool`'s agents directory is proven teamai's
+ * (#993): it holds a version of a team agent named `stem`, in any namespace
+ * (agents land flat, so same-stem agents share the file), verbatim (a legacy
+ * `.md`), as pull renders that version for `tool` today, aliases resolved, or
+ * as an older CLI rendered it: the spec's `model` as written (before aliases),
+ * and before #830 another tool's extras (`PRE_830_EXTRAS_TOOL`).
+ */
+export function agentOrigin(repoPath: string, stem: string, tool: ToolName, aliases: ModelAliases): CopyOrigin {
+  const specOf = (content: Buffer, version: { path: string }): AgentSpec | null => {
+    const file = path.posix.basename(version.path);
+    if (file !== `${stem}.yaml`) return null;
+    const parsed = parseAgentYaml(content.toString('utf-8'), file);
+    if (!parsed.ok || (parsed.spec.targets && !parsed.spec.targets.includes(tool))) return null;
+    return parsed.spec;
+  };
+  const extrasTool = PRE_830_EXTRAS_TOOL[tool];
+  return {
+    repoPath,
+    pathspec: `:(glob)agents/**/${stem}.*`,
+    renders: [
+      (content, version) => {
+        const spec = specOf(content, version);
+        const resolved = spec && renderResolved(spec, tool, aliases);
+        return resolved?.ok ? resolved.render.content : null;
+      },
+      (content, version) => {
+        const spec = specOf(content, version);
+        return spec && renderForTool(spec, tool).content;
+      },
+      ...extrasTool ? [(content: Buffer, version: { path: string }) => {
+        const spec = specOf(content, version);
+        return spec && renderForTool(spec, extrasTool).content;
+      }] : [],
+    ],
+  };
+}
+
+/** `agentOrigin` for a copy of a removed agent; for a tool teamai renders no agents for, the team agents verbatim. */
+export async function removedAgentOrigin(localConfig: LocalConfig, stem: string, tool: string): Promise<CopyOrigin> {
+  // A tool teamai renders no agents for still gets a proof: the team agents' own bytes, verbatim (#993).
+  if (!isKnownTool(tool)) return { repoPath: localConfig.repo.localPath, pathspec: `:(glob)agents/**/${stem}.*` };
+  return agentOrigin(localConfig.repo.localPath, stem, tool, await loadModelAliases(localConfig));
+}
+
+/**
+ * Whether `file`, a copy of agent `stem` in `tool`'s agents directory, is
+ * teamai's to delete in a command the member ran (`teamai remove`,
+ * `uninstall`; #993): a built-in's name, on `previous`, the checkout's
+ * record, edited since or not, or a version of a team agent of that stem by
+ * the team history, verbatim or as teamai rendered it for `tool`. Read-only.
+ */
+export async function ownsAgentCopy(
+  localConfig: LocalConfig, file: string, stem: string, tool: string, previous: DeliveredHashes | undefined,
+): Promise<boolean> {
+  if (await isLink(file)) return false;
+  if (BUILTIN_AGENT_NAMES.has(stem) || previous?.[file] !== undefined) return true;
+  const origin = await removedAgentOrigin(localConfig, stem, tool);
+  return isTeamaiCopy(file, origin);
+}
+
+/**
  * What `tool` receives for `spec`, its model aliases resolved: the one
  * rendering pull writes and push compares against. Fails while the model
  * cannot be resolved, which holds the tool's copy.
@@ -1610,11 +1704,28 @@ function warnLegacyAlias(item: ResourceItem, content: string, aliases: ModelAlia
     + `so each tool receives "${model}" literally. Move it to ${item.relativePath.replace(/\.md$/, '.yaml')} to have the alias resolved.`);
 }
 
-/** Remove an obsolete same-stem native rendering after a format migration. */
-async function removeStaleAgentSiblings(agentsDir: string, stem: string, targetExt: string): Promise<void> {
+/**
+ * Remove an obsolete same-stem native rendering after a format migration:
+ * only a file the checkout's record or the team history (`origin`) proves
+ * teamai's (#993). A same-stem file of the member's stays, named.
+ */
+async function removeStaleAgentSiblings(
+  agentsDir: string, stem: string, targetExt: string, ledger: DeliveryLedger | undefined, origin: CopyOrigin | undefined,
+): Promise<void> {
   for (const file of await listFiles(agentsDir)) {
     if (agentStemFromFilename(file) !== stem || file === `${stem}${targetExt}`) continue;
-    await remove(path.join(agentsDir, file));
+    const sibling = path.join(agentsDir, file);
+    const removal = await judgeRemoval(ledger?.previous, sibling, origin, ledger?.otherRecords);
+    if (removal === 'edited') {
+      warnOnce(`Kept ${sibling}: teamai no longer writes ${stem} in this format, but you changed this copy. Delete it when you no longer need it.`);
+      continue;
+    }
+    if (removal === 'notTeamais') {
+      warnOnce(describeMembersDirLeft(sibling, `agents/${stem}`, 'pull'));
+      continue;
+    }
+    await remove(sibling);
+    if (ledger) forgetDelivered(ledger.hashes, sibling);
     log.debug(`Removed stale agent sibling ${file} for ${stem}`);
   }
 }

@@ -15,7 +15,9 @@ vi.mock('../config.js', async (importOriginal) => ({
   loadStateForScope: vi.fn(async () => mockState),
 }));
 
-vi.mock('../utils/git.js', () => ({
+vi.mock('../utils/git.js', async (importOriginal) => ({
+  // The history proof of an unrecorded copy reads the team repo (#993).
+  createGit: (await importOriginal<typeof import('../utils/git.js')>()).createGit,
   pullRepo: vi.fn(),
   pushRepoBranch: vi.fn().mockResolvedValue(true),
   generateBranchName: vi.fn().mockReturnValue('teamai/push/test/20260305-120000'),
@@ -40,6 +42,7 @@ vi.mock('../utils/logger.js', () => ({
 import { RulesHandler } from '../resources/rules.js';
 import { SkillsHandler } from '../resources/skills.js';
 import type { TeamaiConfig, LocalConfig } from '../types.js';
+import { commitTeamRepo } from './helpers/team-repo-history.js';
 
 describe('RulesHandler.removeItem', () => {
   let tmpDir: string;
@@ -189,8 +192,9 @@ scope: 'user',
       mockState.placedRules = { 'my-rule': 'rules/fe-know/my-rule.md' };
       // The author's own copy, and the namespaced one a member would receive.
       await fse.writeFile(path.join(homeDir, '.claude', 'rules', 'my-rule.md'), 'local');
-      await fse.outputFile(path.join(homeDir, '.claude', 'rules', 'fe-know', 'my-rule.md'), 'local');
+      await fse.outputFile(path.join(homeDir, '.claude', 'rules', 'fe-know', 'my-rule.md'), 'team content');
 
+      commitTeamRepo(localConfig.repo.localPath);
       const removed = await handler.removeItem('fe-know/my-rule', teamConfig, localConfig);
 
       expect(await fse.pathExists(
@@ -213,6 +217,7 @@ scope: 'user',
     await fse.writeFile(path.join(homeDir, '.codex', 'rules', 'my-rule.md'), 'rule content');
     await fse.writeFile(path.join(homeDir, '.claude-internal', 'rules', 'my-rule.md'), 'rule content');
 
+    commitTeamRepo(localConfig.repo.localPath);
     const removed = await handler.removeItem('my-rule', teamConfig, localConfig);
 
     expect(removed.length).toBe(4); // team repo + 3 tools
@@ -232,6 +237,7 @@ scope: 'user',
     await fse.writeFile(path.join(homeDir, '.claude', 'rules', 'my-rule.md'), 'rule content');
     await fse.writeFile(path.join(homeDir, '.codex', 'rules', 'my-rule.md'), 'rule content');
 
+    commitTeamRepo(localConfig.repo.localPath);
     const removed = await handler.removeItem('my-rule', teamConfig, { ...localConfig, enabledAgents: ['claude'] });
 
     expect(await fse.pathExists(path.join(homeDir, '.claude', 'rules', 'my-rule.md'))).toBe(false);
@@ -245,6 +251,7 @@ scope: 'user',
     await fse.writeFile(path.join(localConfig.repo.localPath, 'rules', 'partial-rule.md'), 'content');
     await fse.writeFile(path.join(homeDir, '.claude', 'rules', 'partial-rule.md'), 'content');
 
+    commitTeamRepo(localConfig.repo.localPath);
     const removed = await handler.removeItem('partial-rule', teamConfig, localConfig);
 
     expect(removed.length).toBe(2); // team repo + claude only
@@ -262,6 +269,7 @@ scope: 'user',
     await fse.writeFile(path.join(homeDir, '.claude', 'rules', 'keep-me.md'), 'keep');
     await fse.writeFile(path.join(homeDir, '.claude', 'rules', 'delete-me.md'), 'delete');
 
+    commitTeamRepo(localConfig.repo.localPath);
     await handler.removeItem('delete-me', teamConfig, localConfig);
 
     expect(await fse.pathExists(path.join(localConfig.repo.localPath, 'rules', 'keep-me.md'))).toBe(true);
@@ -337,6 +345,8 @@ scope: 'user',
     const codexSkill = path.join(homeDir, '.codex', 'skills', 'my-skill');
     await fse.ensureDir(codexSkill);
     await fse.writeFile(path.join(codexSkill, 'SKILL.md'), '# My Skill');
+    // The copies hold a team version: teamai's by the history (#993).
+    commitTeamRepo(localConfig.repo.localPath);
 
     const removed = await handler.removeItem('my-skill', teamConfig, localConfig);
 
@@ -359,6 +369,8 @@ scope: 'user',
     const codexSkill = path.join(homeDir, '.codex', 'skills', 'my-skill');
     await fse.ensureDir(codexSkill);
     await fse.writeFile(path.join(codexSkill, 'SKILL.md'), '# My Skill');
+    // The copies hold a team version: teamai's by the history (#993).
+    commitTeamRepo(localConfig.repo.localPath);
 
     const removed = await handler.removeItem('my-skill', teamConfig, { ...localConfig, enabledAgents: ['claude'] });
 
@@ -841,6 +853,7 @@ scope: 'user',
       await fse.writeFile(path.join(homeDir, '.claude/rules', 'shared-rule.md'), '# Shared');
 
       // Remove it from team repo
+      commitTeamRepo(repoPath);
       await handler.removeItem('shared-rule', teamConfig, localConfig);
 
       // Local file still exists (simulates another user's state)

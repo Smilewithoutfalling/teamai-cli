@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import { realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { resolveAnchors, listWorktrees } from '../utils/git.js';
+import { resolveAnchors, listWorktrees, parseWorktreeList } from '../utils/git.js';
 import { defaultProjectSlug } from '../codebase-extract.js';
 
 // ─── Real-git tests for resolveAnchors (issue #374 P0) ──────────────────────
@@ -238,5 +238,44 @@ describe('listWorktrees', () => {
 
   it('returns [] for a directory that no longer exists', async () => {
     expect(await listWorktrees(path.join(os.tmpdir(), 'teamai-gone-', String(process.pid), 'project'))).toEqual([]);
+  });
+
+  it('leaves out the git directory a --separate-git-dir repo lists as its main entry (#993)', async () => {
+    const checkout = path.join(base, 'sep');
+    const gitDir = path.join(base, 'sep-git', 'proj.git');
+    fs.mkdirSync(checkout);
+    fs.mkdirSync(path.dirname(gitDir));
+    git(checkout, 'init', '-q', `--separate-git-dir=${gitDir}`);
+    git(checkout, '-c', 'user.email=test@example.com', '-c', 'user.name=Test', 'commit', '--allow-empty', '-q', '-m', 'init');
+    const linked = path.join(base, 'sep-wt');
+    git(checkout, 'worktree', 'add', '-q', linked, 'HEAD');
+
+    expect(await listWorktrees(checkout)).toEqual([linked]);
+  });
+});
+
+describe('parseWorktreeList (#993)', () => {
+  // `git worktree list --porcelain -z`: NUL ends each attribute, an empty field each entry.
+  const z = (...entries: string[][]): string => entries.map((fields) => `${fields.join('\0')}\0\0`).join('');
+
+  it('keeps a path that contains a newline whole', () => {
+    const output = z(
+      ['worktree /repo', 'HEAD 1111111111111111111111111111111111111111', 'branch refs/heads/main'],
+      ['worktree /work/odd\nname', 'HEAD 2222222222222222222222222222222222222222', 'detached'],
+    );
+    expect(parseWorktreeList(output).map((entry) => entry.path)).toEqual(['/repo', '/work/odd\nname']);
+  });
+
+  it('marks bare and prunable entries, whatever the prunable reason says', () => {
+    const output = z(
+      ['worktree /srv/proj.git', 'bare'],
+      ['worktree /work/gone', 'HEAD 3333333333333333333333333333333333333333', 'detached', 'prunable gitdir file points to non-existent location'],
+      ['worktree /work/live', 'HEAD 4444444444444444444444444444444444444444', 'branch refs/heads/live', 'locked reason\nwith a newline'],
+    );
+    expect(parseWorktreeList(output)).toEqual([
+      { path: '/srv/proj.git', bare: true, prunable: false },
+      { path: '/work/gone', bare: false, prunable: true },
+      { path: '/work/live', bare: false, prunable: false },
+    ]);
   });
 });

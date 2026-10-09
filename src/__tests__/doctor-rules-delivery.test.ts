@@ -24,6 +24,7 @@ import { loadLocalConfig, loadStateForScope, loadTeamConfig } from '../config.js
 import { buildChecks, doctor, resolveDoctorContext, type Check, type DoctorReport } from '../doctor.js';
 import { checkoutKey } from '../pull.js';
 import { StateSchema, TeamaiConfigSchema, type LocalConfig, type TeamaiConfig } from '../types.js';
+import { commitTeamRepo } from './helpers/team-repo-history.js';
 
 /**
  * The rules half of the delivery check (#624). A rule changes both its filename
@@ -86,6 +87,7 @@ describe('doctor — rules delivered on disk', () => {
   }
 
   async function checks(): Promise<Check[]> {
+    commitTeamRepo(repoPath);
     const ctx = await resolveDoctorContext();
     if (!ctx) throw new Error('expected a resolved doctor context');
     return buildChecks(ctx);
@@ -214,7 +216,8 @@ describe('doctor — rules delivered on disk', () => {
 
     const cursor = await rulesCheck('cursor');
     expect(await cursor.check()).toBe(false);
-    expect(cursor.fix).toContain('delivered from an older copy: reviews');
+    // No team version holds those globs and nothing records teamai writing them: pull keeps it (#993).
+    expect(cursor.fix).toContain("not teamai's (kept by pull): reviews");
   });
 
   it('reports a .md copy whose body drifted from the team rule', async () => {
@@ -227,7 +230,9 @@ describe('doctor — rules delivered on disk', () => {
 
     const claude = await rulesCheck('claude');
     expect(await claude.check()).toBe(false);
-    expect(claude.fix).toContain('delivered from an older copy: reviews');
+    // No team version holds that body and nothing records teamai writing it: pull keeps it (#993).
+    expect(claude.fix).toContain("not teamai's (kept by pull): reviews");
+    expect(claude.fix).toContain(`Kept ${drifted}: it is not teamai's`);
   });
 
   it.each([
@@ -247,7 +252,8 @@ describe('doctor — rules delivered on disk', () => {
     await fse.writeFile(reviews, `${frontmatter.replace('**/*.ts', '**/*.py')}Body of reviews\n`);
     const check = await rulesCheck(tool);
     expect(await check.check()).toBe(false);
-    expect(check.fix).toContain('delivered from an older copy: reviews');
+    // A hand edit with no record is the member's: pull keeps it (#993).
+    expect(check.fix).toContain("not teamai's (kept by pull): reviews");
     expect(check.fix).toContain(fields);
     expect(check.fix).not.toContain('.mdc');
   });

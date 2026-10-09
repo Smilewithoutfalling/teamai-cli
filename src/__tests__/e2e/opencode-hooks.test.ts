@@ -25,7 +25,6 @@ async function freePort(): Promise<number> {
 // V2 is distributed separately; CI can opt in with its installed binary.
 describe.each([{ version: 'V1', binary: V1 }, { version: 'V2', binary: V2 }])('real OpenCode $version hooks', ({ version, binary }) => {
   it.skipIf(!binary)('loads the CLI-generated plugin and dispatches session start once', async () => {
-    if (version === 'V1') execFileSync(process.execPath, ['node_modules/opencode-ai/postinstall.mjs'], { cwd: ROOT, stdio: 'pipe' });
     const sandbox = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-oc-hooks-e2e-')));
     const home = path.join(sandbox, 'home');
     const work = path.join(sandbox, 'work');
@@ -47,6 +46,13 @@ describe.each([{ version: 'V1', binary: V1 }, { version: 'V2', binary: V2 }])('r
     fs.writeFileSync(path.join(team, 'teamai.yaml'), `team: opencode-hooks-e2e\nrepo: ${team}\nprovider: tgit\ntoolPaths:\n  opencode:\n    skills: .opencode/skills\n`);
     fs.writeFileSync(path.join(home, '.teamai/config.yaml'), `repo:\n  localPath: ${team}\n  remote: ${team}\nusername: ci\nscope: user\nenabledAgents:\n  - opencode\n`);
     fs.writeFileSync(path.join(env.OPENCODE_CONFIG_DIR, 'opencode.json'), '{}');
+    // With any plugin configured, OpenCode's first request for a directory waits
+    // until it has npm-installed @opencode-ai/plugin into its config dir: a
+    // registry fetch that, when slow, outlasts the session request below (CI).
+    // teamai's plugins import nothing from it, so record it as installed; with
+    // node_modules present and the name locked, OpenCode installs nothing.
+    fs.mkdirSync(path.join(env.OPENCODE_CONFIG_DIR, 'node_modules'));
+    fs.writeFileSync(path.join(env.OPENCODE_CONFIG_DIR, 'package-lock.json'), JSON.stringify({ packages: { '': { dependencies: { '@opencode-ai/plugin': '*' } } } }));
     const shim = path.join(bin, 'capture.cjs');
     fs.writeFileSync(shim, `let stdin='';process.stdin.on('data',d=>stdin+=d);process.stdin.on('end',()=>require('node:fs').appendFileSync(${JSON.stringify(records)},JSON.stringify({args:process.argv.slice(2),payload:JSON.parse(stdin)})+'\\n'));`);
     fs.writeFileSync(path.join(bin, process.platform === 'win32' ? 'teamai.cmd' : 'teamai'), process.platform === 'win32'
@@ -60,17 +66,17 @@ describe.each([{ version: 'V1', binary: V1 }, { version: 'V2', binary: V2 }])('r
       await applyOpencodeAgentHook({ slug: 'start-proof', event: 'SessionStart', command: `node -e ${JSON.stringify(`require('node:fs').appendFileSync(${JSON.stringify(commands)},'start\\n')`)}`, baseDir: home, scope: 'user' });
       const port = await freePort();
       const url = `http://127.0.0.1:${port}`;
-      server = spawn(binary!, ['serve', '--hostname', '127.0.0.1', '--port', String(port)], { env, cwd: work, stdio: ['ignore', 'pipe', 'pipe'] });
+      server = spawn(binary!, ['serve', '--print-logs', '--hostname', '127.0.0.1', '--port', String(port)], { env, cwd: work, stdio: ['ignore', 'pipe', 'pipe'] });
       server.stdout?.on('data', (data: Buffer) => { logs += data.toString(); });
       server.stderr?.on('data', (data: Buffer) => { logs += data.toString(); });
       const auth = Buffer.from(`opencode:${version === 'V1' ? env.OPENCODE_SERVER_PASSWORD : env.OPENCODE_PASSWORD}`).toString('base64');
-      const request = async (route: string, body?: unknown) => {
+      const request = async (route: string, body?: unknown, timeout = 5_000) => {
         if (version === 'V2') {
-          const output = execFileSync(binary!, ['api', '--server', url, body ? 'POST' : 'GET', route, ...(body ? ['--data', JSON.stringify(body)] : [])], { env, cwd: work, encoding: 'utf8', timeout: 5_000, stdio: ['ignore', 'pipe', 'pipe'] });
+          const output = execFileSync(binary!, ['api', '--server', url, body ? 'POST' : 'GET', route, ...(body ? ['--data', JSON.stringify(body)] : [])], { env, cwd: work, encoding: 'utf8', timeout, stdio: ['ignore', 'pipe', 'pipe'] });
           const response = JSON.parse(output) as Record<string, unknown>;
           return (response.data ?? response) as Record<string, unknown>;
         }
-        const response = await fetch(`${url}${route}`, { method: body ? 'POST' : 'GET', headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json' }, signal: AbortSignal.timeout(5_000), ...(body ? { body: JSON.stringify(body) } : {}) });
+        const response = await fetch(`${url}${route}`, { method: body ? 'POST' : 'GET', headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json' }, signal: AbortSignal.timeout(timeout), ...(body ? { body: JSON.stringify(body) } : {}) });
         if (!response.ok) throw new Error(`${route}: ${response.status}`);
         return response.json() as Promise<Record<string, unknown>>;
       };
@@ -82,14 +88,23 @@ describe.each([{ version: 'V1', binary: V1 }, { version: 'V2', binary: V2 }])('r
           return ['teamai.hooks', 'teamai.agent.start-proof'].map((id) => plugins.find((p) => p.id === id)?.state.status);
         }, { timeout: 20_000 }).toEqual(['active', 'active']);
       }
-      const session = await request(version === 'V1' ? '/session' : '/api/session', version === 'V1' ? {} : { location: { directory: work } });
+      // The first session can still install the config-dir plugins' npm dependencies, which takes seconds and varies with load.
+      const session = await request(version === 'V1' ? '/session' : '/api/session', version === 'V1' ? {} : { location: { directory: work } }, 20_000)
+        .catch((error: unknown) => { throw new Error(`Creating the session failed: ${String(error)}\nOpenCode server log:\n${logs}`); });
       const dispatches = () => fs.existsSync(records) ? fs.readFileSync(records, 'utf8').trim().split('\n').map((line) => JSON.parse(line) as { args: string[]; payload: Record<string, unknown> }) : [];
       await expect.poll(() => dispatches().length, { timeout: 10_000 }).toBe(1);
       expect(dispatches()).toEqual([{ args: ['hook-dispatch', 'session-start', '--tool', 'opencode'], payload: { cwd: work, session_id: session.id } }]);
       await expect.poll(() => fs.existsSync(commands) ? fs.readFileSync(commands, 'utf8') : '', { timeout: 10_000 }).toBe('start\n');
       expect(logs).not.toContain('Plugin must export a default definition');
     } finally {
-      if (server && server.exitCode === null) { const closed = once(server, 'close'); server.kill(); await closed; }
+      if (server && server.exitCode === null) {
+        // OpenCode ignores SIGTERM while an aborted session request is in flight; force it so cleanup cannot mask the failure.
+        const closed = once(server, 'close');
+        server.kill();
+        const force = setTimeout(() => server?.kill('SIGKILL'), 3_000);
+        await closed;
+        clearTimeout(force);
+      }
       fs.rmSync(sandbox, { recursive: true, force: true });
     }
   });

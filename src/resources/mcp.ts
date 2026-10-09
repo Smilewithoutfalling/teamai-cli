@@ -78,6 +78,12 @@ function parseMcpContent(content: string | null): McpYamlRead {
   }
 }
 
+/** The servers one MCP file's text declares, or null when it does not parse: for reading a past revision. */
+export function parseTeamMcpServers(content: string): TeamMcpServer[] | null {
+  const read = parseMcpContent(content);
+  return read.ok ? read.yaml?.servers ?? [] : null;
+}
+
 /** How `mcp/mcp.yaml` and `mcp/<ns>/mcp.yaml` are read for delivery. */
 export const mcpEntryReader: EntryReader<TeamMcpServer> = {
   type: 'mcp',

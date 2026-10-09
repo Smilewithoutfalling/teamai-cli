@@ -596,7 +596,7 @@ describe('local-agent: MCP install/uninstall commands', () => {
     expect(acks[0].version).toBe('1.0.0');
 
     // MCP 配置已写入 tool config
-    const mcpConfig = await fse.readJson(path.join(tmpDir, '.codebuddy', 'mcp.json'));
+    const mcpConfig = await fse.readJson(path.join(tmpDir, '.codebuddy', '.mcp.json'));
     expect(mcpConfig.mcpServers.clawpro).toBeDefined();
     expect(mcpConfig.mcpServers.clawpro.url).toBe('https://clawpro.example.com/api/mcp/builtin/clawpro');
     expect(mcpConfig.mcpServers.clawpro.type).toBe('http');
@@ -666,7 +666,7 @@ describe('local-agent: MCP install/uninstall commands', () => {
 
     expect(acks[0].status).toBe('success');
 
-    const mcpConfig = await fse.readJson(path.join(tmpDir, '.codebuddy', 'mcp.json'));
+    const mcpConfig = await fse.readJson(path.join(tmpDir, '.codebuddy', '.mcp.json'));
     const server = mcpConfig.mcpServers['local-tools'];
     expect(server).toBeDefined();
     expect(server.type).toBeUndefined();
@@ -710,7 +710,7 @@ describe('local-agent: MCP install/uninstall commands', () => {
     expect(acks[0].status).toBe('success');
     expect(acks[0].version).toBe('2.0.0');
 
-    const mcpConfig = await fse.readJson(path.join(tmpDir, '.codebuddy', 'mcp.json'));
+    const mcpConfig = await fse.readJson(path.join(tmpDir, '.codebuddy', '.mcp.json'));
     expect(mcpConfig.mcpServers.clawpro.url).toBe('https://new.example.com/mcp');
   });
 
@@ -786,7 +786,7 @@ describe('local-agent: MCP install/uninstall commands', () => {
     });
 
     // 验证安装成功
-    const before = await fse.readJson(path.join(tmpDir, '.codebuddy', 'mcp.json'));
+    const before = await fse.readJson(path.join(tmpDir, '.codebuddy', '.mcp.json'));
     expect(before.mcpServers.clawpro).toBeDefined();
 
     // 卸载
@@ -803,7 +803,7 @@ describe('local-agent: MCP install/uninstall commands', () => {
     expect(acks[0].status).toBe('success');
 
     // server 已从 tool config 移除
-    const after = await fse.readJson(path.join(tmpDir, '.codebuddy', 'mcp.json'));
+    const after = await fse.readJson(path.join(tmpDir, '.codebuddy', '.mcp.json'));
     expect(after.mcpServers.clawpro).toBeUndefined();
 
     // manifest 也已清理
@@ -997,7 +997,8 @@ describe('local-agent: MCP install/uninstall commands', () => {
       expect(await fse.readFile(path.join(wsPath, '.git', 'info', 'exclude'), 'utf-8')).toMatch(/^\/\.mcp\.json$/m);
     });
 
-    it('says the next session tries again when that sync cannot list the file, and calls it a credential', async () => {
+    // root ignores the read-only bit, so the write it expects to fail succeeds.
+    it.skipIf(process.getuid?.() === 0)('says the next session tries again when that sync cannot list the file, and calls it a credential', async () => {
       await install(9105, bearer);
       const excludeFile = path.join(wsPath, '.git', 'info', 'exclude');
       await fse.writeFile(excludeFile, '');
@@ -1077,7 +1078,8 @@ describe('local-agent: MCP install/uninstall commands', () => {
       expect(git('status', '--porcelain', '--untracked-files=all', '--', '.github/mcp.json')).toBe('');
     });
 
-    it('still lists that config when an install replacing its entry with a bare command cannot write the file', async () => {
+    // root ignores the directory's read-only bit, so the write it expects to fail succeeds.
+    it.skipIf(process.getuid?.() === 0)('still lists that config when an install replacing its entry with a bare command cannot write the file', async () => {
       await install(9105, bearer);
       await fse.writeFile(path.join(wsPath, '.git', 'info', 'exclude'), '');
       await fse.remove(await workspaceFile('managed-mcp-files.json'));
@@ -1192,7 +1194,7 @@ describe('local-agent: MCP install/uninstall commands', () => {
     expect(acks.find((a) => a.id === 9031)?.status).toBe('success');
     expect(acks.find((a) => a.id === 9032)?.status).toBe('success');
 
-    const mcpConfig = await fse.readJson(path.join(tmpDir, '.codebuddy', 'mcp.json'));
+    const mcpConfig = await fse.readJson(path.join(tmpDir, '.codebuddy', '.mcp.json'));
     expect(mcpConfig.mcpServers['new-server']).toBeDefined();
     expect(mcpConfig.mcpServers['temp-server']).toBeUndefined();
   });
@@ -1269,5 +1271,117 @@ describe('local-agent: MCP install/uninstall commands', () => {
         expect.objectContaining({ slug: 'codebuddy-only-mcp', source: 'enterprise' }),
       ]),
     );
+  });
+
+  // CodeBuddy reads only the first user MCP file that exists of ~/.codebuddy/.mcp.json,
+  // ~/.codebuddy/mcp.json and ~/.codebuddy.json (#993): an HTTP-backed team's servers go there too.
+  describe('CodeBuddy user MCP file (#993)', () => {
+    const dotMcp = (): string => path.join(tmpDir, '.codebuddy', '.mcp.json');
+    const mcp = (): string => path.join(tmpDir, '.codebuddy', 'mcp.json');
+    const install = (id: number, url: string) => runResponse({ cmds: [{
+      id, type: 'install_mcp', scope: 'user', slug: 'tm-user', version: String(id),
+      mcp_config: { transport: 'http', url },
+    }] });
+    const uninstall = (id: number) => runResponse({ cmds: [{ id, type: 'uninstall_mcp', scope: 'user', slug: 'tm-user', version: '1' }] });
+    const MEMBER = { command: 'my-user-server' };
+
+    it('installs beside the member\'s servers in ~/.codebuddy/.mcp.json, and uninstalls from there', async () => {
+      await fse.outputJson(dotMcp(), { mcpServers: { 'my-user': MEMBER } });
+
+      expect((await install(9601, 'https://team.example.com/mcp'))[0].status).toBe('success');
+      expect((await fse.readJson(dotMcp())).mcpServers).toEqual({
+        'my-user': MEMBER, 'tm-user': { type: 'http', url: 'https://team.example.com/mcp' },
+      });
+      expect(await fse.pathExists(mcp())).toBe(false);
+
+      expect((await uninstall(9602))[0].status).toBe('success');
+      expect((await fse.readJson(dotMcp())).mcpServers).toEqual({ 'my-user': MEMBER });
+    });
+
+    it('creates ~/.codebuddy/.mcp.json when no CodeBuddy user MCP file exists', async () => {
+      expect((await install(9603, 'https://team.example.com/mcp'))[0].status).toBe('success');
+      expect((await fse.readJson(dotMcp())).mcpServers['tm-user']).toBeDefined();
+      expect(await fse.pathExists(mcp())).toBe(false);
+    });
+
+    it('follows the file an earlier install recorded: uninstall removes it there, a new install moves it', async () => {
+      await fse.outputJson(mcp(), { mcpServers: { 'mine-old': MEMBER } });
+      await install(9604, 'https://old.example.com/mcp');
+      // An agent from before #993 recorded no file.
+      const manifestPath = path.join(tmpDir, '.teamai', 'managed-mcp.json');
+      const manifest = await fse.readJson(manifestPath);
+      for (const record of manifest.codebuddy) delete record.file;
+      await fse.writeJson(manifestPath, manifest);
+      // The member then runs `codebuddy mcp add -s user`, which creates the file CodeBuddy reads first.
+      await fse.outputJson(dotMcp(), { mcpServers: { 'my-user': MEMBER } });
+
+      expect((await install(9605, 'https://new.example.com/mcp'))[0].status).toBe('success');
+      expect((await fse.readJson(dotMcp())).mcpServers).toEqual({
+        'my-user': MEMBER, 'tm-user': { type: 'http', url: 'https://new.example.com/mcp' },
+      });
+      expect((await fse.readJson(mcp())).mcpServers).toEqual({ 'mine-old': MEMBER });
+
+      expect((await uninstall(9606))[0].status).toBe('success');
+      expect((await fse.readJson(dotMcp())).mcpServers).toEqual({ 'my-user': MEMBER });
+    });
+
+    it('keeps the old file\'s record when moving a server to the file CodeBuddy now reads fails', async () => {
+      await fse.outputJson(mcp(), { mcpServers: { 'mine-old': MEMBER } });
+      await install(9613, 'https://old.example.com/mcp');
+      await fse.outputJson(dotMcp(), { mcpServers: { 'my-user': MEMBER } });
+      await fse.chmod(dotMcp(), 0o444);
+      await fse.chmod(path.dirname(dotMcp()), 0o555);
+      try {
+        expect((await install(9614, 'https://new.example.com/mcp'))[0].status).toBe('failed');
+      } finally {
+        await fse.chmod(path.dirname(dotMcp()), 0o755);
+        await fse.chmod(dotMcp(), 0o644);
+      }
+      // Still recorded where it is: uninstall finds it there.
+      expect((await uninstall(9615))[0].status).toBe('success');
+      expect((await fse.readJson(mcp())).mcpServers).toEqual({ 'mine-old': MEMBER });
+      expect((await fse.readJson(dotMcp())).mcpServers).toEqual({ 'my-user': MEMBER });
+    });
+
+    it('moving a server to the file CodeBuddy now reads keeps the old copy the member edited', async () => {
+      await fse.outputJson(mcp(), { mcpServers: { 'mine-old': MEMBER } });
+      await install(9611, 'https://old.example.com/mcp');
+      const edited = { type: 'http', url: 'https://old.example.com/mcp', headers: { 'X-Mine': '1' } };
+      const old = await fse.readJson(mcp());
+      old.mcpServers['tm-user'] = edited;
+      await fse.writeJson(mcp(), old);
+      await fse.outputJson(dotMcp(), { mcpServers: { 'my-user': MEMBER } });
+
+      expect((await install(9612, 'https://new.example.com/mcp'))[0].status).toBe('success');
+      expect((await fse.readJson(dotMcp())).mcpServers['tm-user']).toEqual({ type: 'http', url: 'https://new.example.com/mcp' });
+      expect((await fse.readJson(mcp())).mcpServers).toEqual({ 'mine-old': MEMBER, 'tm-user': edited });
+    });
+
+    it('keeps an older record that names no file when ~/.codebuddy/.mcp.json links to mcp.json', async () => {
+      await fse.outputJson(mcp(), { mcpServers: { 'mine-old': MEMBER } });
+      await install(9609, 'https://old.example.com/mcp');
+      const manifestPath = path.join(tmpDir, '.teamai', 'managed-mcp.json');
+      const manifest = await fse.readJson(manifestPath);
+      for (const record of manifest.codebuddy) delete record.file;
+      await fse.writeJson(manifestPath, manifest);
+      // One file under both names: CodeBuddy's first lookup file is a link to the second.
+      await fse.symlink('mcp.json', dotMcp());
+
+      expect((await install(9610, 'https://new.example.com/mcp'))[0].status).toBe('success');
+      expect((await fse.readJson(mcp())).mcpServers).toEqual({
+        'mine-old': MEMBER, 'tm-user': { type: 'http', url: 'https://new.example.com/mcp' },
+      });
+      expect((await fse.lstat(dotMcp())).isSymbolicLink()).toBe(true);
+    });
+
+    it('uninstall removes a server from the file it was recorded in, which CodeBuddy no longer reads', async () => {
+      await fse.outputJson(mcp(), { mcpServers: { 'mine-old': MEMBER } });
+      await install(9607, 'https://team.example.com/mcp');
+      await fse.outputJson(dotMcp(), { mcpServers: { 'my-user': MEMBER } });
+
+      expect((await uninstall(9608))[0].status).toBe('success');
+      expect((await fse.readJson(mcp())).mcpServers).toEqual({ 'mine-old': MEMBER });
+      expect((await fse.readJson(dotMcp())).mcpServers).toEqual({ 'my-user': MEMBER });
+    });
   });
 });

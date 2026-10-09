@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll } from 'vitest';
-import { spawn } from 'node:child_process';
+import { execSync, spawn } from 'node:child_process';
 import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -280,13 +280,47 @@ describe('source code checks', () => {
 
 // ─── Remote E2E tests (require token + repo) ─────────────
 
+// The remote suite runs as the user-scope member of TEAMAI_TEST_REPO_URL. HOME
+// is the e2e sandbox (helpers/isolate-e2e-env.ts), so clone the team repo into
+// it and write the config there. Supports GitHub (TEAMAI_TEST_PROVIDER=github)
+// and TGit (default).
+function prepareRemoteTeamHome(): void {
+  const teamaiHome = path.join(process.env.HOME ?? '', '.teamai');
+  const repoPath = path.join(teamaiHome, 'team-repo');
+  const testRepoUrl = process.env.TEAMAI_TEST_REPO_URL ?? '';
+  const provider = (process.env.TEAMAI_TEST_PROVIDER ?? 'tgit').toLowerCase();
+  const defaultHost = provider === 'github' ? 'github.com' : 'git.woa.com';
+  const cloneUrl = testRepoUrl.startsWith('http')
+    ? testRepoUrl
+    : `https://${defaultHost}/${testRepoUrl}.git`;
+  const cloneCmd =
+    provider === 'github'
+      ? `git clone "https://x-access-token:${process.env.TEAMAI_TEST_TOKEN}@${cloneUrl.replace(/^https?:\/\//, '')}" "${repoPath}"`
+      : `git clone -c "http.extraHeader=PRIVATE-TOKEN: ${process.env.TEAMAI_TEST_TOKEN}" "${cloneUrl}" "${repoPath}"`;
+
+  fs.mkdirSync(teamaiHome, { recursive: true });
+  execSync(cloneCmd, { stdio: 'pipe' });
+  fs.writeFileSync(
+    path.join(teamaiHome, 'config.yaml'),
+    [
+      `repo:`,
+      `  localPath: ${repoPath}`,
+      `  remote: ${testRepoUrl}`,
+      `username: ci`,
+      `updatePolicy: auto`,
+    ].join('\n'),
+  );
+}
+
 describe('remote commands', () => {
   beforeAll(() => {
     if (!CAN_RUN_REMOTE) {
       console.log(
         '⏭  Skipping remote E2E tests: TEAMAI_TEST_TOKEN or TEAMAI_TEST_REPO_URL not set',
       );
+      return;
     }
+    prepareRemoteTeamHome();
   });
 
   it.skipIf(!CAN_RUN_REMOTE)(
@@ -621,37 +655,8 @@ describe('remote commands', () => {
       const teamaiHome = path.join(process.env.HOME ?? '', '.teamai');
       expect(fs.existsSync(path.join(teamaiHome, 'config.yaml'))).toBe(false);
 
-      // Step 3: Restore for subsequent CI steps — write minimal config + clone repo
-      const testRepoUrl = process.env.TEAMAI_TEST_REPO_URL ?? '';
-      const repoPath = path.join(teamaiHome, 'team-repo');
-      fs.mkdirSync(teamaiHome, { recursive: true });
-
-      // Clone the repo back (uninstall removed it).
-      // Supports both GitHub (via TEAMAI_TEST_PROVIDER=github) and TGit (default).
-      const { execSync } = await import('node:child_process');
-      const provider = (process.env.TEAMAI_TEST_PROVIDER ?? 'tgit').toLowerCase();
-      const defaultHost = provider === 'github' ? 'github.com' : 'git.woa.com';
-      const cloneUrl = testRepoUrl.startsWith('http')
-        ? testRepoUrl
-        : `https://${defaultHost}/${testRepoUrl}.git`;
-
-      const cloneCmd =
-        provider === 'github'
-          ? `git clone "https://x-access-token:${process.env.TEAMAI_TEST_TOKEN}@${cloneUrl.replace(/^https?:\/\//, '')}" "${repoPath}"`
-          : `git clone -c "http.extraHeader=PRIVATE-TOKEN: ${process.env.TEAMAI_TEST_TOKEN}" "${cloneUrl}" "${repoPath}"`;
-
-      execSync(cloneCmd, { stdio: 'pipe' });
-
-      fs.writeFileSync(
-        path.join(teamaiHome, 'config.yaml'),
-        [
-          `repo:`,
-          `  localPath: ${repoPath}`,
-          `  remote: ${testRepoUrl}`,
-          `username: ci`,
-          `updatePolicy: auto`,
-        ].join('\n'),
-      );
+      // Step 3: Restore for subsequent tests (uninstall removed the clone)
+      prepareRemoteTeamHome();
 
       // Verify pull works after restore (may sync skills or report no resources depending on test repo)
       const pullResult = await runCLI(['pull']);

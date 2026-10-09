@@ -232,6 +232,8 @@ describe('Copilot MCP reconciliation', () => {
       server: LOCAL_SERVER,
       action: 'skipped',
       reason: 'a server with this name already exists and is not managed by teamai',
+      file: projectFile,
+      member: true,
     });
     expect(after[LOCAL_SERVER]).toEqual(existingLocal);
     expect(after[USER_SERVER]).toEqual(existingUser);

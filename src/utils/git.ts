@@ -907,30 +907,126 @@ async function readAnchors(cwd?: string): Promise<ProjectAnchors | null> {
   }
 }
 
+/** One entry of `git worktree list --porcelain -z`. */
+export interface WorktreeListEntry {
+  path: string;
+  bare: boolean;
+  prunable: boolean;
+}
+
 /**
- * List the realpath'd top-level directory of every worktree of the repo that
- * contains `cwd` (main checkout + all linked worktrees), from
- * `git worktree list --porcelain`. Returns [] outside a git repo, or when `cwd`
- * does not exist. Used by a project-wide uninstall to clean each worktree's
- * managed resources before the shared partition is deleted (issue #374 P1-2C).
+ * Parse `git worktree list --porcelain -z`: each attribute ends with NUL and
+ * each entry with an extra NUL, so a path (or a lock reason) holding a newline
+ * stays whole (#993).
  */
-export async function listWorktrees(cwd?: string): Promise<string[]> {
+export function parseWorktreeList(output: string): WorktreeListEntry[] {
+  const entries: WorktreeListEntry[] = [];
+  let entry: WorktreeListEntry | null = null;
+  for (const field of output.split('\0')) {
+    if (field.startsWith('worktree ')) {
+      entry = { path: field.slice('worktree '.length), bare: false, prunable: false };
+      entries.push(entry);
+    } else if (entry && field === 'bare') {
+      entry.bare = true;
+    } else if (entry && (field === 'prunable' || field.startsWith('prunable '))) {
+      entry.prunable = true;
+    }
+  }
+  return entries;
+}
+
+/**
+ * The realpath of the git common directory of the repository containing
+ * `cwd`, shared by its main checkout and every linked worktree, or null when
+ * git cannot tell (no repository, a missing directory, a worktree whose git
+ * directory was pruned).
+ */
+export async function gitCommonDir(cwd: string): Promise<string | null> {
+  try {
+    // Inside the try: simple-git throws at once for a directory that does not exist.
+    const out = await createGit(cwd).revparse(['--git-common-dir']);
+    return await realpath(path.resolve(cwd, out.replace(/\r?\n$/, '')));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether `root` is still a checkout of the repository whose common directory
+ * is `commonDir` (see gitCommonDir): it holds a `.git` entry, and git there
+ * names the same common directory. A removed worktree fails the first test, a
+ * pruned one the second. Probed per checkout because `git worktree list` does
+ * not list the main checkout of a `--separate-git-dir` repo or a submodule
+ * (#993).
+ */
+export async function isLiveCheckout(root: string, commonDir: string): Promise<boolean> {
+  if (!await fse.pathExists(path.join(root, '.git'))) return false;
+  return await gitCommonDir(root) === commonDir;
+}
+
+/** A `git worktree list` entry, with `path` realpath'd and `listed` as git printed it. */
+interface ListedWorktree extends WorktreeListEntry {
+  listed: string;
+}
+
+/**
+ * The entries of `git worktree list --porcelain -z` for the repo containing
+ * `cwd`, or null when git fails: outside a repository, a missing `cwd`, or git
+ * older than 2.36, which has no `-z`. With `newlineSplit`, the entries of
+ * `git worktree list --porcelain` instead, split on newlines, which cuts a
+ * path holding one: never a proof of liveness (#993).
+ */
+async function readWorktreeList(cwd?: string, newlineSplit = false): Promise<ListedWorktree[] | null> {
   let list: string;
   try {
     // Inside the try: simple-git throws at once for a directory that does not exist.
-    list = await createGit(cwd).raw(['worktree', 'list', '--porcelain']);
+    list = await createGit(cwd).raw(['worktree', 'list', '--porcelain', ...newlineSplit ? [] : ['-z']]);
   } catch {
-    return [];
+    return null;
   }
-  const roots = list
-    .split('\n')
-    .filter((l) => l.startsWith('worktree '))
-    .map((l) => l.slice('worktree '.length).trim())
-    .filter(Boolean);
-  const resolved = await Promise.all(
-    roots.map((r) => realpath(r).catch(() => r)),
-  );
-  return Array.from(new Set(resolved));
+  if (newlineSplit) list = list.split(/\r?\n/).join('\0');
+  return Promise.all(parseWorktreeList(list)
+    .filter((entry) => entry.path)
+    .map(async (entry) => ({ ...entry, listed: entry.path, path: await realpath(entry.path).catch(() => entry.path) })));
+}
+
+/** The checkouts among `entries`: neither bare, prunable, nor the common directory itself. */
+function listedCheckouts(entries: ListedWorktree[], commonDir: string | null): ListedWorktree[] {
+  return entries.filter((entry) => !entry.bare && !entry.prunable && entry.path !== commonDir);
+}
+
+/**
+ * List the realpath'd top-level directory of every worktree of the repo that
+ * contains `cwd` (main checkout + all linked worktrees), from
+ * `git worktree list --porcelain -z`. Bare and prunable entries are left out,
+ * and so is the git directory itself, which a `--separate-git-dir` repo or a
+ * submodule lists in place of its main checkout (#993): that checkout is then
+ * missing, so liveness is never read from this list alone (see isLiveCheckout,
+ * completeWorktreeList). On git before 2.36, which has no `-z`, it falls back
+ * to the newline-split list: callers that guard every checkout's files (the
+ * shared `info/exclude`, per-worktree MCP cleanup) need the siblings there
+ * too. Returns [] when git fails both ways.
+ */
+export async function listWorktrees(cwd?: string): Promise<string[]> {
+  const entries = await readWorktreeList(cwd) ?? await readWorktreeList(cwd, true);
+  if (!entries) return [];
+  const commonDir = await gitCommonDir(path.resolve(cwd ?? process.cwd()));
+  return [...new Set(listedCheckouts(entries, commonDir).map((entry) => entry.path))];
+}
+
+/**
+ * Every checkout of the repository whose common directory is `commonDir`
+ * (gitCommonDir of `cwd`), each both as `git worktree list` printed it and
+ * realpath'd, but only when that list names every checkout: null when git
+ * fails, and when a non-bare entry is the common directory itself, which is
+ * how a `--separate-git-dir` repo or a submodule stands in for its main
+ * checkout (#993). A path in neither form in a non-null list is not a checkout
+ * of the repository; a null list proves nothing about a path missing from it.
+ */
+export async function completeWorktreeList(cwd: string, commonDir: string): Promise<string[] | null> {
+  const entries = await readWorktreeList(cwd);
+  if (!entries || entries.some((entry) => !entry.bare && entry.path === commonDir)) return null;
+  return [...new Set(listedCheckouts(entries, commonDir).flatMap((entry) => [entry.listed, entry.path]))];
 }
 
 /**

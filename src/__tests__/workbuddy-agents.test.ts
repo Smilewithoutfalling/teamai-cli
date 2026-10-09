@@ -12,6 +12,7 @@ import {
   type ToolName,
 } from '../resources/agent-format.js';
 import { AgentsHandler } from '../resources/agents.js';
+import { commitTeamRepo } from './helpers/team-repo-history.js';
 import { TeamaiConfigSchema, type LocalConfig, type TeamaiConfig } from '../types.js';
 
 vi.mock('../utils/logger.js', () => ({
@@ -150,6 +151,10 @@ describe('WorkBuddy custom agents', () => {
     expect(pushedTeamAgent?.mergedSpec?.description).toBe('Review WorkBuddy changes');
     expect(pushedTeamAgent?.mergedSpec?.tool_extras?.workbuddy).toEqual({ mode: 'strict' });
 
+    // Without a delivery record (pullItem ran without a ledger), a copy goes
+    // only as a team version by the history (#993): the delivered one is.
+    await fse.writeFile(userTarget, firstContent);
+    commitTeamRepo(teamRepo);
     // Removal deletes the managed file only
     const removed = await handler.removeItem(TEAM_AGENT, teamConfig, userConfig);
     expect(removed).toContain(userTarget);

@@ -42,7 +42,7 @@ Git source add, browse/cache refresh, pull, and removal use the same machine-loc
 
 A successful source pull records only its current destinations and releases obsolete tool paths, including when the repository URL is unchanged. A valid source config with no `publicSkills`, an empty list, or no remaining published skill directories releases the previous installation. Files still owned by another installation remain protected; a missing or unreadable source config leaves the old installation untouched. Conflict-retained copies keep their previous records.
 
-Public skill names and recorded skill identities must already be canonical (no normalization-changing segments, repeated separators, backslashes, or trailing slash), so alternate spellings cannot bypass team-skill priority. Canonical nested names also respect local-team and builtin skill directory ownership, including ancestor/descendant conflicts. When this protection leaves previous source files in place, pull/removal retains their scoped provenance and excludes their paths from push pending manual review; it does not silently adopt them as team content. Source removal preflights all foreign ownership records and deletion targets before editing shared configuration. Ownership records must contain safe relative skill names and non-empty relative descendant paths; root-equivalent, escaping, and absolute paths stop cleanup before configuration or files are changed.
+Public skill names and recorded skill identities must already be canonical (no normalization-changing segments, repeated separators, backslashes, or trailing slash), so alternate spellings cannot bypass team-skill priority. Canonical nested names also respect local-team and builtin skill directory ownership, including ancestor/descendant conflicts. When this protection leaves previous source files in place, pull/removal retains their scoped provenance and excludes their paths from push pending manual review; it does not silently adopt them as team content. Source removal preflights all foreign ownership records and deletion targets before editing shared configuration. Ownership records must contain safe relative skill names and non-empty relative descendant paths, or absolute paths inside a tool's home outside the project (Hermes, OpenClaw, Copilot; #993); root-equivalent, escaping, and other absolute paths stop cleanup before configuration or files are changed.
 
 All accepted source aliases, including `.git`, `node_modules`, and names ending in `.pyc`, participate in ownership, provenance, and push checks; resource-directory filters never hide their tracking.
 
@@ -138,9 +138,16 @@ cleared, so when the scan lists a team rule or skill as modified, push stops
 before creating a branch and asks the member to save any edits to them and run
 `teamai pull` in the checkout. A rule this machine placed (`placedRules`) is the
 author's own copy and does not count; config-only pushes and new resources go
-through. Every full sync keeps only the
-entries of checkouts `git worktree list` still reports, so a deleted or
-re-created worktree's entry goes with the next full sync in any checkout. A
+through. Each project checkout's full sync records its `root` in its entry,
+and every full sync drops the entries whose `root` is no longer a checkout of
+the repository (it has no `.git`, or `git rev-parse --git-common-dir` there
+names another common directory) or is one under another key, so a deleted or
+re-created worktree's entry goes with the next full sync in any checkout. It
+does not read `git worktree list`, which names the git directory instead of
+the main checkout in a `--separate-git-dir` repo or a submodule (#993). An
+entry an older CLI wrote without `root` is kept until its checkout's own full
+sync adds one, and every entry is kept when git cannot name this checkout's
+common directory. A
 state.json written before this field has no entry, so each checkout does one
 full sync after the upgrade. The user scope's pull records its one checkout,
 HOME, the same way, for push's bases alone: its fast path still reads the
@@ -379,7 +386,7 @@ A readable self partition over a legacy dir that holds self knowledge (a
 another checkout ran `init --self`, and this one checked out what it committed
 next to its old install, so retiring the whole dir would take the knowledge too
 (#808). Its machine entries (`SUPERSEDED_ENTRIES`: state, token, the `env` file,
-the team-repo clone, indexes, report and usage data) move to a new
+the team-repo clone and its `last-fetch.json` stamp, indexes, report and usage data) move to a new
 `.teamai.bak[.N]` with its own `.gitignore` (`*`), as step 5 keeps a retired dir;
 the knowledge stays. Then its queue is set aside as `pending-learnings.<old kind>`
 (settleCheckoutQueue, below), and only then does `config.yaml` follow: it is what
@@ -481,7 +488,10 @@ stays in the checkout's `.teamai/`.
   in memory, and prints `[dry-run] Would bootstrap ...` without locking, writing,
   injecting hooks or registering the member. It makes no provider auth call
   either (a stale token can send `authenticate()` into an interactive login), so
-  the preview names the provider but not the username.
+  the preview names the provider but not the username. `init` detects with
+  `selfHeal: false` (in its `preAction` queue check and in `initSelfRepo`): it
+  sets the project up itself, and a self-heal there would enable every tool in
+  HOME before `--agent` chose them (#993).
 - **migration** (`migrate.ts`, `mode: 'self'`): self CANNOT use the git-mode whole
   directory copy→rename (that would carry the knowledge off and rename `.teamai` to
   `.bak`, breaking "knowledge on main"). Instead it selectively relocates the A1
@@ -519,8 +529,26 @@ every checkout, so that is where they live now:
 │                                              Codex records event, matcher-group position and complete rendered entry; unique definitions recover moved entries
 │                                              legacy ownership matches event/matcher/command uniquely, ignoring unrecorded timeout/context options
 │                                              pre-#370 Codex ownership is imported from <main>/.teamai/managed-hooks.json before reconcile/removal
+│                                              an un-migrated linked worktree injects through the main checkout's copy (<main>/.teamai when the main checkout
+│                                              has no install), importing then retiring the records v0.22.0 kept in each linked checkout's data home; checkouts registered in the
+│                                              manifest share ownership so removal keeps the shared entries until the last checkout removes them (#373)
+│                                              registration is per tool; targeted uninstall releases only that tool and keeps the remaining tools' records
+│                                              discovery respects enabledAgents/disabledAgents; excluded tools do not retain another checkout's shared hook
+│                                              a shared partition config registers its linked worktrees even without checkout-local configs or prior hook injection
+│                                              removing a legacy Codex copy shifts surviving checkout records only after matching their full entry at the old position
+│                                              uninstall of a shared partition removes the selected tool's hooks and registrations for that whole installation before deleting its authority
+│                                              the synthetic main-checkout manifest and empty .teamai directory go only after the last hook record is removed
+│                                              uninstall also retires selected tool records for missing hook files after their last checkout releases ownership
+│                                              removal releases one Claude entry per record, so an identical copy another checkout records stays
+├── teamai.lock                                packageLockDir: installed package versions (#993; an older <root>/.teamai/teamai.lock is moved here, or copied while git tracks it,
+│                                              and a <root>/.teamai/.gitignore holding only `teamai.lock` is removed outside self mode)
 └── workspaces/<managedMcpWorkspaceId(root)>/
-    ├── managed-main-checkout-hooks.json       bare repositories only: this workspace owns its Claude / Codex team-hook files and trust target
+    ├── root                                   the checkout's path, written by its full pulls; liveness is probed from it (#993)
+    ├── managed-hooks.json                     getManagedHooksPath: team hooks teamai wrote into this checkout's own hook files (Copilot's
+    │                                          .github/hooks/; every tool in self mode). Until #993 it sat in <root>/.teamai/: the first pull
+    │                                          moves its Copilot records (all of them in self mode), and deletes it once empty and untracked;
+    │                                          doctor names a tracked one. Other records stay there for the pre-#370 import and legacy sweep
+    ├── managed-main-checkout-hooks.json       bare repositories only: this workspace owns its Claude / Codex team-hook files and trust target, without sibling registrations
     ├── managed-mcp.json                       managedMcpManifestPath, one per checkout; Copilot placement is true for bare, false for keyed, absent when unproven
     ├── managed-mcp-files.json                 resolvedMcpFilesPath: project MCP configs teamai may have written a resolved ${VAR} to, and whether
     │                                          the paths earlier teamai.yaml revisions mapped were read; one of those git tracks is marked tracked (#882);
@@ -537,6 +565,20 @@ any tool writes it and restores those snapshots if saving ownership or a later
 config write fails. File records added by that failed run are cleaned up before
 Git protection is checked against the restored configs. If restoration also
 fails, the command reports both failures and keeps credential files excluded.
+
+HTTP source removal keeps `~/.teamai/local-agent/config.json` as `{disabled:true}`,
+without an endpoint or credentials, so legacy config and environment fallback
+cannot reconnect. Failed agent-hook removals retain `agent-hooks.json` and report
+exit code 1; removal can retry without an active source. HTTP initialization
+replaces the disabled config to enable a source again.
+
+Sync, detached plugin reconciliation and HTTP source removal share `~/.teamai/.local-agent-sync-lock`, outside the
+cache directory cleanup. A user-scope `teamai uninstall` removes the source the same way before its other steps. A sync runs a server-pushed
+`uninstall_teamai` command while it holds the lock, and passes it on: that
+uninstall's process, the sync's child, neither waits for the lock nor releases it. Each reloads config after acquiring the lock. Removal
+waits up to 30 seconds for the current operation, disables before teardown, and
+reports failure without teardown if the lock cannot be acquired. A hook sync
+skips while the lock is held; plugin reconciliation waits up to 30 seconds.
 
 `git worktree add` takes a path outside the repo, and the owning repo is still
 the business repo, whose refs every checkout shares. The search index is keyed
@@ -756,9 +798,17 @@ how many unpublished learnings each queue in the data home holds, set-aside ones
 included, so the member can publish or copy them first.
 
 Every checkout keeps its `workspaces/<id>/` (search index, managed MCP and
-the MCP configs it wrote a resolved value to, resource cache) in the shared data home. A full `pull` removes those of
-checkouts `git worktree list` no longer shows; the fast path does not list
-worktrees.
+the MCP configs it wrote a resolved value to, resource cache) in the shared data home. A full `pull` writes its
+checkout's path to the directory's `root` file, then removes the directories
+whose `root` is no longer a checkout of the repository, probed as for the
+`lastPullByWorkspace` entries above (#993). A directory without `root` (an
+older CLI's, or one contribute, recall, viz, the MCP writers or the local agent
+created before its checkout's first full pull) goes only when
+`git worktree list --porcelain -z` names every checkout (no non-bare entry is
+the common directory) and none of them, as git prints it or realpath'd, has its
+id. With `--separate-git-dir`, in a submodule, on git before 2.36, or when it
+holds `local-agent/`, it stays until its checkout's own full pull writes
+`root`. The fast path probes nothing.
 
 `import --from-mr` queues its learning in `pendingLearningsDir` and publishes
 it as `contribute` does (#823), so in self mode it lands in the partition queue

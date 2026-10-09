@@ -235,7 +235,10 @@ export interface InstructionTargets {
   hooks: InstructionHook[];
   /** Files earlier releases wrote blocks to that no installed tool reads now: a pull strips teamai blocks from them. */
   stale: InstructionTarget[];
-  /** Claude's user file when OpenCode reads the blocks from it, so OpenCode gets no file of its own. */
+  /**
+   * Claude's user file when OpenCode V1 reads the blocks from it, so OpenCode's
+   * own file, written for V2's plugin, is not listed in its `instructions`.
+   */
   opencodeFallback?: string | null;
   /** The fallback holds blocks no installed, enabled Claude Code keeps current. */
   opencodeFallbackStale?: boolean;
@@ -609,20 +612,17 @@ export async function resolveInstructionTargets(
     targets.set(file, target);
   }
   const stale = [...(await retiredTargets(toolPaths, localConfig)).values()].filter((t) => !inUse.has(t.path));
-  // OpenCode reads ~/.claude/CLAUDE.md while its own user AGENTS.md does not
-  // exist; when Claude's blocks are there, a second copy would duplicate them.
-  // That holds for blocks an excluded Claude left there too: OpenCode reads
-  // them all the same.
+  // OpenCode V1 reads ~/.claude/CLAUDE.md while its own user AGENTS.md does
+  // not exist; when Claude's blocks are there, listing OpenCode's file too
+  // would duplicate them. That holds for blocks an excluded Claude left there
+  // too: V1 reads them all the same. V2 reads neither CLAUDE.md nor
+  // `instructions`, so OpenCode's file is still written for teamai's plugin.
   const opencode = [...targets.values()].find((target) => target.tools.includes('opencode'));
   const claudeFile = path.join(getUserHome(), '.claude', 'CLAUDE.md');
   const claudeHolds = !targets.has(claudeFile) && await holdsInstructionBlocks(claudeFile);
   const opencodeFallback = localConfig.scope === 'user' && opencode !== undefined
     ? await opencodeClaudeFallback(getUserHome(), [...targets.keys(), ...claudeHolds ? [claudeFile] : []])
     : null;
-  if (opencode && opencodeFallback) {
-    targets.delete(opencode.path);
-    stale.push(opencode);
-  }
   return { targets: [...targets.values()], hooks, stale, opencodeFallback, opencodeFallbackStale: Boolean(opencodeFallback) && claudeHolds };
 }
 
@@ -651,21 +651,23 @@ export async function retiredFilesOfReached(
  * List teamai's OpenCode instruction file in OpenCode's `instructions` while
  * it holds teamai's blocks, and drop the entry teamai recorded adding once the
  * file is gone: OpenCode reads no file it is not told about. A file without
- * teamai's blocks is the member's, and an entry teamai did not add stays. Returns what it did or, with
- * `dryRun`, would do.
+ * teamai's blocks is the member's, and an entry teamai did not add stays. Beside
+ * the Claude fallback the file is for V2 only and is not listed. Returns what
+ * it did or, with `dryRun`, would do.
  */
 export async function registerOpencodeContext(
   teamConfig: TeamaiConfig,
   localConfig: LocalConfig,
-  resolved: Pick<InstructionTargets, 'targets' | 'stale'>,
+  resolved: Pick<InstructionTargets, 'targets' | 'stale' | 'opencodeFallback'>,
   dryRun: boolean,
   files: readonly InstructionFileResult[],
 ): Promise<string | null> {
   const paths = scopedToolPaths(teamConfig, localConfig).opencode;
   const contextFile = paths && await instructionTargetPath('opencode', paths, localConfig);
   if (!contextFile) return null;
-  const wanted = resolved.targets.some((target) => target.path === contextFile);
-  if (!wanted && !resolved.stale.some((target) => target.path === contextFile)) return null;
+  const targeted = resolved.targets.some((target) => target.path === contextFile);
+  const wanted = targeted && !resolved.opencodeFallback;
+  if (!targeted && !resolved.stale.some((target) => target.path === contextFile)) return null;
   const result = files.find((file) => file.path === contextFile);
   // An unsuccessful edit cannot activate a new entry or remove a working one.
   if (wanted && (!result || result.status === 'blocked' || result.status === 'failed')) return null;

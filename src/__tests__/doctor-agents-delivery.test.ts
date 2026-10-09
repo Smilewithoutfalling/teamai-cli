@@ -23,6 +23,7 @@ import { loadLocalConfig, loadTeamConfig } from '../config.js';
 import { AgentsHandler } from '../resources/agents.js';
 import { buildChecks, resolveDoctorContext, type Check } from '../doctor.js';
 import type { LocalConfig, TeamaiConfig } from '../types.js';
+import { commitTeamRepo } from './helpers/team-repo-history.js';
 
 /**
  * The agents half of the delivery check (#624). Unlike skills, the desired set
@@ -165,7 +166,10 @@ describe('doctor — agents delivered on disk', () => {
   it('fails when the delivered copy was rendered from an older spec', async () => {
     await deliver('claude', 'reviewer');
     await deliver('codex', 'reviewer');
+    // The copies hold the spec the team repo's history had before this change.
+    commitTeamRepo(repoPath, 'v1');
     await writeTeamAgent('reviewer', specFor('reviewer').replace('Do the thing.', 'Do it differently.'));
+    commitTeamRepo(repoPath, 'v2');
 
     const claude = await agentsCheck('claude');
     expect(await claude.check()).toBe(false);

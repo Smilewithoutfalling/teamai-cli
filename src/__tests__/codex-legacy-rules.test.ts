@@ -140,6 +140,25 @@ describe('pull reclaims the .codex/rules copies earlier pulls wrote (#938)', () 
     expect(warnings[0]).toMatch(/[Dd]elete/);
   });
 
+  it('keeps a member\'s link at a legacy copy\'s path, even when its target holds the copy teamai wrote (#993)', async () => {
+    await fse.ensureDir(legacyDir());
+    const target = path.join(tmpDir, 'mine', 'codeword.md');
+    await fse.outputFile(target, 'The team codeword is PELICAN-42.\n');
+    await fse.symlink(target, legacy('codeword.md'));
+    const recallTarget = path.join(tmpDir, 'mine', 'teamai-recall.md');
+    await fse.outputFile(recallTarget, await deployLegacyRecallRule());
+    await fse.remove(legacy('teamai-recall.md'));
+    await fse.symlink(recallTarget, legacy('teamai-recall.md'));
+
+    await handler.pullAllRules(teamConfig, localConfig);
+    const copies = await handler.legacyRuleCopies(teamConfig, localConfig, undefined);
+
+    expect((await fse.lstat(legacy('codeword.md'))).isSymbolicLink()).toBe(true);
+    expect((await fse.lstat(legacy('teamai-recall.md'))).isSymbolicLink()).toBe(true);
+    expect(await fse.readFile(target, 'utf8')).toBe('The team codeword is PELICAN-42.\n');
+    expect(copies.flatMap(({ owned, edited }) => [...owned, ...edited])).toEqual([]);
+  });
+
   it('never touches Codex exec-policy files or files that are not team rules', async () => {
     await fse.ensureDir(legacyDir());
     await fse.writeFile(legacy('codeword.md'), 'The team codeword is PELICAN-42.\n');

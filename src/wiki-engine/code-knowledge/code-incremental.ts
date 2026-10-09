@@ -1,7 +1,7 @@
 import { readFile, writeFile, stat, mkdir } from "node:fs/promises";
 import path from "node:path";
 
-import { collectCode, gitCommit, gitDiffNameStatus, isWorkingTreeClean } from "./code-collector.js";
+import { CODE_COLLECTION_VERSION, collectCode, gitCommit, gitDiffNameStatus, isWorkingTreeClean } from "./code-collector.js";
 import type { CodeFact } from "./code-extractors.js";
 import type { InterfaceInventory } from "../interface-scanner.js";
 
@@ -16,22 +16,29 @@ export async function detectCodeIncrementalChanges(
   root: string,
   manifestPath: string,
   project: string,
+  maxFiles?: number,
 ): Promise<CodeIncrementalChange> {
   const previous = (await exists(manifestPath))
     ? (JSON.parse(await readFile(manifestPath, "utf8")) as {
         headSha?: string;
+        version?: number;
         files?: Array<{ relativePath: string; sha256: string }>;
       })
     : { files: [] };
 
   const oldSha = previous.headSha;
   const newSha = await gitCommit(root);
+  // A manifest from an older collector may simply not know files this
+  // version collects (.scala, say) — a commit-to-commit diff would report
+  // no changes and keep them absent. The sha256 path below spots them.
+  const manifestIsCurrent = previous.version === CODE_COLLECTION_VERSION;
 
-  // Git incremental path: only when both commits are known AND the working
-  // tree is clean. A dirty tree has uncommitted/untracked changes that a
-  // commit-to-commit diff cannot see, so we fall back to the full sha256
-  // scan (which reads the working tree) to avoid silent staleness.
-  if (oldSha && newSha && (await isWorkingTreeClean(root))) {
+  // Git incremental path: only when both commits are known, the manifest
+  // comes from this collector version, AND the working tree is clean. A
+  // dirty tree has uncommitted/untracked changes that a commit-to-commit
+  // diff cannot see, so we fall back to the full sha256 scan (which reads
+  // the working tree) to avoid silent staleness.
+  if (oldSha && newSha && manifestIsCurrent && (await isWorkingTreeClean(root))) {
     const gitChanges = await gitDiffNameStatus(root, oldSha, newSha);
     if (gitChanges !== null) {
       const { added, changed, deleted } = gitChanges;
@@ -44,8 +51,10 @@ export async function detectCodeIncrementalChanges(
     }
   }
 
-  // Fallback: full sha256 comparison when git is unavailable or no baseline
-  const current = await collectCode({ root });
+  // Fallback: full sha256 comparison when git is unavailable or no baseline.
+  // Honors the caller's --max-files: a default-capped scan against a larger
+  // prior extraction would classify the tail as deleted and prune it.
+  const current = await collectCode({ root, maxFiles });
   const previousByPath = new Map((previous.files ?? []).map((file) => [file.relativePath, file.sha256]));
   const currentByPath = new Map(current.manifest.files.map((file) => [file.relativePath, file.sha256]));
   const added = [...currentByPath.keys()].filter((file) => !previousByPath.has(file)).sort();

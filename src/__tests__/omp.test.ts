@@ -13,12 +13,13 @@ import { detectMcpFormat } from '../resources/mcp-format.js';
 import { ruleFileExtensionForTool, usesMdcRules } from '../resources/rule-format.js';
 import { RulesHandler } from '../resources/rules.js';
 import { checkoutKey } from '../pull.js';
-import { openLedger, recordDelivered, type DeliveredHashes } from '../resources/delivered-copies.js';
+import { contentHash, openLedger, recordDelivered, type DeliveredHashes } from '../resources/delivered-copies.js';
 import { log } from '../utils/logger.js';
 import { resetWarnOnce } from '../utils/warn-once.js';
 import { loadStateForScope, saveStateForScope } from '../config.js';
 import { TeamaiConfigSchema, scopedToolPaths } from '../types.js';
 import type { LocalConfig, ResourceItem } from '../types.js';
+import { commitTeamRepo } from './helpers/team-repo-history.js';
 
 describe('OMP (Oh My Pi) support', () => {
   afterEach(() => vi.unstubAllEnvs());
@@ -137,6 +138,11 @@ describe('OMP rules directory is user-owned', () => {
       await fse.ensureDir(path.join(repoPath, 'rules'));
       await fse.outputFile(path.join(homeDir, '.omp/agent/rules', 'gone.md'), 'Former team rule.');
       await fse.outputFile(path.join(homeDir, '.omp/agent/rules', 'personal.md'), 'Personal rule.');
+      // The rule as an older teamai delivered it verbatim, before the team
+      // removed it: with no record, the history proves the copy teamai's (#993).
+      await fse.writeFile(path.join(repoPath, 'rules', 'gone.md'), 'Former team rule.');
+      commitTeamRepo(repoPath, 'gone');
+      await fse.remove(path.join(repoPath, 'rules', 'gone.md'));
       await fse.writeFile(path.join(repoPath, 'rules', 'keep.md'), 'Current team rule.');
       await fse.writeFile(path.join(repoPath, 'rules', '.removed'), 'gone\n');
       vi.stubEnv('HOME', homeDir);
@@ -493,6 +499,52 @@ describe('OMP gets its own rule render, namespaced rules flat (#946)', () => {
       `Kept ${mine}: teamai did not write it, and it is where omp would read team rule fe/style. `
       + 'Rename your file, then run `teamai pull --force`.',
     );
+  });
+
+  describe('a member\'s link where teamai delivered a rule (#993)', () => {
+    const linkTo = async (link: string, content: string): Promise<string> => {
+      const target = path.join(tmp, 'mine', path.basename(link));
+      await fse.outputFile(target, content);
+      await fse.ensureDir(path.dirname(link));
+      await fse.symlink(target, link);
+      return target;
+    };
+    const isLinkAt = async (file: string): Promise<boolean> => (await fse.lstat(file)).isSymbolicLink();
+
+    it('keeps a link at the flat name of a rule the author placed in a namespace, even when its target holds the render', async () => {
+      const state = await loadStateForScope(localConfig);
+      state.placedRules = { style: 'rules/fe/style.md' };
+      await saveStateForScope(state, localConfig);
+      const link = path.join(userRules(), 'fe.style.md');
+      const target = await linkTo(link, OMP_NS);
+      const previous: DeliveredHashes = { [link]: contentHash(OMP_NS) };
+
+      await handler.pullAllRules(teamConfig, localConfig, undefined, [], openLedger(previous));
+
+      expect(await isLinkAt(link)).toBe(true);
+      expect(await fse.readFile(target, 'utf8')).toBe(OMP_NS);
+    });
+
+    it('keeps a link at a nested path an older teamai wrote, even when its target holds that copy', async () => {
+      const link = path.join(userRules(), 'fe', 'style.md');
+      const target = await linkTo(link, NS);
+
+      await handler.pullAllRules(teamConfig, localConfig, undefined, [], openLedger(undefined));
+
+      expect(await isLinkAt(link)).toBe(true);
+      expect(await fse.readFile(target, 'utf8')).toBe(NS);
+    });
+
+    it('does not own a link at a flat copy\'s path for remove and uninstall, even on record', async () => {
+      const link = path.join(userRules(), 'fe.style.md');
+      await linkTo(link, OMP_NS);
+
+      const copies = await handler.ownedFlatCopies(
+        teamConfig, localConfig, await handler.scanTeamForPull(teamConfig, localConfig), { [link]: contentHash(OMP_NS) },
+      );
+
+      expect(copies).toEqual({ owned: [], edited: [] });
+    });
   });
 
   it("removes a tombstoned rule's flat copy only on record, not a member's own file of that name", async () => {

@@ -562,10 +562,13 @@ export async function deployBuiltinSkills(teamConfig: TeamaiConfig, localConfig?
       // Resolved without a source path, so the resolver only answers where the
       // skill lives and touches nothing: its Codex reconciliation deletes a
       // duplicate, and nothing may be deleted before the link guard has run.
-      // The other Codex copy is dealt with below, under the guard.
+      // The other Codex copy is dealt with below, under the guard. A built-in
+      // name is the CLI's (`isCliOwnedSkillName`), so an existing shared copy
+      // takes the stub; its files are judged by what a release shipped.
+      const ownsShared = async (): Promise<boolean> => true;
       const destDir = localConfig
-        ? await skillTargetForTool(tool, toolPath.skills, localConfig, skillName) ?? path.join(target.skillsDir, skillName)
-        : await resolveSkillDestination(tool, toolPath.skills, baseDir, skillName);
+        ? await skillTargetForTool(tool, toolPath.skills, localConfig, skillName, ownsShared) ?? path.join(target.skillsDir, skillName)
+        : await resolveSkillDestination(tool, toolPath.skills, baseDir, skillName, ownsShared);
 
       try {
         // A symlinked destination points somewhere we do not own. Writing

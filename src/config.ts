@@ -32,6 +32,11 @@ type LoadOptions = {
   dryRun?: boolean;
   /** Omit the legacy-role preview notice for a read-only load on a plain command. */
   suppressMigrationNotice?: boolean;
+  /**
+   * false: a single-repo clone with no config yet loads as no config, without
+   * the clone-time self-heal. For `init`, which sets the project up itself.
+   */
+  selfHeal?: boolean;
 };
 
 async function migrateLegacyRoleConfig(
@@ -499,6 +504,7 @@ async function selfHealAndReadPartition(
   onUnreadable?: UnreadableConfigSink,
   options: LoadOptions = {},
 ): Promise<LocalConfig | null> {
+  if (options.selfHeal === false) return null;
   if (options.dryRun) return previewSelfHeal(workspaceRoot, partitionDir, workspaceRoot);
   try {
     const { bootstrapSelfRepo } = await import('./bootstrap.js');
@@ -519,7 +525,7 @@ export async function readConfigFrom(
 ): Promise<LocalConfig | null> {
   const configPath = path.join(dataHomeDir, 'config.yaml');
   if (!(await pathExists(configPath))) {
-    if (!selfHealRepoRoot) return null;
+    if (!selfHealRepoRoot || options.selfHeal === false) return null;
     if (options.dryRun) return previewSelfHeal(selfHealRepoRoot, dataHomeDir, projectRoot);
     try {
       const { bootstrapSelfRepo } = await import('./bootstrap.js');

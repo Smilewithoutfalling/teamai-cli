@@ -1,4 +1,6 @@
+import crypto from 'node:crypto';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { openLedger } from '../resources/delivered-copies.js';
 import path from 'node:path';
 import os from 'node:os';
 import fse from 'fs-extra';
@@ -29,6 +31,7 @@ vi.mock('../utils/git.js', async () => ({
 }));
 
 import { AgentsHandler } from '../resources/agents.js';
+import { commitTeamRepo } from './helpers/team-repo-history.js';
 import { getDataHome, type TeamaiConfig, type LocalConfig } from '../types.js';
 
 /**
@@ -212,6 +215,28 @@ describe('AgentsHandler — Phase 1 push/pull/remove', () => {
     );
 
     expect(await fse.pathExists(path.join(homeDir, '.claude/agents/helper.md'))).toBe(true);
+    expect(await fse.readFile(mine, 'utf8')).toBe('name = "my own helper"\n');
+  });
+
+  it('pullItem keeps a member\'s same-stem file beside a rendered agent, and removes a recorded stale sibling (#993)', async () => {
+    // A rendered spec sweeps the extensions it left behind, but only a file the
+    // record or the team history proves teamai's: a same-stem file of the
+    // member's stays.
+    const srcPath = path.join(repoPath, 'agents', 'helper.yaml');
+    await fse.writeFile(srcPath, 'name: helper\ndescription: Helper.\ninstructions: Help.\n');
+    const mine = path.join(homeDir, '.claude/agents/helper.toml');
+    await fse.ensureDir(path.dirname(mine));
+    await fse.writeFile(mine, 'name = "my own helper"\n');
+    const item = { name: 'helper', type: 'agents' as const, sourcePath: srcPath, relativePath: 'agents/helper.yaml' };
+
+    await handler.pullItem(item, teamConfig, localConfig, openLedger({}));
+    expect(await fse.readFile(mine, 'utf8')).toBe('name = "my own helper"\n');
+
+    const stale = path.join(homeDir, '.claude/agents/helper.json');
+    await fse.writeFile(stale, '{"old":"render"}');
+    const recorded = { [stale]: crypto.createHash('sha256').update('{"old":"render"}').digest('hex') };
+    await handler.pullItem(item, teamConfig, localConfig, openLedger(recorded));
+    expect(await fse.pathExists(stale)).toBe(false);
     expect(await fse.readFile(mine, 'utf8')).toBe('name = "my own helper"\n');
   });
 
@@ -404,6 +429,23 @@ projects:
     // Agents deploy flattened, so a bare `vr` tombstone would suppress and
     // delete be/vr the moment that namespace became active.
     expect(tombstones.split('\n')).not.toContain('vr');
+  });
+
+  it('keeps a member\'s link at the author\'s root copy, whatever the placement record says (#993)', async () => {
+    await fse.outputFile(path.join(repoPath, 'agents/fe/vr.yaml'), 'name: vr\ndescription: Mine\ninstructions: A.\n');
+    const target = path.join(tmpDir, 'mine', 'vr.md');
+    await fse.outputFile(target, '# my agent');
+    const link = path.join(homeDir, '.claude/agents/vr.md');
+    await fse.ensureDir(path.dirname(link));
+    await fse.symlink(target, link);
+    await fse.outputJson(path.join(getDataHome(localConfig), 'state.json'), {
+      placedAgents: { vr: 'agents/fe/vr.yaml' },
+    });
+
+    await handler.removeItem('fe/vr', teamConfig, localConfig);
+
+    expect((await fse.lstat(link)).isSymbolicLink()).toBe(true);
+    expect(await fse.readFile(target, 'utf-8')).toBe('# my agent');
   });
 
   it('keeps the flattened local copy when no record proves it is this agent\'s', async () => {
@@ -670,6 +712,24 @@ projects:
     await handler.cleanupInactiveNamespaces(teamConfig, localConfig, ['common']);
 
     expect(await fse.pathExists(deployed)).toBe(false);
+  });
+
+  it('keeps a member\'s link where an inactive namespace\'s agent was delivered, even when its target holds the render (#993)', async () => {
+    const sourcePath = path.join(repoPath, 'agents/fe-agents/reviewer.yaml');
+    await fse.outputFile(sourcePath, 'name: reviewer\ndescription: Theirs\ninstructions: Read it.\n');
+    await handler.pullItem(
+      { name: 'reviewer', type: 'agents', sourcePath, relativePath: 'agents/fe-agents/reviewer.yaml', namespace: 'fe-agents' },
+      teamConfig, localConfig,
+    );
+    const deployed = path.join(homeDir, '.claude/agents/reviewer.md');
+    const target = path.join(tmpDir, 'mine', 'reviewer.md');
+    await fse.move(deployed, target);
+    await fse.symlink(target, deployed);
+
+    await handler.cleanupInactiveNamespaces(teamConfig, localConfig, ['common']);
+
+    expect((await fse.lstat(deployed)).isSymbolicLink()).toBe(true);
+    expect(await fse.pathExists(target)).toBe(true);
   });
 
   it('prefers an active source over the placement record', async () => {
@@ -940,6 +1000,8 @@ projects:
     await fse.writeFile(path.join(repoPath, 'agents', 'old.md'), 'old');
     await fse.writeFile(path.join(homeDir, '.claude/agents', 'old.md'), 'old');
     await fse.writeFile(path.join(homeDir, '.codebuddy/agents', 'old.md'), 'old');
+    // Copies of a team version: the history proves them teamai's (#993).
+    commitTeamRepo(repoPath);
 
     const removed = await handler.removeItem('old', teamConfig, localConfig);
 
@@ -958,6 +1020,7 @@ projects:
     await fse.writeFile(path.join(repoPath, 'agents', 'old.md'), 'old');
     await fse.writeFile(path.join(homeDir, '.claude/agents', 'old.md'), 'old');
     await fse.writeFile(path.join(homeDir, '.codebuddy/agents', 'old.md'), 'old');
+    commitTeamRepo(repoPath);
 
     // enabledAgents whitelists claude only, so codebuddy is not ours to touch.
     await handler.removeItem('old', teamConfig, { ...localConfig, enabledAgents: ['claude'] });
@@ -969,7 +1032,9 @@ projects:
   it('removeItem deletes a namespaced agent from the team repo and tombstones it', async () => {
     await fse.ensureDir(path.join(repoPath, 'agents', 'devops'));
     await fse.writeFile(path.join(repoPath, 'agents', 'devops', 'tf.yaml'), 'name: tf\n');
-    await fse.writeFile(path.join(homeDir, '.claude/agents', 'tf.md'), 'rendered');
+    // A copy of the team version, verbatim: the history proves it teamai's (#993).
+    await fse.writeFile(path.join(homeDir, '.claude/agents', 'tf.md'), 'name: tf\n');
+    commitTeamRepo(repoPath);
 
     await handler.removeItem('tf', teamConfig, localConfig);
 

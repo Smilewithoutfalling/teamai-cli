@@ -18,6 +18,7 @@ vi.mock('../utils/logger.js', () => ({
 import { SkillsHandler } from '../resources/skills.js';
 import { scanTeamRepoNamespaces, ensureSkillFrontmatter } from '../resources/skills.js';
 import { log } from '../utils/logger.js';
+import { commitTeamRepo } from './helpers/team-repo-history.js';
 import type { TeamaiConfig, LocalConfig } from '../types.js';
 
 describe('SkillsHandler.scanLocalForPush', () => {
@@ -682,6 +683,23 @@ scope: 'user',
     const contribPath = path.join(localConfig.repo.localPath, 'skills', 'my-skill', 'CONTRIBUTORS');
     const content = await fse.readFile(contribPath, 'utf-8');
     expect(content).toBe('testuser\n');
+  });
+
+  it('does not push a link inside the skill into the team repo, and names it (#993)', async () => {
+    const localSkillDir = path.join(homeDir, '.claude/skills', 'my-skill');
+    await fse.ensureDir(localSkillDir);
+    await fse.writeFile(path.join(localSkillDir, 'SKILL.md'), '# My Skill');
+    const outside = path.join(tmpDir, 'notes.md');
+    await fse.writeFile(outside, 'private');
+    await fse.symlink(outside, path.join(localSkillDir, 'notes.md'));
+    const warn = vi.spyOn(log, 'warn');
+
+    await handler.pushItem({ name: 'my-skill', type: 'skills' as const, sourcePath: localSkillDir, relativePath: 'skills/my-skill' }, teamConfig, localConfig);
+
+    const pushed = path.join(localConfig.repo.localPath, 'skills', 'my-skill');
+    expect(await fse.readFile(path.join(pushed, 'SKILL.md'), 'utf-8')).toContain('# My Skill');
+    expect(await fse.pathExists(path.join(pushed, 'notes.md'))).toBe(false);
+    expect(warn.mock.calls.flat().join('\n')).toContain('notes.md');
   });
 
   it('should not duplicate username on repeated push', async () => {
@@ -1362,6 +1380,48 @@ describe('SkillsHandler.pullItem skips hermes when not installed', () => {
 
     expect(await fse.pathExists(path.join(hermesHome, 'skills', 'team-skill', 'SKILL.md'))).toBe(true);
   });
+
+  it('delivers a skill without the links in its source, and names each one it skipped (#993)', async () => {
+    const hermesHome = path.join(homeDir, '.hermes');
+    await fse.ensureDir(hermesHome);
+    vi.stubEnv('HERMES_HOME', hermesHome);
+    const outside = path.join(tmpDir, 'outside.md');
+    await fse.writeFile(outside, 'outside');
+    await fse.symlink(outside, path.join(sourcePath, 'linked.md'));
+    vi.mocked(log.warn).mockClear();
+
+    await handler.pullItem(item(), teamConfig, localConfig);
+
+    const dest = path.join(hermesHome, 'skills', 'team-skill');
+    expect(await fse.pathExists(path.join(dest, 'SKILL.md'))).toBe(true);
+    expect(await fse.lstat(path.join(dest, 'linked.md')).catch(() => null)).toBeNull();
+    expect(vi.mocked(log.warn).mock.calls.map(([message]) => String(message))).toContain(
+      'Skipped linked.md in skills/team-skill: teamai does not deliver links.',
+    );
+  });
+
+  it('keeps a member\'s link at or inside the skill directory when installed without a delivery record (#993)', async () => {
+    const hermesHome = path.join(homeDir, '.hermes');
+    vi.stubEnv('HERMES_HOME', hermesHome);
+    const dest = path.join(hermesHome, 'skills', 'team-skill');
+    const external = path.join(tmpDir, 'my-skill');
+    await fse.outputFile(path.join(external, 'SKILL.md'), 'mine');
+    await fse.ensureDir(path.dirname(dest));
+    await fse.symlink(external, dest, 'dir');
+
+    await handler.pullItem(item(), teamConfig, localConfig);
+
+    expect((await fse.lstat(dest)).isSymbolicLink()).toBe(true);
+    expect(await fse.readFile(path.join(external, 'SKILL.md'), 'utf8')).toBe('mine');
+
+    await fse.unlink(dest);
+    await fse.ensureDir(dest);
+    await fse.symlink(path.join(external, 'SKILL.md'), path.join(dest, 'SKILL.md'));
+
+    await handler.pullItem(item(), teamConfig, localConfig);
+
+    expect((await fse.lstat(path.join(dest, 'SKILL.md'))).isSymbolicLink()).toBe(true);
+  });
 });
 
 describe('SkillsHandler.pullItem Codex shared skills', () => {
@@ -1389,6 +1449,8 @@ describe('SkillsHandler.pullItem Codex shared skills', () => {
     await fse.writeFile(path.join(sharedSkillPath, 'SKILL.md'), managedContent);
     await fse.writeFile(path.join(codexSkillPath, 'SKILL.md'), managedContent);
     await fse.writeFile(path.join(sourcePath, 'SKILL.md'), managedContent);
+    // With no record, the shared copy is teamai's on the team history's proof (#993).
+    commitTeamRepo(path.join(tmpDir, 'team-repo'));
 
     const teamConfig = {
       team: 'test',
@@ -1421,7 +1483,7 @@ describe('SkillsHandler.pullItem Codex shared skills', () => {
     expect(await fse.pathExists(sharedSkillPath)).toBe(false);
   });
 
-  it('preserves and reports a different .codex copy', async () => {
+  it('preserves and reports a different .codex copy beside teamai\'s shared copy', async () => {
     const homeDir = path.join(tmpDir, 'home');
     const sourcePath = path.join(tmpDir, 'team-repo', 'skills', 'team-skill');
     const sharedSkillPath = path.join(homeDir, '.agents', 'skills', 'team-skill');
@@ -1429,9 +1491,13 @@ describe('SkillsHandler.pullItem Codex shared skills', () => {
     await fse.ensureDir(sharedSkillPath);
     await fse.ensureDir(codexSkillPath);
     await fse.ensureDir(sourcePath);
+    // The shared copy is an older team version, so teamai's (#993).
+    await fse.writeFile(path.join(sourcePath, 'SKILL.md'), 'shared copy');
+    commitTeamRepo(path.join(tmpDir, 'team-repo'), 'v1');
     await fse.writeFile(path.join(sharedSkillPath, 'SKILL.md'), 'shared copy');
     await fse.writeFile(path.join(codexSkillPath, 'SKILL.md'), 'different copy');
     await fse.writeFile(path.join(sourcePath, 'SKILL.md'), '---\nname: team-skill\ndescription: Updated\n---\n');
+    commitTeamRepo(path.join(tmpDir, 'team-repo'), 'v2');
 
     await new SkillsHandler().pullItem({
       name: 'team-skill', type: 'skills', sourcePath, relativePath: 'skills/team-skill',
@@ -1445,6 +1511,7 @@ describe('SkillsHandler.pullItem Codex shared skills', () => {
     });
 
     expect(await fse.readFile(path.join(codexSkillPath, 'SKILL.md'), 'utf8')).toBe('different copy');
-    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('Codex skill conflict'));
+    expect(await fse.readFile(path.join(sharedSkillPath, 'SKILL.md'), 'utf8')).toContain('description: Updated');
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('Codex skill conflict for team-skill: keeping different copies'));
   });
 });

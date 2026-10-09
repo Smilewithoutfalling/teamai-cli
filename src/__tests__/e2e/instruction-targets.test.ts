@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { loadV2Plugin } from '../helpers/opencode-plugin.js';
 
 // Real-CLI coverage for #945: a pull writes the instruction blocks (culture,
 // claudemd, recall) only where an installed tool reads them, and strips the
@@ -808,7 +809,7 @@ describe('instruction block targets on real CLI pull (#945)', () => {
     expect(JSON.parse(fs.readFileSync(config, 'utf8'))).toEqual({ instructions: ['docs/style.md'], theme: 'dark' });
   });
 
-  it('gives OpenCode its user blocks in its config dir, registered with an absolute path, and adds no copy beside its Claude fallback', async () => {
+  it('gives OpenCode its user blocks in its config dir, registered with an absolute path, and lists no copy beside its Claude fallback', async () => {
     const own = makeUserSandbox(['.config/opencode']);
     sandboxes.push(own.sandbox);
     const ocDir = path.join(own.home, '.config', 'opencode');
@@ -821,17 +822,26 @@ describe('instruction block targets on real CLI pull (#945)', () => {
     expect(JSON.parse(fs.readFileSync(path.join(ocDir, 'opencode.json'), 'utf8')).instructions).toEqual(['~/notes.md', contextFile]);
     expect(fs.readFileSync(path.join(ocDir, 'AGENTS.md'), 'utf8')).toBe('# My OpenCode notes\n');
 
-    // No native user AGENTS.md: OpenCode falls back to ~/.claude/CLAUDE.md, which already holds the blocks.
+    // No native user AGENTS.md: OpenCode V1 falls back to ~/.claude/CLAUDE.md, which already holds the blocks,
+    // so the copy V2 reads through teamai's plugin is not listed for V1 (#993 bug 6).
     const fallback = makeUserSandbox(['.config/opencode', '.claude']);
     sandboxes.push(fallback.sandbox);
-    const viaClaude = await runCLI(['pull'], { HOME: fallback.home }, fallback.sandbox);
+    const env = { HOME: fallback.home, XDG_CONFIG_HOME: path.join(fallback.home, '.config'), GIT_CONFIG_NOSYSTEM: '1' };
+    const fallbackContext = path.join(fallback.home, '.config', 'opencode', 'teamai-context.md');
+    const listed = (): unknown[] => {
+      const file = path.join(fallback.home, '.config', 'opencode', 'opencode.json');
+      return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')).instructions ?? [] : [];
+    };
+    const viaClaude = await runCLI(['pull'], env, fallback.sandbox);
     expect(viaClaude.code, viaClaude.output).toBe(0);
     expect(fs.readFileSync(path.join(fallback.home, '.claude', 'CLAUDE.md'), 'utf8')).toContain(CLAUDEMD_START);
-    expect(fs.existsSync(path.join(fallback.home, '.config', 'opencode', 'teamai-context.md'))).toBe(false);
+    expect(fs.readFileSync(fallbackContext, 'utf8')).toContain(CLAUDEMD_START);
+    expect(listed()).toEqual([]);
     expect(viaClaude.output).toContain('OpenCode reads the team instructions from');
-    const recall = await runCLI(['recall', 'enable'], { HOME: fallback.home }, fallback.sandbox);
+    const recall = await runCLI(['recall', 'enable'], env, fallback.sandbox);
     expect(recall.code, recall.output).toBe(0);
-    expect(fs.existsSync(path.join(fallback.home, '.config', 'opencode', 'teamai-context.md'))).toBe(false);
+    expect(fs.readFileSync(fallbackContext, 'utf8')).toContain(RECALL_START);
+    expect(listed()).toEqual([]);
   });
 
   it('has doctor report what keeps a tool from loading its instructions, not just whether a file was written', async () => {
@@ -1180,5 +1190,105 @@ describe('instruction block targets on real CLI pull (#945)', () => {
     expect(uninstall.code, uninstall.output).toBe(0);
     expect(fs.readFileSync(contextFile, 'utf8')).toBe('# My own notes\n');
     expect(JSON.parse(fs.readFileSync(config, 'utf8')).instructions ?? []).toEqual([]);
+  });
+});
+
+// #993 bug 6: OpenCode V2 parses `instructions` and ignores it, so teamai's
+// plugin in HOME reads the files itself in its V2 setup.
+describe('OpenCode V2 delivery through the teamai plugin (#993 bug 6)', () => {
+  const sandboxes: string[] = [];
+  afterEach(() => {
+    for (const dir of sandboxes.splice(0)) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  });
+
+  /** The sandbox env for a member: HOME, its XDG config and no system git config. */
+  const isolated = (home: string): Record<string, string> => ({ HOME: home, XDG_CONFIG_HOME: path.join(home, '.config'), GIT_CONFIG_NOSYSTEM: '1' });
+
+  /** What the plugin the CLI installed adds to a V2 session's system prompt in `directory`, through `hook`. */
+  async function systemTexts(home: string, directory: string, hook: 'context' | 'compaction'): Promise<string[]> {
+    const source = fs.readFileSync(path.join(home, '.config', 'opencode', 'plugin', 'teamai-hooks.ts'), 'utf8');
+    const host = await loadV2Plugin(source, {}, directory);
+    const event = { sessionID: 'ses_v2', system: [] as Array<{ type: string; text: string }> };
+    await host.callbacks[`session.${hook}`](event);
+    await host.cleanup?.();
+    return event.system.map((part) => part.text);
+  }
+  const sources = (texts: string[]): string[] => texts.map((text) => text.split('\n')[0].replace('Instructions from: ', ''));
+
+  it('adds the nearest project\'s context and rules, and the user-scope ones everywhere, on context and compaction', async () => {
+    const sandbox = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-993-oc-v2-')));
+    sandboxes.push(sandbox);
+    const fixture = makeTeamAndProject(sandbox, { files: { 'rules/style.md': 'RULE-SENTINEL: keep functions small.\n' } });
+    const member = makeProjectMember(sandbox, fixture, 'dev', 'developer', ['.opencode/skills']);
+    const userDir = path.join(member.home, '.config', 'opencode');
+    fs.mkdirSync(path.join(userDir, 'rules', 'ns'), { recursive: true });
+    fs.writeFileSync(path.join(userDir, 'teamai-context.md'), 'USER-CONTEXT-SENTINEL\n');
+    fs.writeFileSync(path.join(userDir, 'rules', 'z.md'), 'USER-RULE-Z\n');
+    fs.writeFileSync(path.join(userDir, 'rules', 'ns', 'a.md'), 'USER-RULE-NS-A\n');
+    fs.writeFileSync(path.join(userDir, 'rules', 'notes.txt'), 'not a rule\n');
+
+    const pulled = await pullAs(member, [], isolated(member.home));
+    expect(pulled.code, pulled.output).toBe(0);
+
+    const deep = path.join(member.projectRoot, 'src', 'deep');
+    fs.mkdirSync(deep, { recursive: true });
+    const inProject = await systemTexts(member.home, deep, 'context');
+    const userSources = [path.join(userDir, 'teamai-context.md'), path.join(userDir, 'rules', 'ns', 'a.md'), path.join(userDir, 'rules', 'z.md')];
+    const projectContext = path.join(member.projectRoot, '.opencode', 'teamai-context.md');
+    expect(sources(inProject).slice(0, 4)).toEqual([...userSources, projectContext]);
+    expect(inProject[0]).toBe(`Instructions from: ${userSources[0]}\nUSER-CONTEXT-SENTINEL\n`);
+    expect(inProject[3]).toContain('DEVELOPMENT-SENTINEL');
+    const rulesDir = path.join(member.projectRoot, '.opencode', 'rules');
+    const projectRules = sources(inProject).slice(4);
+    expect(projectRules).toContain(path.join(rulesDir, 'style.md'));
+    expect(projectRules).toEqual([...projectRules].sort());
+    expect(projectRules.every((file) => file.startsWith(rulesDir + path.sep))).toBe(true);
+    expect(inProject.join('\n')).toContain('RULE-SENTINEL');
+
+    expect(await systemTexts(member.home, deep, 'compaction')).toEqual(inProject);
+    expect(sources(await systemTexts(member.home, sandbox, 'context'))).toEqual(userSources);
+  });
+
+  it('has doctor check the plugin on OpenCode V2 and `instructions` on V1', async () => {
+    const sandbox = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-993-oc-v2-')));
+    sandboxes.push(sandbox);
+    const fixture = makeTeamAndProject(sandbox, { files: { 'rules/style.md': 'RULE-SENTINEL: keep functions small.\n' } });
+    const member = makeProjectMember(sandbox, fixture, 'dev', 'developer', ['.opencode/skills']);
+    const bin = path.join(sandbox, 'bin');
+    fs.mkdirSync(bin);
+    /** `opencode` on PATH prints `version`, as the installed binary does. */
+    const withOpencode = (version: string): Record<string, string> => {
+      fs.writeFileSync(path.join(bin, 'opencode'), `#!/bin/sh\necho '${version}'\n`, { mode: 0o755 });
+      fs.writeFileSync(path.join(bin, 'opencode.cmd'), `@echo ${version}\r\n`);
+      return { ...isolated(member.home), PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}` };
+    };
+    const doctor = async (env: Record<string, string>): Promise<Map<string, { ok: boolean; fix?: string }>> => {
+      const run = await runCLI(['doctor', '--json'], env, member.projectRoot);
+      const report = JSON.parse(run.stdout) as { checks: Array<{ name: string; ok: boolean; fix?: string }> };
+      return new Map(report.checks.map((c) => [c.name, c]));
+    };
+    const pulled = await pullAs(member, [], withOpencode('opencode v2.0.24'));
+    expect(pulled.code, pulled.output).toBe(0);
+    // V2 ignores these entries: doctor does not ask for them.
+    fs.writeFileSync(path.join(member.projectRoot, '.opencode', 'opencode.json'), '{}\n');
+
+    const v2 = await doctor(withOpencode('opencode v2.0.24'));
+    expect(v2.get('Team rules are active in opencode')?.ok).toBe(true);
+    expect(v2.get('opencode adds the team instructions to its prompt')?.ok).toBe(true);
+    expect(v2.has('Team instructions are listed in opencode instructions')).toBe(false);
+
+    const plugin = path.join(member.home, '.config', 'opencode', 'plugin', 'teamai-hooks.ts');
+    fs.rmSync(plugin);
+    const noPlugin = await doctor(withOpencode('opencode v2.0.24'));
+    for (const name of ['Team rules are active in opencode', 'opencode adds the team instructions to its prompt']) {
+      expect(noPlugin.get(name)).toMatchObject({ ok: false });
+      expect(noPlugin.get(name)?.fix).toContain(plugin);
+    }
+
+    const v1 = await doctor(withOpencode('1.18.35'));
+    expect(v1.get('Team rules are active in opencode')).toMatchObject({ ok: false });
+    expect(v1.get('Team rules are active in opencode')?.fix).toContain('`instructions`');
+    expect(v1.get('Team instructions are listed in opencode instructions')).toMatchObject({ ok: false });
+    expect(v1.has('opencode adds the team instructions to its prompt')).toBe(false);
   });
 });

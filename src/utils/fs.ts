@@ -67,7 +67,7 @@ const MAX_SYMLINK_HOPS = 40;
  * exists there yet; `filePath` itself when it is not a link. Each hop resolves
  * against the real directory of the link, as the kernel does.
  */
-async function symlinkTarget(filePath: string): Promise<string> {
+export async function symlinkTarget(filePath: string): Promise<string> {
   let target = filePath;
   for (let hops = 0; hops < MAX_SYMLINK_HOPS; hops++) {
     try {
@@ -211,8 +211,12 @@ export async function writeJsonAtomic(
  * Copy a directory recursively.
  * If `dest` is a symlink (e.g. left over from setup-links.sh), remove it first
  * so fse.copy can create a real directory in its place.
+ * With `onLink`, a link in `src` is not copied (nor followed): `onLink` gets its
+ * path relative to `src`. Without it, links are copied as links.
  */
-export async function copyDir(src: string, dest: string): Promise<void> {
+export async function copyDir(
+  src: string, dest: string, onLink?: (relativePath: string) => void, skip: readonly string[] = [],
+): Promise<void> {
   const destExpanded = expandHome(dest);
   try {
     const stat = await fse.lstat(destExpanded);
@@ -222,9 +226,18 @@ export async function copyDir(src: string, dest: string): Promise<void> {
   } catch {
     // dest doesn't exist yet — that's fine
   }
-  await fse.copy(expandHome(src), destExpanded, {
+  const srcExpanded = expandHome(src);
+  await fse.copy(srcExpanded, destExpanded, {
     overwrite: true,
-    filter: (srcPath: string) => !isIgnored(path.basename(srcPath)),
+    filter: async (srcPath: string) => {
+      if (isIgnored(path.basename(srcPath))) return false;
+      // An entry `skip` names, and everything under it, is left as the destination has it.
+      const rel = path.relative(srcExpanded, srcPath).split(path.sep).join('/');
+      if (skip.some((entry) => rel === entry || rel.startsWith(`${entry}/`))) return false;
+      if (onLink === undefined || srcPath === srcExpanded || !(await fse.lstat(srcPath)).isSymbolicLink()) return true;
+      onLink(path.relative(srcExpanded, srcPath).split(path.sep).join('/'));
+      return false;
+    },
   });
 }
 

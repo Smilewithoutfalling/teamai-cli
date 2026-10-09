@@ -96,6 +96,16 @@ describe('removeClaudeMdSection', () => {
         expect(await fse.pathExists(filePath)).toBe(false);
     });
 
+    it('with deleteIfEmpty, keeps a linked file and empties its target instead of deleting the link', async () => {
+        const filePath = path.join(tmpDir, 'AGENTS.md');
+        const target = path.join(tmpDir, 'dotfiles-CLAUDE.md');
+        await fse.writeFile(target, makeBlock('team rules') + '\n');
+        await fse.symlink(target, filePath);
+        expect(await removeClaudeMdSection(filePath, START, END, { deleteIfEmpty: true })).toBe(true);
+        expect((await fse.lstat(filePath)).isSymbolicLink()).toBe(true);
+        expect(await fse.readFile(target, 'utf8')).toBe('');
+    });
+
     it('with deleteIfEmpty, deletes a file injectClaudeMdSection created once its sections go one by one', async () => {
         const filePath = path.join(tmpDir, 'AGENTS.md');
         await injectClaudeMdSection(filePath, START, END, makeBlock('x'));

@@ -87,7 +87,8 @@ it('real pull prunes deleted docs from a Git remote, including deletion of the l
   expect(pull()).toContain('Synced 1 docs');
   expect(await fse.readFile(path.join(destination, 'guide.md'), 'utf8')).toBe('updated');
   expect(await fse.pathExists(path.join(destination, 'old'))).toBe(false);
-  expect(await fse.pathExists(path.join(destination, 'draft.md'))).toBe(false);
+  // A file at a path the team never had is the member's and stays (#993).
+  expect(await fse.readFile(path.join(destination, 'draft.md'), 'utf8')).toBe('local-only');
   expect(await fse.readFile(path.join(destination, '.keep'), 'utf8')).toBe('local metadata');
   expect(docsCheck().ok).toBe(true);
 
@@ -102,7 +103,8 @@ it('real pull prunes deleted docs from a Git remote, including deletion of the l
   expect(pull('--dry-run')).toContain('Would sync 0 docs and remove stale local docs');
   expect(await fse.pathExists(path.join(destination, 'guide.md'))).toBe(true);
   expect(pull()).toContain('Synced 0 docs');
-  expect(await fse.readdir(destination)).toEqual(['.keep']);
+  // Only the member's own files are left: the hidden one and the draft the team never had (#993).
+  expect((await fse.readdir(destination)).sort()).toEqual(['.keep', 'draft.md']);
   expect(docsCheck()).toBeUndefined();
   expect(pull()).toContain('Already synced');
 }, 120_000);

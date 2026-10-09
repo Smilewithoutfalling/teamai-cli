@@ -1,4 +1,4 @@
-import { getTeamaiHome, type GlobalOptions, type LocalConfig } from '../types.js';
+import { type GlobalOptions, type LocalConfig } from '../types.js';
 import { autoDetectInit } from '../config.js';
 import { assertNotReadOnly } from '../read-only.js';
 import { pathExists } from '../utils/fs.js';
@@ -11,7 +11,7 @@ import { NpmAdapter } from './adapters/npm.js';
 import type { PackageInstallContext } from './adapters/base.js';
 import { detectPackageEnvironment } from './env-detect.js';
 import {
-  ensurePackageLockIgnored,
+  packageLockDir,
   hasPackageDeclarations,
   loadPackageLock,
   loadPackageManifest,
@@ -188,7 +188,7 @@ export async function pkgInstall(
   const { localConfig } = await autoDetectInit(undefined, { dryRun: options.dryRun });
   const manifest = await loadPackageManifest(localConfig.repo.localPath);
   const cwd = process.cwd();
-  const lockDir = getTeamaiHome(localConfig.scope, localConfig.projectRoot);
+  const lockDir = await packageLockDir(localConfig, { readOnly: options.dryRun });
   const npm = new NpmAdapter();
   const claude = new ClaudePluginAdapter();
 
@@ -273,7 +273,6 @@ export async function pkgInstall(
     await savePackageManifest(localConfig.repo.localPath, manifest);
     log.success(`Declared ${target} in teamai.yaml (${added?.ecosystem})`);
   }
-  if (localConfig.scope === 'project') await ensurePackageLockIgnored(lockDir);
   await savePackageLock(lockDir, lock);
   log.success('TeamAI packages installed; wrote teamai.lock');
 }
@@ -305,9 +304,8 @@ export async function pkgDoctorReport(
 
   const npm = new NpmAdapter();
   const claude = new ClaudePluginAdapter();
-  const previousLock = await loadPackageLock(
-    getTeamaiHome(localConfig.scope, localConfig.projectRoot),
-  );
+  // doctor is read-only: it reads an older lock where it is, and the next install or session moves it.
+  const previousLock = await loadPackageLock(await packageLockDir(localConfig, { readOnly: true }));
   const context: PackageInstallContext = {
     cwd,
     scope: localConfig.scope,

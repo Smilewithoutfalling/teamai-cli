@@ -82,6 +82,17 @@ async function readHooksFile(absolutePath: string, relativePath: string): Promis
   }
 }
 
+/** The hooks one hooks file's text declares, or null when it does not parse: for reading a past revision. */
+export function parseTeamHooks(content: string): TeamHook[] | null {
+  try {
+    const raw: unknown = YAML.parse(content);
+    if (missingTopLevelKeyReason(raw, HooksYamlSchema)) return null;
+    return HooksYamlSchema.parse(raw ?? {}).hooks;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * How `hooks/hooks.yaml` and `hooks/<ns>/hooks.yaml` are read for delivery.
  * The `builtin:` overrides are team-wide and read from the root file alone.

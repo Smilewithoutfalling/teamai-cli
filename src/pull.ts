@@ -7,7 +7,7 @@ import {
 } from './resources/desired.js';
 import type { IndexedSkills } from './utils/search-index.js';
 import { detectProjectConfig, describeUnreadableConfig, loadLocalConfigForScope, loadTeamConfig, loadStateForScope, saveStateForScope } from './config.js';
-import { pullRepo, getHeadRev, createGit, getDefaultBranch, listWorktrees } from './utils/git.js';
+import { pullRepo, getHeadRev, createGit, getDefaultBranch, gitCommonDir, isLiveCheckout } from './utils/git.js';
 import { publishQueuedLearnings } from './utils/learnings-publish.js';
 import { pendingLearningsDir } from './utils/pending-learnings.js';
 import { indexableLearningsRoots } from './utils/learnings-roots.js';
@@ -19,14 +19,15 @@ import {
   registerOpencodeContext, resolveInstructionTargets, retiredFilesOfReached, type InstructionBlocks,
 } from './instruction-targets.js';
 import { getHandler, RulesHandler, DocsHandler, EnvHandler, AgentsHandler } from './resources/index.js';
-import { reportHeldAgents, type RedeployedCopy } from './resources/agents.js';
-import { listStaleDocDirectories, resolveDesiredDocs, resolveDocsDestination } from './resources/docs.js';
+import { removedAgentOrigin, reportHeldAgents, type RedeployedCopy } from './resources/agents.js';
+import { ruleOrigin } from './resources/rules.js';
+import { describeLinkedDocsRoot, isLinkedDocsRoot, listStaleDocDirectories, membersDocs, resolveDesiredDocs, resolveDocsDestination } from './resources/docs.js';
 import { isToolInstalledForConfig, ResourceHandler } from './resources/base.js';
-import { skillsDirForTool } from './resources/skills.js';
+import { skillOrigin, skillsDirForTool } from './resources/skills.js';
 import { flatStemsOfRemoved, ruleFileExtensionForTool, ruleFormatForTool, ruleStemsForTool } from './resources/rule-format.js';
 import { AGENT_FILE_EXTENSIONS } from './resources/agent-format.js';
 import {
-  forgetDelivered, judgeCopy, openLedger, removedCopyChanged, reportKept, type DeliveredHashes, type DeliveryLedger,
+  describeMembersDirLeft, forgetDelivered, holdsNonRegular, judgeCopy, judgeRemoval, notTeamaisReason, openLedger, reportKept, type DeliveredHashes, type DeliveryLedger,
 } from './resources/delivered-copies.js';
 import { BUILTIN_SKILL_NAMES } from './builtin-skills.js';
 import type { AgentModelRecords, GlobalOptions, ResourceType, ResourceItem, TeamaiConfig, LocalConfig, State } from './types.js';
@@ -287,6 +288,8 @@ async function skillSafeToRemove(deployedDir: string, source: string | undefined
   // Recursive: a git repo nested anywhere under the skill (e.g. scripts/.git)
   // can hide stashes/unpushed history too, and dirContentEqual skips every .git.
   if (await hasVcsMetadataRecursive(deployedDir)) return false;
+  // The compare does not see links, and a link inside is the member's (#993).
+  if (await holdsNonRegular(deployedDir)) return false;
   return dirContentEqual(deployedDir, source, [CONTRIBUTORS_FILE]);
 }
 
@@ -378,8 +381,11 @@ async function reportWouldKeep(
   const received = items.map((item) => item.name);
   for (const item of items) {
     for (const target of await handler.deliveryTargets(freshConfig, localConfig, item, received)) {
-      if ((await judgeCopy(ledger.previous, item, target)).kind === 'keep') {
+      const verdict = await judgeCopy(ledger.previous, item, target);
+      if (verdict.kind === 'keep') {
         log.info(`[${scopeLabel}] [dry-run] Would keep ${target.dest}: you changed it since teamai delivered it.`);
+      } else if (verdict.kind === 'member') {
+        log.info(`[${scopeLabel}] [dry-run] Would keep ${target.dest}: ${notTeamaisReason(item.relativePath)}.`);
       }
     }
   }
@@ -523,7 +529,7 @@ async function cleanupTombstonedResources(
       for (const stem of flatStems) {
         const localPath = path.join(baseDir, dir, `${stem}${ruleFileExtensionForTool(tool)}`);
         if (ledger.previous?.[localPath] === undefined || !await pathExists(localPath)) continue;
-        if (await removedCopyChanged(ledger.previous, localPath)) {
+        if (await judgeRemoval(ledger.previous, localPath) !== 'remove') {
           log.warn(`[${scopeLabel}] Kept ${localPath}: the team removed the rule it is a copy of, but you changed this copy. Delete it when you no longer need it.`);
           continue;
         }
@@ -548,8 +554,18 @@ async function cleanupTombstonedResources(
             log.warn(`[${scopeLabel}] Kept tombstoned skill "${name}" (${tool}): it has local VCS metadata (.git) that may hold unpushed history. Back it up, then delete it manually.`);
             continue;
           }
-          if (await removedCopyChanged(ledger.previous, localPath)) {
+          // With no record, a copy goes only on proof that it is teamai's (#993).
+          const origin = type === 'rules' ? ruleOrigin(tool, localConfig.repo.localPath, `rules/${name}.md`)
+            : type === 'agents' ? await removedAgentOrigin(localConfig, name, tool)
+              : type === 'skills' ? skillOrigin(localConfig.repo.localPath, name)
+                : undefined;
+          const removal = await judgeRemoval(ledger.previous, localPath, origin, ledger.otherRecords);
+          if (removal === 'edited') {
             log.warn(`[${scopeLabel}] Kept ${localPath}: the team removed ${name}, but you changed this copy. Delete it when you no longer need it.`);
+            continue;
+          }
+          if (removal === 'notTeamais') {
+            log.warn(`[${scopeLabel}] ${describeMembersDirLeft(localPath, type === 'rules' ? `rules/${name}.md` : `${type}/${name}`, 'pull')}`);
             continue;
           }
           await remove(localPath);
@@ -681,22 +697,31 @@ export async function checkoutKey(projectRoot: string): Promise<string> {
 }
 
 /**
- * The records of `records` whose checkout still exists: one `git worktree
- * list` per full sync, so a removed or re-created worktree's entry does not
- * stay in state.json forever. A repository always lists its main checkout, so
- * an empty list means git failed (or there is no repository) and every record
- * is kept: a stale key matches no checkout, while a dropped one sends push
- * back to the shared revision (#812).
+ * The records of `records` to keep, probed once per full sync so a removed or
+ * re-created worktree's entry does not stay in state.json forever. A record
+ * goes when its `root` is no longer a checkout of this repository
+ * (isLiveCheckout), or is one under another key: a worktree re-created at the
+ * same path starts fresh (#807). It is not read from `git worktree list`,
+ * which does not list the main checkout of a `--separate-git-dir` repo or a
+ * submodule (#993). A record without `root`, from an older CLI, is kept until
+ * its own checkout's pull writes one, and so is every record when git cannot
+ * name this repository's common directory: a stale key matches no checkout,
+ * while a dropped one sends push back to the shared revision (#812).
  */
 async function liveCheckoutRecords(
   projectRoot: string,
   records: State['lastPullByWorkspace'],
 ): Promise<State['lastPullByWorkspace']> {
   if (!records) return undefined;
-  const roots = await listWorktrees(projectRoot);
-  if (roots.length === 0) return records;
-  const live = new Set(await Promise.all(roots.map(checkoutKey)));
-  return Object.fromEntries(Object.entries(records).filter(([key]) => live.has(key)));
+  const commonDir = await gitCommonDir(projectRoot);
+  if (!commonDir) return records;
+  const kept = await Promise.all(Object.entries(records).map(async ([key, record]) => {
+    const { root } = record;
+    const live = root === undefined
+      || (await isLiveCheckout(root, commonDir) && await checkoutKey(root) === key);
+    return live ? [key, record] as const : null;
+  }));
+  return Object.fromEntries(kept.filter((entry) => entry !== null));
 }
 
 export type CheckoutRecord = NonNullable<State['lastPullByWorkspace']>[string];
@@ -844,8 +869,14 @@ function setAgentModels(record: CheckoutRecord, agentModels: AgentModelRecords):
 
 /** The ledger a pull of that checkout starts from (see DeliveryLedger). */
 async function openCheckoutLedger(localConfig: LocalConfig, state?: State): Promise<DeliveryLedger> {
-  const record = await deliveringCheckoutRecord(localConfig, state);
-  return openLedger(record?.delivered, record?.agentModels);
+  const key = await checkoutRecordKey(localConfig);
+  const records = (state ?? await loadStateForScope(localConfig)).lastPullByWorkspace ?? {};
+  const record = key ? records[key] : undefined;
+  // Only words a kept copy (#993): a record lost to a new key is not this checkout's.
+  const otherRecords: DeliveredHashes = Object.assign({}, ...Object.entries(records)
+    .filter(([other]) => other !== key)
+    .map(([, other]) => other.delivered ?? {}));
+  return openLedger(record?.delivered, record?.agentModels, otherRecords);
 }
 
 /**
@@ -990,6 +1021,7 @@ function awaitingFullSync(records: Record<string, CheckoutRecord>): Record<strin
     const pushBaseRevs = checkoutBaseRevs(record).slice(0, MAX_PUSH_BASE_REVS);
     const reset: CheckoutRecord = {
       rev: FORCED_FULL_SYNC_REV,
+      ...(record.root !== undefined ? { root: record.root } : {}),
       targets: record.targets,
       ...(record.delivered ? { delivered: record.delivered } : {}),
       ...(record.agentModels ? { agentModels: record.agentModels } : {}),
@@ -1458,6 +1490,9 @@ async function pullForScope(
   // which they fix without a new team revision, so the next pull must sync
   // again to deliver what was held.
   let agentModelsHeld = false;
+  // Set when a file of the member's own holds a team resource back (#993):
+  // the next pull must sync again, so it delivers once the file is gone.
+  let membersFilesKept = false;
   let knownRepoSkillNames: Set<string> | null = null;
   // name → team-repo source dir, for the data-safety check in Step 3b cleanup.
   let knownRepoSkillSources: Map<string, string> | null = null;
@@ -1485,7 +1520,7 @@ async function pullForScope(
         if (items.length > 0) {
           log.success(`[${scopeLabel}] Synced ${items.length} rule(s)${skippedByTags > 0 ? ` (skipped ${skippedByTags} by tags)` : ''}`);
         }
-        reportKept(ledger, scopeLabel);
+        if (reportKept(ledger, scopeLabel) > 0) membersFilesKept = true;
       }
       totalSynced += items.length;
       continue;
@@ -1521,12 +1556,21 @@ async function pullForScope(
         const desired = await resolveDesiredDocs(localConfig.repo.localPath, roleContext?.inactiveDocsNamespaces ?? []);
         const fileCount = desired.files.length;
         const destination = resolveDocsDestination(freshConfig, localConfig);
+        // A mirror that is a link of the member's is never walked, not even to count or preview (#993).
+        if (await isLinkedDocsRoot(destination)) {
+          log.warn(`[${scopeLabel}] ${options.dryRun ? '[dry-run] ' : ''}${describeLinkedDocsRoot(destination, 'pull')}`);
+          if (!options.dryRun) membersFilesKept = true;
+          continue;
+        }
         if (fileCount === 0 && await docsHandler.countDocFiles(destination) === 0
           && (await listStaleDocDirectories(desired.sourceDir, destination)).length === 0) continue;
         if (options.dryRun) {
           log.info(`[${scopeLabel}] [dry-run] Would sync ${fileCount} docs and remove stale local docs`);
+          for (const file of await membersDocs(desired, destination, localConfig.repo.localPath)) {
+            log.info(`[${scopeLabel}] [dry-run] Would keep ${path.join(destination, file)}: ${notTeamaisReason(`docs/${file}`)}.`);
+          }
         } else {
-          await docsHandler.pullDocs(desired, freshConfig, localConfig);
+          if (await docsHandler.pullDocs(desired, freshConfig, localConfig) > 0) membersFilesKept = true;
           log.success(`[${scopeLabel}] Synced ${fileCount} docs`);
         }
         totalSynced += fileCount;
@@ -1619,6 +1663,12 @@ async function pullForScope(
       for (const item of items) {
         await handler.pullItem(item, freshConfig, localConfig, ledger);
       }
+      // A copy that failed (each said as it happened) leaves the pull unsynced, as a kept file of the
+      // member's does: the revision stays, and the next pull is a full one that retries it.
+      if (ledger.failed.splice(0).length > 0) {
+        membersFilesKept = true;
+        if (result) result.resourceSyncFailed = true;
+      }
       // Agents whose model cannot be resolved reach no tool: said once per reason, and not counted as synced.
       if (ledger.held.length > 0) agentModelsHeld = true;
       const held = ledger.held.length > 0 ? reportHeldAgents(ledger) : 0;
@@ -1633,7 +1683,7 @@ async function pullForScope(
           log.success(`[${scopeLabel}] Synced ${items.length} ${type}`);
         }
       }
-      reportKept(ledger, scopeLabel);
+      if (reportKept(ledger, scopeLabel) > 0) membersFilesKept = true;
     }
 
     totalSynced += items.length;
@@ -1721,7 +1771,15 @@ async function pullForScope(
             if (!excludedSkills.has(skillName) || BUILTIN_SKILL_NAMES.has(skillName)) continue;
             const nestedSkillDir = path.join(namespaceDir, skillName);
             if (!await pathExists(path.join(nestedSkillDir, 'SKILL.md'))) continue;
+            // A name is no proof: the member's own skill can sit in a folder
+            // of theirs. Only teamai's copy goes (#993); pull never delivers
+            // here, so the member's stays without a line on every pull.
+            if (await judgeRemoval(ledger.previous, nestedSkillDir, skillOrigin(localConfig.repo.localPath, skillName)) !== 'remove') {
+              log.debug(`Kept ${nestedSkillDir}: it is not teamai's copy of the excluded skill ${skillName}`);
+              continue;
+            }
             await remove(nestedSkillDir);
+            forgetDelivered(ledger.hashes, nestedSkillDir);
             log.debug(`Removed excluded skill ${namespace}/${skillName} from ${tool}`);
           }
         }
@@ -1822,11 +1880,12 @@ async function pullForScope(
         state.lastPull = new Date().toISOString();
       }
       // A failed submodule update keeps the previous rev so the next pull
-      // retries the update (see refreshTeamRepo); so does a held agent.
-      if (!submodulesFailed && !agentModelsHeld) state[revisionField] = deliveredRev;
+      // retries the update (see refreshTeamRepo); so does a held agent, or a
+      // team resource a member's own file holds back.
+      if (!submodulesFailed && !agentModelsHeld && !membersFilesKept) state[revisionField] = deliveredRev;
       state[targetsField] = syncedTargets;
     }
-    const complete = !docsSyncFailed && !submodulesFailed && !agentModelsHeld;
+    const complete = !docsSyncFailed && !submodulesFailed && !agentModelsHeld && !membersFilesKept;
     if (recordKey && deliveredRev && (!complete || revisionField === 'lastInheritedPullRev')) {
       // An inherited pull moves HOME's skills, rules and agents, not the rest,
       // and an incomplete one keeps its marker for a retry, yet both delivered
@@ -1835,9 +1894,17 @@ async function pullForScope(
       const record = localConfig.scope === 'user'
         ? await userScopeRecord(state)
         : state.lastPullByWorkspace?.[recordKey] ?? { rev: FORCED_FULL_SYNC_REV, targets: syncedTargets };
+      if (localConfig.scope === 'project' && localConfig.projectRoot) record.root = localConfig.projectRoot;
       addPushBaseRev(record, deliveredRev);
       record.delivered = ledger.hashes;
       setAgentModels(record, ledger.agentModels);
+      // Not advancing the revision is not enough when this checkout was at it
+      // already (`pull --force`, or after an older CLI's pull): miss the fast
+      // path outright, so a pull after the member's file is gone delivers.
+      if (membersFilesKept) {
+        if (workspaceKey) record.rev = FORCED_FULL_SYNC_REV;
+        else state[revisionField] = null;
+      }
       state.lastPullByWorkspace = { ...state.lastPullByWorkspace, [recordKey]: record };
     } else if (recordKey && deliveredRev) {
       // A forced full sync (lastPullRev cleared) leaves every other checkout
@@ -1851,7 +1918,12 @@ async function pullForScope(
         ? await liveCheckoutRecords(localConfig.projectRoot, state.lastPullByWorkspace)
         : undefined;
       const others = previousRev === null && live ? awaitingFullSync(live) : live;
-      const record: CheckoutRecord = { rev: deliveredRev, targets: syncedTargets, delivered: ledger.hashes };
+      const record: CheckoutRecord = {
+        rev: deliveredRev,
+        ...(localConfig.scope === 'project' && localConfig.projectRoot ? { root: localConfig.projectRoot } : {}),
+        targets: syncedTargets,
+        delivered: ledger.hashes,
+      };
       setAgentModels(record, ledger.agentModels);
       state.lastPullByWorkspace = {
         ...others,
@@ -1896,12 +1968,13 @@ async function pullForScope(
 
   // Every checkout of the repo keeps `workspaces/<id>/` in the shared data home
   // (search index, managed MCP, resource cache), and a removed worktree's stays
-  // behind. A full sync drops those; the fast path never lists worktrees (#808).
+  // behind. A full sync records its own root there and drops the directories of
+  // checkouts that are gone; the fast path probes none (#808, #993).
   if (localConfig.scope === 'project' && localConfig.projectRoot && !options.dryRun) {
     try {
-      const { listWorktrees } = await import('./utils/git.js');
-      const { pruneWorkspaceDirs } = await import('./utils/partition.js');
-      const removed = await pruneWorkspaceDirs(getDataHome(localConfig), await listWorktrees(localConfig.projectRoot));
+      const { pruneWorkspaceDirs, writeWorkspaceRoot } = await import('./utils/partition.js');
+      await writeWorkspaceRoot(getDataHome(localConfig), localConfig.projectRoot);
+      const removed = await pruneWorkspaceDirs(getDataHome(localConfig), localConfig.projectRoot);
       if (removed.length > 0) log.debug(`[${scopeLabel}] removed ${removed.length} directory(ies) of removed worktrees`);
     } catch (e) {
       log.debug(`[${scopeLabel}] workspace prune skipped: ${e instanceof Error ? e.message : String(e)}`);
@@ -2077,7 +2150,7 @@ async function syncManagedInstructions(
   if (opencodeFallback && opencodeFallbackStale) {
     log.warn(`[${scopeLabel}] OpenCode reads the team instructions from ${opencodeFallback}, its fallback while ~/.config/opencode/AGENTS.md does not exist, but teamai no longer updates them there: Claude Code is excluded or not installed. Create that AGENTS.md to have teamai deliver them to OpenCode's own file, or remove the teamai blocks from ${opencodeFallback}.`);
   } else if (opencodeFallback) {
-    log.info(`[${scopeLabel}] OpenCode reads the team instructions from ${opencodeFallback}, its fallback while ~/.config/opencode/AGENTS.md does not exist, so teamai adds no second copy for it. Create that AGENTS.md to have teamai deliver them to OpenCode's own file instead.`);
+    log.info(`[${scopeLabel}] OpenCode reads the team instructions from ${opencodeFallback}, its fallback while ~/.config/opencode/AGENTS.md does not exist, so teamai lists no second copy in its instructions. OpenCode V2, which reads neither, gets them from ~/.config/opencode/teamai-context.md through teamai's plugin. Create that AGENTS.md to have teamai list OpenCode's own file instead.`);
   }
   // Retired files are cleaned after hook reconciliation, using the delivery
   // results from this pass. A failed replacement must keep its working copy.
@@ -2095,7 +2168,8 @@ async function syncManagedInstructions(
     const registered = await registerOpencodeContext(config, localConfig, resolved, dryRun, files);
     if (registered && dryRun) log.info(`[dry-run] ${registered}`);
     else if (registered) log.debug(registered);
-    if (!dryRun && targets.some((target) => target.tools.includes('opencode'))
+    // Beside the Claude fallback V1 reads CLAUDE.md, so no entry is wanted.
+    if (!dryRun && !opencodeFallback && targets.some((target) => target.tools.includes('opencode'))
       && Object.values(blocks).some(Boolean)) {
       const { opencodeContextReference, readOpencodeInstructionList } = await import('./resources/opencode-config.js');
       const target = targets.find((target) => target.tools.includes('opencode'))!;
@@ -2903,15 +2977,23 @@ async function reconcileMcpAllScopes(
         errors.push(`[${localConfig.scope}] MCP: team config could not be loaded`);
         continue;
       }
-      const { reconcileMcpForConfig } = await import('./mcp-reconcile.js');
+      const { reconcileMcpForConfig, describeKeptMemberServer } = await import('./mcp-reconcile.js');
+      // Not `--force`: it means a full sync here, never taking a member's own server (#993).
       const { changes, unresolved } = await reconcileMcpForConfig(teamConfig, localConfig, {
-        force: options.force, dryRun: options.dryRun, teamEnv: await scopeEnv(localConfig, teamEnvs),
+        dryRun: options.dryRun, teamEnv: await scopeEnv(localConfig, teamEnvs),
       });
       if (unresolved) errors.push(`[${localConfig.scope}] Team MCP configuration could not be resolved`);
 
       const applied = changes.filter((c) => c.action !== 'skipped');
+      const named = new Set<string>();
       for (const c of changes) {
-        if (c.action === 'skipped') log.debug(`[mcp] ${c.tool}/${c.server}: skipped — ${c.reason}`);
+        if (c.action !== 'skipped') continue;
+        log.debug(`[mcp] ${c.tool}/${c.server}: skipped — ${c.reason}`);
+        // Two tools sharing a file (Claude and CodeBuddy's .mcp.json) name it once.
+        if (c.member && c.file && !named.has(`${c.file}\0${c.server}`)) {
+          named.add(`${c.file}\0${c.server}`);
+          log.warn(describeKeptMemberServer(c.server, c.file));
+        }
       }
       if (applied.length > 0 && !options.silent) {
         const servers = [...new Set(applied.map((c) => c.server))];
@@ -2989,18 +3071,26 @@ async function reconcileCoAuthorAllScopes(
       const state = await loadStateForScope(localConfig);
       const { changes, managed } = await reconcileCoAuthorForConfig(teamConfig, localConfig, state);
 
-      const applied = changes.filter((c) => c.action !== 'skipped');
+      const applied = changes.filter((c) => c.action === 'updated');
       for (const c of changes) {
         if (c.action === 'skipped') log.debug(`[coauthor] ${c.tool}: skipped — ${c.reason}`);
       }
-      if (applied.length > 0) {
+      // Also persists a dropped record of a pre-#993 shared file (#993).
+      if (JSON.stringify(managed) !== JSON.stringify(state.coAuthorManaged ?? {})) {
         state.coAuthorManaged = managed;
         await saveStateForScope(state, localConfig);
-        if (!options.silent) {
-          const verb = applied[0].enabled ? 'enabled' : 'disabled';
-          const tools = [...new Set(applied.map((c) => c.tool))];
-          log.info(`Co-author trailer ${verb} for ${tools.join(', ')}. Restart your AI tool session to apply.`);
-        }
+      }
+      if (options.silent) continue;
+      for (const c of changes.filter((change) => change.action === 'removed')) {
+        log.info(`Removed the co-author setting an earlier teamai wrote to ${c.file}, a shared project file (teamai now writes it only to .claude/settings.local.json). Commit the change if the file is tracked.`);
+      }
+      for (const c of changes.filter((change) => change.action === 'moved')) {
+        log.info(`Moved the co-author setting an earlier teamai wrote to ${c.file}, a shared project file, to .claude/settings.local.json; your trailer setting is unchanged. Commit the change if the file is tracked.`);
+      }
+      if (applied.length > 0) {
+        const verb = applied[0].enabled ? 'enabled' : 'disabled';
+        const tools = [...new Set(applied.map((c) => c.tool))];
+        log.info(`Co-author trailer ${verb} for ${tools.join(', ')}. Restart your AI tool session to apply.`);
       }
     } catch (e) {
       log.debug(`[${localConfig.scope}] co-author reconcile skipped: ${(e as Error).message}`);

@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { readFileSafe, writeJsonAtomic, pathExists, remove } from '../utils/fs.js';
+import { readFileSafe, writeJsonAtomic, pathExists, remove, symlinkTarget } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
 
 // ─── OpenCode config activation ──────────────────────────────
@@ -124,7 +124,8 @@ export function opencodeRuleGlobs(
  * is desired. A file that exists but cannot be parsed as a JSON object is left
  * strictly alone (it may hold config we do not understand), and the function
  * returns false. With `deleteIfEmpty`, a file left holding nothing but the
- * `$schema` OpenCode adds is deleted: for a config file teamai creates.
+ * `$schema` OpenCode adds is deleted: for a config file teamai creates. A
+ * symlink is the member's: written at its target, and never deleted.
  */
 export async function reconcileOpencodeInstructionSet(
   configFileAbs: string,
@@ -137,7 +138,7 @@ export async function reconcileOpencodeInstructionSet(
 
   if (!exists) {
     if (desired.length === 0) return false;
-    await writeJsonAtomic(configFileAbs, { instructions: [...desired] });
+    await writeJsonAtomic(await symlinkTarget(configFileAbs), { instructions: [...desired] });
     log.debug(`Created ${configFileAbs} with teamai ${purpose} entries`);
     return true;
   }
@@ -179,12 +180,14 @@ export async function reconcileOpencodeInstructionSet(
     data.instructions = next;
   }
 
-  if (deleteIfEmpty && Object.keys(data).every((key) => key === '$schema')) {
+  // A symlink there is the member's (a dotfiles setup): written at the file it points to, never deleted.
+  const target = await symlinkTarget(configFileAbs);
+  if (deleteIfEmpty && target === configFileAbs && Object.keys(data).every((key) => key === '$schema')) {
     await remove(configFileAbs);
     log.debug(`Removed ${configFileAbs}: it held only teamai ${purpose} entries`);
     return true;
   }
-  await writeJsonAtomic(configFileAbs, data);
+  await writeJsonAtomic(target, data);
   log.debug(`Reconciled teamai ${purpose} entries in ${configFileAbs}`);
   return true;
 }

@@ -24,6 +24,7 @@
     "build": "tsup",
     "dev": "tsup --watch",
     "test": "vitest run",
+    "pretest:e2e": "npm run build",
     "test:e2e": "vitest run --config vitest.e2e.config.ts",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",

@@ -518,6 +518,27 @@ describe('push places new rules and agents in a namespace (issue #649)', () => {
     expect(fs.existsSync(path.join(rulesDir, 'be-know', 'my-rule.md')), pulled.output).toBe(false);
   }, 60_000);
 
+  it('pull keeps a member\'s own file at the namespaced path beside the author\'s root copy, and removes teamai\'s (#993)', async () => {
+    const fixture = track(makeFixture({ agent: 'claude', provider: 'git' }));
+    writeLocalResources(fixture);
+    await runCLI(['push', '--role', 'be-know', '--all'], fixture.projectRoot, fixture.home);
+    mergeBranch(fixture, branchFiles(fixture).branch);
+    const namespaced = path.join(fixture.projectRoot, '.claude/rules', 'be-know', 'my-rule.md');
+    fs.mkdirSync(path.dirname(namespaced), { recursive: true });
+    fs.writeFileSync(namespaced, 'MY OWN NOTES\n');
+
+    const kept = await runCLI(['pull', '--force'], fixture.projectRoot, fixture.home);
+    expect(kept.code, kept.output).toBe(0);
+    expect(fs.readFileSync(namespaced, 'utf8')).toBe('MY OWN NOTES\n');
+    expect(kept.output).toMatch(/Kept \S+be-know\/my-rule\.md: it is not teamai's \(no delivery record, and it matches no team version of rules\/be-know\/my-rule\.md\), so pull left it\./);
+
+    // An unrecorded copy of a team version is teamai's: the same rule twice, so it goes.
+    fs.writeFileSync(namespaced, '# Rule v1\n');
+    const removed = await runCLI(['pull', '--force'], fixture.projectRoot, fixture.home);
+    expect(removed.code, removed.output).toBe(0);
+    expect(fs.existsSync(namespaced), removed.output).toBe(false);
+  }, 60_000);
+
   it('leaves a shared-root PR untouched when the next push names a namespace', async () => {
     // No knowledge namespace on the role, so the first push goes to the shared root.
     const fixture = track(makeFixture({

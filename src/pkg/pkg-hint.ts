@@ -2,7 +2,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { detectProjectConfig, loadLocalConfig } from '../config.js';
-import { getTeamaiHome } from '../types.js';
 import { ensureDir, readJson, writeJsonAtomic } from '../utils/fs.js';
 import { getUserHome } from '../utils/home.js';
 import { log } from '../utils/logger.js';
@@ -10,6 +9,7 @@ import {
   hasPackageDeclarations,
   loadPackageLock,
   loadPackageManifest,
+  packageLockDir,
   packageDeclarationHash,
   packageProjectKey,
   projectNpmDeclarationHash,
@@ -75,9 +75,7 @@ async function computePackageHintState(cwd: string): Promise<PackageHintState | 
   const context = await loadPackageContext(cwd);
   if (!context) return null;
   const { localConfig, manifest } = context;
-  const lock = await loadPackageLock(
-    getTeamaiHome(localConfig.scope, localConfig.projectRoot),
-  );
+  const lock = await loadPackageLock(await packageLockDir(localConfig));
   if (isDeclarationAcknowledged(localConfig, manifest, lock, cwd)) return null;
 
   return {

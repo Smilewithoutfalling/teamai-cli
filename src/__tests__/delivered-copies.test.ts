@@ -1,6 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import fc from 'fast-check';
-import { classifyCopy, type DeliveredFile } from '../resources/delivered-copies.js';
+import { classifyCopy, describeKeptDir, judgeRemoval, type DeliveredFile } from '../resources/delivered-copies.js';
+import { commitTeamRepo } from './helpers/team-repo-history.js';
 
 // #822 item 5: pull keeps a copy only when the record proves teamai wrote
 // other bytes there than the member has now.
@@ -48,5 +53,101 @@ describe('classifyCopy', () => {
         && copy.some((f) => f.disk !== null);
       expect(classifyCopy(copy).kind).toBe(proven ? 'keep' : 'write');
     }));
+  });
+});
+
+// #993: a copy of a resource no longer delivered is removed, kept as the
+// member's edit, or kept as not teamai's; the caller words each one.
+describe('judgeRemoval', () => {
+  let root: string;
+  let repo: string;
+  let copy: string;
+  const sha = (text: string): string => crypto.createHash('sha256').update(text).digest('hex');
+  const origin = (): { repoPath: string; pathspec: string } => ({ repoPath: repo, pathspec: 'rules/r.md' });
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'judge-removal-'));
+    repo = path.join(root, 'team');
+    fs.mkdirSync(path.join(repo, 'rules'), { recursive: true });
+    fs.writeFileSync(path.join(repo, 'rules', 'r.md'), 'team v1');
+    commitTeamRepo(repo);
+    copy = path.join(root, 'r.md');
+  });
+  afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  it('removes a recorded copy the member did not change', async () => {
+    fs.writeFileSync(copy, 'team v1');
+    expect(await judgeRemoval({ [copy]: sha('team v1') }, copy, origin())).toBe('remove');
+  });
+
+  it('keeps a recorded copy the member changed as an edit', async () => {
+    fs.writeFileSync(copy, 'mine');
+    expect(await judgeRemoval({ [copy]: sha('team v1') }, copy, origin())).toBe('edited');
+  });
+
+  it('removes an unrecorded copy that holds a team version', async () => {
+    fs.writeFileSync(copy, 'team v1');
+    expect(await judgeRemoval({}, copy, origin())).toBe('remove');
+  });
+
+  it('keeps an unrecorded copy that holds no team version as not teamai\'s', async () => {
+    fs.writeFileSync(copy, 'mine');
+    expect(await judgeRemoval({}, copy, origin())).toBe('notTeamais');
+  });
+
+  it('keeps it as an edit when another checkout record shows teamai wrote that path', async () => {
+    fs.writeFileSync(copy, 'mine');
+    expect(await judgeRemoval({}, copy, origin(), { [copy]: sha('team v1') })).toBe('edited');
+  });
+
+  it('keeps a link at the path, recorded or not, and never follows it', async () => {
+    const target = path.join(root, 'elsewhere.md');
+    fs.writeFileSync(target, 'team v1');
+    fs.symlinkSync(target, copy);
+    expect(await judgeRemoval({}, copy, origin())).toBe('notTeamais');
+    expect(await judgeRemoval({ [copy]: sha('team v1') }, copy, origin())).toBe('edited');
+  });
+
+  it('keeps a recorded skill directory as an edit when the member replaced a file in it with a link to the same bytes', async () => {
+    const skill = path.join(root, 'skill');
+    fs.mkdirSync(skill);
+    const target = path.join(root, 'elsewhere.md');
+    fs.writeFileSync(target, 'team v1');
+    fs.symlinkSync(target, path.join(skill, 'SKILL.md'));
+    expect(await judgeRemoval({ [path.join(skill, 'SKILL.md')]: sha('team v1') }, skill, origin())).toBe('edited');
+  });
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)('keeps an unrecorded file it cannot read as not teamai\'s', async () => {
+    fs.writeFileSync(copy, 'team v1');
+    fs.chmodSync(copy, 0o000);
+    expect(await judgeRemoval({}, copy, origin())).toBe('notTeamais');
+    fs.chmodSync(copy, 0o600);
+  });
+
+  it('removes an unrecorded copy when no origin can prove whose it is, as before', async () => {
+    fs.writeFileSync(copy, 'mine');
+    expect(await judgeRemoval({}, copy)).toBe('remove');
+  });
+});
+
+// #993: a skill directory remove or uninstall left is named for why it stayed.
+describe('describeKeptDir', () => {
+  let root: string;
+  beforeEach(() => { root = fs.mkdtempSync(path.join(os.tmpdir(), 'kept-dir-')); });
+  afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  it('names a link, a directory holding a link, and a directory of the member\'s apart', async () => {
+    const target = path.join(root, 'target');
+    fs.mkdirSync(target);
+    const link = path.join(root, 'linked');
+    fs.symlinkSync(target, link);
+    const holding = path.join(root, 'holding');
+    fs.mkdirSync(holding);
+    fs.symlinkSync(path.join(target, 'x'), path.join(holding, 'x'));
+    const plain = path.join(root, 'plain');
+    fs.mkdirSync(plain);
+    expect(await describeKeptDir(link, 'skills/a', 'uninstall')).toBe(`Kept ${link}: it is a link of yours, so uninstall left it.`);
+    expect(await describeKeptDir(holding, 'skills/a', 'uninstall')).toBe(`Kept ${holding}: it holds a link of yours, so uninstall left it.`);
+    expect(await describeKeptDir(plain, 'skills/a', 'uninstall')).toContain('it is not teamai\'s');
   });
 });

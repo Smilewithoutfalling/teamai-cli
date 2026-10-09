@@ -6,7 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { transformSync } from 'esbuild';
 import { parseDocument } from 'yaml';
 import {
-  applyOpenClawAgentHook, removeOpenClawAgentHook, injectOpenClawHooks, removeOpenClawHooks, resolveOpenclawWorkspaceDir, OPENCLAW_HOOK_DIR,
+  applyOpenClawAgentHook, removeOpenClawAgentHook, injectOpenClawHooks, removeOpenClawHookEntry, removeOpenClawHooks, resolveOpenclawWorkspaceDir, OPENCLAW_HOOK_DIR,
 } from '../openclaw-hooks.js';
 import { reconcileHooksToAllTools } from '../hooks.js';
 import { log } from '../utils/logger.js';
@@ -101,6 +101,23 @@ describe('injectOpenClawHooks enables the hook in openclaw.json', () => {
     expect(cfg.hooks.internal.enabled).toBeUndefined();
     expect(cfg.agents.defaults.workspace).toBe(wsDir);
     expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('writes a symlinked openclaw.json at its target and keeps the link, on enable and on removal', async () => {
+    const target = path.join(tmpDir, 'dotfiles', 'openclaw.json');
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.renameSync(cfgPath(), target);
+    fs.symlinkSync(target, cfgPath());
+
+    await injectOpenClawHooks(wsDir, 'openclaw');
+
+    expect(fs.lstatSync(cfgPath()).isSymbolicLink()).toBe(true);
+    expect(JSON.parse(fs.readFileSync(target, 'utf-8')).hooks.internal.entries['teamai-status-report']).toEqual({ enabled: true });
+
+    await removeOpenClawHookEntry();
+
+    expect(fs.lstatSync(cfgPath()).isSymbolicLink()).toBe(true);
+    expect(JSON.parse(fs.readFileSync(target, 'utf-8'))).toEqual({ agents: { defaults: { workspace: wsDir } } });
   });
 
   it('adds the entry beside existing named entries', async () => {

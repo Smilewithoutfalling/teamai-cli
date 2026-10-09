@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { autoDetectInit } from './config.js';
-import { reconcileHooks, reconcileHooksToAllTools, reconcileTeamHooksForConfig, sweepLegacyProjectHooks, getHookStatus, reportCodexTrust, resolveMainCheckoutHooks, trustCodexForScope, type HookStatus } from './hooks.js';
+import { migrateLegacyManagedHooks, reconcileHooks, reconcileHooksToAllTools, reconcileTeamHooksForConfig, sweepLegacyProjectHooks, getHookStatus, reportCodexTrust, resolveMainCheckoutHooks, trustCodexForScope, type HookStatus } from './hooks.js';
 import { applyBuiltinOverride, installedBuiltinHookDefs } from './builtin-hooks.js';
 import { resolveTeamHookEntries } from './resources/hooks.js';
 import { describeEntryFailure, describeOrigin, reportUndeliveredEntryNotices } from './namespaced-entries.js';
@@ -96,7 +96,7 @@ async function adapterHookArtifacts(tool: string): Promise<string[] | null> {
  * Reconciles built-in (A) + team (B) hooks into all configured AI tool settings.
  */
 export async function hooksInject(options: GlobalOptions): Promise<void> {
-    const { localConfig, teamConfig } = await autoDetectInit();
+    const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: options.dryRun });
 
     // Explicit user action → not gated by sharing.hooks.autoApply (auto: false).
     let reconciled: Awaited<ReturnType<typeof reconcileTeamHooksForConfig>>;
@@ -104,15 +104,23 @@ export async function hooksInject(options: GlobalOptions): Promise<void> {
         reconciled = await reconcileTeamHooksForConfig(teamConfig, localConfig, {
             auto: false,
             silent: options.silent,
+            dryRun: options.dryRun,
         });
     } finally {
         // Git-hook installation can fail after the Codex hooks were written.
-        const codexTrust = await trustCodexForScope(teamConfig, localConfig, { force: true });
-        if (!options.silent) reportCodexTrust(codexTrust, 'all');
+        if (!options.dryRun) {
+            const codexTrust = await trustCodexForScope(teamConfig, localConfig, { force: true });
+            if (!options.silent) reportCodexTrust(codexTrust, 'all');
+        }
     }
     // The reason is already reported; the installed team hooks were left as they were.
     if (!reconciled.ok) {
         process.exitCode = 1;
+        return;
+    }
+    if (options.dryRun) {
+        if (!options.silent) log.info('[dry-run] Would inject hooks into configured AI tool settings.');
+        return;
     }
     if (!options.silent && reconciled.ok) log.success('Hooks injected into all AI tool settings');
 }
@@ -268,6 +276,8 @@ export async function hooksList(_options: GlobalOptions): Promise<void> {
  */
 export async function hooksRemove(_options: GlobalOptions): Promise<void> {
     const { localConfig, teamConfig } = await autoDetectInit();
+    // An index an older release left in the tree still owns Copilot's team hooks (#993).
+    await migrateLegacyManagedHooks(localConfig);
 
     const { baseDir, manifestPath, scope: hookScope } = resolveHookScope(localConfig);
     // Removal must target the same paths injection used. A non-self project
@@ -291,7 +301,7 @@ export async function hooksRemove(_options: GlobalOptions): Promise<void> {
             COPILOT_TOOL_ID,
             [],
             {
-                manifestPath: getManagedHooksPath(localConfig.scope, localConfig.projectRoot),
+                manifestPath: getManagedHooksPath(localConfig),
                 removeAll: true,
             },
         );

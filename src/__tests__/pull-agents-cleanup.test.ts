@@ -15,7 +15,9 @@ vi.mock('../config.js', async (importOriginal) => ({
   saveStateForScope: vi.fn(),
 }));
 
-vi.mock('../utils/git.js', () => ({
+vi.mock('../utils/git.js', async (importOriginal) => ({
+  // The history proof of an unrecorded copy reads the team repo (#993).
+  createGit: (await importOriginal<typeof import('../utils/git.js')>()).createGit,
   pullRepo: vi.fn().mockResolvedValue('Already up to date.'),
 }));
 
@@ -49,6 +51,7 @@ import { pull } from '../pull.js';
 import { loadLocalConfigForScope, loadTeamConfig, detectProjectConfig } from '../config.js';
 import { log } from '../utils/logger.js';
 import type { TeamaiConfig, LocalConfig } from '../types.js';
+import { commitTeamRepo } from './helpers/team-repo-history.js';
 
 const ROLES_YAML = `
 version: 1
@@ -152,6 +155,8 @@ describe('pull agents cleanup after role change', () => {
   it('removes an old Codex render when the active same-stem source is legacy Markdown', async () => {
     await fse.outputFile(path.join(repoPath, 'agents/frontend/reviewer.yaml'), 'name: reviewer\ndescription: Old\ninstructions: Review old.\n');
     await fse.outputFile(path.join(repoPath, 'agents/devops/reviewer.md'), '# Active legacy agent\n');
+    // The state is not saved here, so the history proves the Claude copy teamai's (#993).
+    commitTeamRepo(repoPath);
     await pull({});
     const codexCopy = path.join(homeDir, '.codex/agents/reviewer.toml');
     expect(await fse.pathExists(codexCopy)).toBe(true);

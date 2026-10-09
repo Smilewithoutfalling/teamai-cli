@@ -24,7 +24,7 @@
  */
 
 import path from 'node:path';
-import { writeFile, writeIfChanged, ensureDir, pathExists, readJsonObject, writeJsonAtomic, remove } from './utils/fs.js';
+import { writeFile, writeIfChanged, ensureDir, pathExists, readJsonObject, writeJsonAtomic, remove, symlinkTarget } from './utils/fs.js';
 import { log } from './utils/logger.js';
 import { expandHome, getUserHome } from './utils/home.js';
 
@@ -268,7 +268,7 @@ async function enableOpenClawHookEntry(hookKey: string, source: 'workspace' | 'm
   const hooks = config.hooks && typeof config.hooks === 'object' ? config.hooks as Record<string, unknown> : {};
   config.hooks = { ...hooks, internal: { ...internal, entries: { ...entries, [hookKey]: { ...entry, enabled: true } } } };
   try {
-    await writeJsonAtomic(cfgPath, config);
+    await writeJsonAtomic(await symlinkTarget(cfgPath), config);
     log.success(`Enabled the teamai OpenClaw hook ${hookKey} in ${cfgPath}`);
   } catch (e) {
     log.warn(`OpenClaw: could not enable the teamai hook ${hookKey} in ${cfgPath}: ${(e as Error).message}. Run ${enableCmd}.`);
@@ -310,7 +310,7 @@ export async function removeOpenClawHookEntry(hookKey: string = OPENCLAW_HOOK_KE
   const hooks = cfg.hooks as Record<string, unknown>;
   const nextHooks = nextInternal ? { ...hooks, internal: nextInternal } : withoutKey(hooks, 'internal');
   const next = nextHooks ? { ...cfg, hooks: nextHooks } : withoutKey(cfg, 'hooks') ?? {};
-  await writeJsonAtomic(cfgPath, next);
+  await writeJsonAtomic(await symlinkTarget(cfgPath), next);
   log.success(`Removed the teamai OpenClaw hook entry ${hookKey} from ${cfgPath}`);
 }
 
@@ -430,7 +430,8 @@ export async function removeOpenClawAgentHook(opts: {
 /** Where OpenClaw's default agent reads its workspace from, as far as teamai can tell (`resolveOpenclawWorkspace`). */
 export type OpenclawWorkspace =
   | { readonly kind: 'found'; readonly dir: string }
-  | { readonly kind: 'none'; readonly tried: string }
+  /** `candidate` is the directory OpenClaw would read, although it does not exist. */
+  | { readonly kind: 'none'; readonly tried: string; readonly candidate: string }
   /** openclaw.json is there but not plain JSON, so a workspace it sets is unknown. */
   | { readonly kind: 'unreadable-config'; readonly file: string; readonly error: string; readonly fallback: string | null };
 
@@ -465,7 +466,7 @@ export async function resolveOpenclawWorkspace(workspacePath?: string): Promise<
   if (read.kind === 'invalid') {
     return { kind: 'unreadable-config', file: cfgPath, error: read.error, fallback: exists ? candidate : null };
   }
-  return exists ? { kind: 'found', dir: candidate } : { kind: 'none', tried: [workspacePath, candidate].filter(Boolean).join(', ') };
+  return exists ? { kind: 'found', dir: candidate } : { kind: 'none', tried: [workspacePath, candidate].filter(Boolean).join(', '), candidate };
 }
 
 /**

@@ -1,3 +1,4 @@
+import fse from 'fs-extra';
 import { readFileSafe, remove, writeFile } from './fs.js';
 
 /**
@@ -69,7 +70,9 @@ export async function removeClaudeMdSection(
     const after = existing.substring(endIdx + endMarker.length).replace(/^\n+/, startIdx === 0 ? '' : '\n');
     const rest = (before + after).trimEnd();
     if (options.deleteIfEmpty && rest.trim() === '') {
-        if (startIdx === 0) await remove(filePath);
+        // A link is the member's (a dotfiles setup): it stays, and its target is emptied instead.
+        const isLink = (await fse.lstat(filePath).catch(() => null))?.isSymbolicLink() ?? false;
+        if (startIdx === 0 && !isLink) await remove(filePath);
         else await writeFile(filePath, '');
     } else {
         await writeFile(filePath, rest + '\n');

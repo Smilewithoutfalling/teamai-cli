@@ -487,7 +487,8 @@ describe('OpenCode\'s Claude fallback (#945)', () => {
       const resolved = await resolveInstructionTargets(TeamaiConfigSchema.parse({ team: 't', repo: 'https://example.invalid/t.git' }), localConfig);
 
       expect(resolved.opencodeFallback).toBe(claudeFile);
-      expect(resolved.targets.map((t) => t.path)).not.toContain(path.join(home, '.config', 'opencode', 'teamai-context.md'));
+      // OpenCode V2 reads neither the fallback nor `instructions`: its file is still written, for teamai's plugin (#993).
+      expect(resolved.targets.map((t) => t.path)).toContain(path.join(home, '.config', 'opencode', 'teamai-context.md'));
     } finally {
       process.env.HOME = prevHome;
       fs.rmSync(root, { recursive: true, force: true });

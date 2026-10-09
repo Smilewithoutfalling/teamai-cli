@@ -512,6 +512,12 @@ describe('a rules sync that delivers no rule reclaims an older-format copy (#946
     const edited = path.join(homeDir, '.kiro', 'steering', 'other.md');
     await fse.outputFile(old, SCOPED);
     await fse.outputFile(edited, 'Other rule, my way.\n');
+    // A link of the member's is theirs even when its target holds the copy teamai wrote (#993).
+    await fse.outputFile(path.join(repoPath, 'rules', 'linked.md'), 'Linked rule.\n');
+    const linkTarget = path.join(tmpDir, 'mine', 'linked.md');
+    await fse.outputFile(linkTarget, 'Linked rule.\n');
+    const link = path.join(homeDir, '.kiro', 'steering', 'linked.md');
+    await fse.symlink(linkTarget, link);
     vi.stubEnv('HOME', homeDir);
     const { RulesHandler } = await import('../resources/rules.js');
     const localConfig = {
@@ -529,6 +535,8 @@ describe('a rules sync that delivers no rule reclaims an older-format copy (#946
 
     expect(await fse.pathExists(old)).toBe(false);
     expect(await fse.readFile(edited, 'utf8')).toBe('Other rule, my way.\n');
+    expect((await fse.lstat(link)).isSymbolicLink()).toBe(true);
+    expect(await fse.readFile(linkTarget, 'utf8')).toBe('Linked rule.\n');
   });
 });
 

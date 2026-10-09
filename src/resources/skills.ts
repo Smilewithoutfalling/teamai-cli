@@ -1,12 +1,13 @@
 import path from 'node:path';
 import YAML from 'yaml';
 import { isToolInstalledForConfig, ResourceHandler } from './base.js';
-import type { ResourceItem, ResourceItemStatus, DeliveryTarget, TeamaiConfig, LocalConfig } from '../types.js';
+import type { CopyOrigin, ResourceItem, ResourceItemStatus, DeliveryTarget, TeamaiConfig, LocalConfig } from '../types.js';
 import { getPushignorePath, isAgentExcluded, resolveToolBaseDir, scopedToolPaths, SELF_KNOWLEDGE_SCAN_KEY } from '../types.js';
 import { listDirs, listFilesRecursive, pathExists, copyDir, remove, pruneEmptyDirs, dirContentEqual, dirTeamSubsetEqual, fileContentEqual, fileHash, getDirLatestMtime, readFileSafe, writeFile } from '../utils/fs.js';
 import { log } from '../utils/logger.js';
+import { warnOnce } from '../utils/warn-once.js';
 import { getFileContentWhenAdded, isPastVersionOf } from '../utils/git.js';
-import { isCliOwnedSkillName } from '../builtin-skills.js';
+import { isCliOwnedSkillName, ownedSkillFiles, prunedWhole, removeOwnedFiles } from '../builtin-skills.js';
 import { resolveOpenclawWorkspaceDir } from '../openclaw-hooks.js';
 import { getHermesHome } from '../hermes-home.js';
 import {
@@ -16,7 +17,9 @@ import { loadProjectsManifest, resolveProjectResourceNamespaces } from '../proje
 import { assertSafeFallbackNamespaces } from '../manifest-schema.js';
 import { assertWithinRoot, resolveReal } from '../utils/path-safety.js';
 import { splitFrontmatter, stringifyFrontmatter } from '../utils/frontmatter.js';
-import { keepsEditedCopy, recordDelivered, type DeliveredHashes, type DeliveryLedger } from './delivered-copies.js';
+import {
+  blockingEntries, describeKeptDir, describeMembersDirLeft, describeMembersFile, describeMembersLink, describeSkippedLink, isLink, judgeCopy, keepsEditedCopy, membersLinkAt, ownsSkillDir, recordDelivered, teamaiSkillFiles, type DeliveredHashes, type DeliveryLedger,
+} from './delivered-copies.js';
 
 /** File name used to track who has contributed (pushed) a skill. */
 const CONTRIBUTORS_FILE = 'CONTRIBUTORS';
@@ -24,34 +27,63 @@ const SKILL_MD = 'SKILL.md';
 export const CODEX_TOOL = 'codex';
 export const SHARED_AGENT_SKILLS_PATH = '.agents/skills';
 
-/** Prefer Codex's shared skill when that skill already lives there. */
+/**
+ * Whether the existing copy at `sharedDir`, in Codex's shared `.agents/skills`,
+ * is teamai's (#993). Other tools and the member write there too, so a copy
+ * is teamai's only on proof: the caller's delivery record (`judgeCopy`), or,
+ * without one, the history of the repo the skill comes from
+ * (`isTeamaiSkillCopy`).
+ */
+export type SharedSkillOwnership = (sharedDir: string) => Promise<boolean>;
+
+/** What a full pull prints while Codex sees the member's `.agents/skills/<name>` and teamai's copy. */
+export function codexSkillConflictLine(skillName: string, configuredSkillsPath: string): string {
+  const shared = path.posix.join(SHARED_AGENT_SKILLS_PATH, skillName);
+  const configured = path.posix.join(configuredSkillsPath, skillName);
+  return `Codex skill conflict for ${skillName}: ${shared} is not teamai's, so it was left alone; `
+    + `the team skill is in ${configured}. Codex now sees two skills named ${skillName}.`;
+}
+
+/**
+ * Where Codex's copy of `skillName` goes: the shared `.agents/skills/<name>`
+ * when a copy there is teamai's (`ownsShared`), else the configured directory.
+ * Other tools get the configured directory.
+ */
 export async function resolveSkillDestination(
   tool: string,
   configuredSkillsPath: string,
   baseDir: string,
   skillName: string,
+  ownsShared: SharedSkillOwnership,
   sourcePath?: string,
 ): Promise<string> {
   const configuredDestination = path.join(baseDir, configuredSkillsPath, skillName);
   if (tool === CODEX_TOOL) {
     const sharedDestination = path.join(baseDir, SHARED_AGENT_SKILLS_PATH, skillName);
-    if (await pathExists(sharedDestination)) {
-      // No source to compare against: the caller only wants to know where the
-      // skill lives. Reconciling needs the team copy to prove the two are the
-      // same, so without it there is nothing to decide and nothing to report —
-      // `doctor` and the post-pull pass would otherwise warn about a conflict
-      // on every skill, for copies the write path treats as identical.
-      if (!sourcePath) return sharedDestination;
-      if (await pathExists(configuredDestination)) {
-        if (await dirContentEqual(sharedDestination, configuredDestination) && await dirContentEqual(configuredDestination, sourcePath)) {
-          await remove(configuredDestination);
-          log.debug(`Removed identical TeamAI skill ${skillName} from ${configuredSkillsPath}`);
-        } else {
-          log.warn(`Codex skill conflict for ${skillName}: keeping different copies in ${SHARED_AGENT_SKILLS_PATH} and ${configuredSkillsPath}`);
-        }
-      }
-      return sharedDestination;
+    if (!await pathExists(sharedDestination)) return configuredDestination;
+    if (!await ownsShared(sharedDestination)) {
+      // The member's skill, or another tool's: never written, so Codex sees both.
+      if (sourcePath) log.warn(codexSkillConflictLine(skillName, configuredSkillsPath));
+      return configuredDestination;
     }
+    // No source to compare against: the caller only wants to know where the
+    // skill lives. Reconciling needs the team copy to prove the two are the
+    // same, so without it there is nothing to decide and nothing to report —
+    // `doctor` and the post-pull pass would otherwise warn about a conflict
+    // on every skill, for copies the write path treats as identical.
+    if (!sourcePath) return sharedDestination;
+    if (await pathExists(configuredDestination)) {
+      // A link there is the member's: never deleted as a duplicate (#993).
+      if (await isLink(configuredDestination)) {
+        log.warn(describeMembersLink(configuredDestination, `skills/${skillName}`));
+      } else if (await dirContentEqual(sharedDestination, configuredDestination) && await dirContentEqual(configuredDestination, sourcePath)) {
+        await remove(configuredDestination);
+        log.debug(`Removed identical TeamAI skill ${skillName} from ${configuredSkillsPath}`);
+      } else {
+        log.warn(`Codex skill conflict for ${skillName}: keeping different copies in ${SHARED_AGENT_SKILLS_PATH} and ${configuredSkillsPath}`);
+      }
+    }
+    return sharedDestination;
   }
 
   return configuredDestination;
@@ -110,29 +142,47 @@ export async function skillsDirForTool(
  * same paths (#598). A second copy of these gates is how "Synced 12 skills"
  * ends up true for one tool and silently false for another.
  *
- * `sourcePath` belongs to the write path: it lets the Codex shared-directory
- * reconciliation delete a duplicate it can prove is identical. Omit it to
- * resolve a destination without that side effect.
+ * `ownsShared` decides whether Codex's existing copy in `.agents/skills` is
+ * teamai's (`resolveSkillDestination`). `sourcePath` belongs to the write
+ * path: it lets the Codex shared-directory reconciliation delete a duplicate
+ * it can prove is identical, and name a conflict. Omit it to resolve a
+ * destination without those side effects.
  */
 export async function skillTargetForTool(
   tool: string,
   configuredSkillsPath: string | undefined,
   localConfig: LocalConfig,
   skillName: string,
+  ownsShared: SharedSkillOwnership,
   sourcePath?: string,
 ): Promise<string | null> {
   const skillsDir = await skillsDirForTool(tool, configuredSkillsPath, localConfig);
   if (skillsDir === null || configuredSkillsPath === undefined) return null;
 
   // Codex alone can redirect a skill to the shared `.agents/skills` directory,
-  // and only for a skill that already lives there — so the destination is
+  // and only for a skill whose copy there is teamai's — so the destination is
   // per-skill and the gate above cannot answer it.
   if (tool === CODEX_TOOL) {
     const baseDir = resolveToolBaseDir(tool, localConfig);
-    return resolveSkillDestination(tool, configuredSkillsPath, baseDir, skillName, sourcePath);
+    return resolveSkillDestination(tool, configuredSkillsPath, baseDir, skillName, ownsShared, sourcePath);
   }
 
   return path.join(skillsDir, skillName);
+}
+
+/**
+ * Where a copy of team skill `name` comes from, for the ownership proof
+ * (#993): that name's directory at the root of `skills/` or in any namespace
+ * of the team repo at `repoPath`, so a copy of the root skill still proves
+ * teamai's after the team moved it into a namespace. SKILL.md also counts as
+ * pull delivers it, with its frontmatter repaired.
+ */
+export function skillOrigin(repoPath: string, name: string): CopyOrigin {
+  return {
+    repoPath,
+    pathspec: `:(glob)skills/**/${name}`,
+    renders: [(content) => withSkillFrontmatter(content.toString('utf-8'), name)],
+  };
 }
 
 /** Add fields immediately before the closing delimiter without reformatting existing YAML. */
@@ -706,7 +756,10 @@ export class SkillsHandler extends ResourceHandler {
       dest,
       `Invalid skill destination outside team repo skills directory: ${item.relativePath}`,
     );
-    await copyDir(item.sourcePath, dest);
+    // A link in the member's skill stays theirs: teamai never puts links in the team repo (#993).
+    await copyDir(item.sourcePath, dest, (link) => {
+      log.warn(`Skipped ${link} in ${item.relativePath}: teamai does not push links to the team repo.`);
+    });
     const sourceFiles = new Set(await listFilesRecursive(item.sourcePath));
     const teamFiles = await listFilesRecursive(dest);
     for (const relativePath of teamFiles) {
@@ -738,19 +791,27 @@ export class SkillsHandler extends ResourceHandler {
    * `sourcePath` opts into the write path's Codex shared-directory
    * reconciliation, which can delete a duplicate it proves identical. A reader
    * omits it and gets the same destinations without the side effect.
+   *
+   * Codex's copy in `.agents/skills` is teamai's as pull judges any copy
+   * (`judgeCopy`): by the checkout's record `previous` when the caller has it,
+   * else by the team repo's history alone.
    */
   private async resolveTargets(
     teamConfig: TeamaiConfig,
     localConfig: LocalConfig,
     item: ResourceItem,
     sourcePath?: string,
+    previous?: DeliveredHashes,
   ): Promise<DeliveryTarget[]> {
+    const origin = skillOrigin(localConfig.repo.localPath, item.name);
     const targets: DeliveryTarget[] = [];
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
       if (isAgentExcluded(localConfig, tool)) continue;
 
-      const dest = await skillTargetForTool(tool, toolPath.skills, localConfig, item.name, sourcePath);
-      if (dest) targets.push({ tool, dest });
+      const ownsShared = async (dest: string): Promise<boolean> =>
+        (await judgeCopy(previous, item, { tool, dest, origin })).kind !== 'member';
+      const dest = await skillTargetForTool(tool, toolPath.skills, localConfig, item.name, ownsShared, sourcePath);
+      if (dest) targets.push({ tool, dest, origin });
     }
     return targets;
   }
@@ -768,17 +829,31 @@ export class SkillsHandler extends ResourceHandler {
    */
   async pullItem(item: ResourceItem, teamConfig: TeamaiConfig, localConfig: LocalConfig, ledger?: DeliveryLedger): Promise<void> {
     const otherVersions = await otherVersionFiles(localConfig.repo.localPath, item);
-    for (const target of await this.resolveTargets(teamConfig, localConfig, item, item.sourcePath)) {
+    for (const target of await this.resolveTargets(teamConfig, localConfig, item, item.sourcePath, ledger?.previous)) {
       const { tool, dest } = target;
       try {
         if (ledger && await keepsEditedCopy(ledger, item, target)) continue;
-        await copyDir(item.sourcePath, dest);
+        // With no ledger (the local agent's install), nothing else judges a link of the member's there (#993).
+        const membersLink = ledger ? null : await membersLinkAt(dest);
+        if (membersLink !== null) {
+          warnOnce(describeMembersLink(membersLink, item.relativePath));
+          continue;
+        }
+        // An entry of the member's of the other type blocks only the files under it (#993): the rest is delivered.
+        const blocked = await blockingEntries(dest, item.sourcePath);
+        for (const rel of blocked) {
+          const entry = path.join(dest, ...rel.split('/'));
+          if (ledger) ledger.members.push({ dest: entry, teamRelPath: `${item.relativePath}/${rel}` });
+          else warnOnce(describeMembersFile(entry, `${item.relativePath}/${rel}`));
+        }
+        await copyDir(item.sourcePath, dest, (link) => warnOnce(describeSkippedLink(link, item.relativePath)), blocked);
         await removeLeftoverVersionFiles(item.sourcePath, dest, otherVersions, ledger?.previous);
         await ensureSkillFrontmatter(dest, item.name);
         if (ledger) await recordDelivered(ledger.hashes, dest, item.sourcePath);
         log.debug(`Synced skill ${item.name} → ${tool}`);
       } catch (e) {
         log.warn(`Failed to sync skill ${item.name} to ${tool}: ${(e as Error).message}`);
+        ledger?.failed.push({ name: item.name, tool });
       }
     }
   }
@@ -788,53 +863,94 @@ export class SkillsHandler extends ResourceHandler {
    */
   async removeItem(name: string, teamConfig: TeamaiConfig, localConfig: LocalConfig): Promise<string[]> {
     const removed: string[] = [];
-
-    // Remove from team repo
     const scopedNamespaces = await resolveSkillNamespaces(localConfig);
-    if (scopedNamespaces.length > 0) {
-      for (const namespace of scopedNamespaces) {
-        const namespaceDir = path.join(localConfig.repo.localPath, 'skills', namespace, name);
-        if (await pathExists(namespaceDir)) {
-          await remove(namespaceDir);
-          removed.push(namespaceDir);
-        }
-      }
-    } else {
-      const teamDir = path.join(localConfig.repo.localPath, 'skills', name);
-      if (await pathExists(teamDir)) {
-        await remove(teamDir);
-        removed.push(teamDir);
-      }
+    const teamDirs = scopedNamespaces.length > 0
+      ? scopedNamespaces.map((namespace) => path.join(localConfig.repo.localPath, 'skills', namespace, name))
+      : [path.join(localConfig.repo.localPath, 'skills', name)];
+
+    // Only teamai's copy in each tool's skills directory goes (#993): one on
+    // this checkout's record, what pull writes today from the team source, or
+    // a team version by the history. Judged before the team source is
+    // deleted below; the local agent's resource cache has no history.
+    const sources: ResourceItem[] = [];
+    for (const teamDir of teamDirs) {
+      if (!await pathExists(teamDir)) continue;
+      sources.push({ name, type: 'skills', sourcePath: teamDir, relativePath: path.relative(localConfig.repo.localPath, teamDir).split(path.sep).join('/') });
     }
-
-    // Record tombstone so the resource won't be re-pushed
-    await this.addTombstone(name, localConfig);
-
-    // Remove from each tool's skills directory
+    const previous = await (await import('../pull.js')).deliveredHashes(localConfig);
+    const origin = skillOrigin(localConfig.repo.localPath, name);
+    const owned: { tool: string; skillDir: string; files?: string[]; packagedBase?: string }[] = [];
     for (const [tool, toolPath] of Object.entries(scopedToolPaths(teamConfig, localConfig))) {
       if (!toolPath.skills) continue;
       // Not ours to write to, so not ours to delete from. Above the OpenClaw
       // branch, so the workspace copy is covered by the same gate.
       if (isAgentExcluded(localConfig, tool)) continue;
-      let skillDir: string;
+      const skillDirs: string[] = [];
+      let toolBase: string;
       if (tool === 'openclaw') {
         const wsDir = await resolveOpenclawWorkspaceDir();
         if (!wsDir) continue;
-        skillDir = path.join(wsDir, 'skills', name);
+        toolBase = wsDir;
+        skillDirs.push(path.join(wsDir, 'skills', name));
       } else {
         const baseDir = resolveToolBaseDir(tool, localConfig);
-        const configuredDir = path.join(baseDir, toolPath.skills, name);
-        skillDir = await resolveSkillDestination(tool, toolPath.skills, baseDir, name);
-        if (skillDir !== configuredDir && await pathExists(configuredDir) && await dirContentEqual(skillDir, configuredDir)) {
-          await remove(configuredDir);
-          removed.push(configuredDir);
+        toolBase = baseDir;
+        skillDirs.push(path.join(baseDir, toolPath.skills, name));
+        // Codex also reads, and pull may deliver into, the shared directory.
+        if (tool === CODEX_TOOL) skillDirs.push(path.join(baseDir, SHARED_AGENT_SKILLS_PATH, name));
+      }
+      for (const skillDir of skillDirs) {
+        if (!await pathExists(skillDir)) continue;
+        // A link is the member's even at a built-in's name, so it is judged before the name.
+        // A built-in's name loses the team's files and those a release packaged there, as on uninstall:
+        // anything the member added stays.
+        if (!await isLink(skillDir) && isCliOwnedSkillName(name)) {
+          owned.push({ tool, skillDir, files: (await teamaiSkillFiles(previous, skillDir, origin)).teamais, packagedBase: toolBase });
+          continue;
+        }
+        if (!await isLink(skillDir) && await ownsSkillDir(previous, skillDir, origin, sources)) {
+          owned.push({ tool, skillDir });
+          continue;
+        }
+        // Ownership is per file: teamai's go, the member's stay, and so does the directory (#993).
+        const files = await isLink(skillDir) ? { teamais: [], members: [] } : await teamaiSkillFiles(previous, skillDir, origin);
+        if (files.teamais.length === 0) {
+          log.warn(await describeKeptDir(skillDir, `skills/${name}`, 'remove'));
+          continue;
+        }
+        owned.push({ tool, skillDir, files: files.teamais });
+        for (const file of files.members) {
+          log.warn(describeMembersDirLeft(file, `skills/${name}/${path.relative(skillDir, file).split(path.sep).join('/')}`, 'remove'));
         }
       }
-      if (await pathExists(skillDir)) {
+    }
+
+    // Remove from team repo
+    for (const { sourcePath } of sources) {
+      await remove(sourcePath);
+      removed.push(sourcePath);
+    }
+
+    // Record tombstone so the resource won't be re-pushed
+    await this.addTombstone(name, localConfig);
+
+    for (const { tool, skillDir, files, packagedBase } of owned) {
+      if (packagedBase) {
+        for (const file of files ?? []) await remove(file);
+        removed.push(...files ?? []);
+        const result = await removeOwnedFiles(skillDir, await ownedSkillFiles(name), packagedBase);
+        if (prunedWhole(result)) removed.push(skillDir);
+        else if (result.notRemoved.length > 0) log.warn(`Could not delete packaged files under ${skillDir}. First: ${result.notRemoved[0].file} — ${result.notRemoved[0].error}. Fix the permissions and run \`teamai remove\` again, or delete the directory yourself.`);
+        else log.warn(`Kept ${skillDir}: it holds files TeamAI did not put there. The packaged files were removed; delete the rest yourself once you have saved what you need.`);
+      } else if (files) {
+        for (const file of files) await remove(file);
+        await pruneEmptyDirs(skillDir);
+        removed.push(...files);
+      } else {
         await remove(skillDir);
         removed.push(skillDir);
-        log.debug(`Removed skill ${name} from ${tool}`);
       }
+      log.debug(`Removed skill ${name} from ${tool}`);
     }
 
     return removed;
