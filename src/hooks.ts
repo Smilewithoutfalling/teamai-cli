@@ -431,13 +431,13 @@ async function judgeUnrecordedTeamEntries(
     Record<string, HookFileEntry[]> | undefined;
   if (!hooks || typeof hooks !== 'object') return result;
 
-  const vbsPath = path.join(path.dirname(file), 'teamai-hook-dispatch.vbs');
+  const zcodeLauncher = zcodeLauncherPath(file);
   // The event key and entry each reconciler writes for a hook.
   const render = (def: HookDef): { event?: string; entry: unknown } => {
     switch (format) {
       case 'cursor': return { event: CLAUDE_TO_CURSOR_EVENTS[def.event], entry: toCursorEntry(def) };
       case 'copilot': return { event: CLAUDE_TO_COPILOT_EVENTS[def.event], entry: toCopilotEntry(def) };
-      case 'zcode': return { event: def.event, entry: toZcodeEntry(def, vbsPath) };
+      case 'zcode': return { event: def.event, entry: toZcodeEntry(def, zcodeLauncher) };
       case 'codex': return { event: def.event, entry: toCodexEntry(def) };
       default: return { event: def.event, entry: toClaudeEntry(def) };
     }
@@ -1295,7 +1295,7 @@ function toCopilotEntry(def: HookDef): CopilotHookEntry {
   };
 }
 
-function toZcodeEntry(def: HookDef, vbsPath: string): ZcodeHookMatcher {
+function toZcodeEntry(def: HookDef, launcherPath: string): ZcodeHookMatcher {
   // ZCode sessions run hooks inline: a session-start dispatch carries a network
   // pull (SSH to the team host), which on slower links exceeds the 10–15s
   // builtin defaults and gets killed mid-pull — so the timeouts here are
@@ -1306,12 +1306,14 @@ function toZcodeEntry(def: HookDef, vbsPath: string): ZcodeHookMatcher {
     PostToolUse: 30000,
     UserPromptSubmit: 60000,
   };
-  // wscript.exe is a GUI-subsystem binary: unlike cmd/bash it never allocates
-  // a console window, so hook runs don't flash a black box over the desktop.
-  // The VBS launcher preserves the STDIN contract (ZCode's payload reaches
-  // hook-dispatch via a spooled temp file), waits for the dispatch bounded by
-  // the per-event timeout, and runs everything hidden (window style 0) with
-  // the dispatch tail cmd-level quoted so team-declared commands survive
+  // A Windows entry points at a launcher rather than at the dispatch itself,
+  // and that launcher is a Node script. ZCode talks to a `process` hook over
+  // stdio — one JSON line in, the reply on stdout — and no WSH host can carry
+  // those bytes: WScript.StdIn/StdOut exist only under cscript, WshShell.Run
+  // drops the child's streams outright, and cscript writes redirected stdout in
+  // the OEM code page, which mangles non-ASCII JSON. Node inherits both handles
+  // unchanged, so the dispatch's reply reaches ZCode byte for byte, and the
+  // dispatch tail is spawned cmd-level quoted so team-declared commands survive
   // cmd's operator parsing. The payload travels verbatim as a single argument
   // so managed-entry detection and the manifest keep one command
   // representation.
@@ -1324,17 +1326,15 @@ function toZcodeEntry(def: HookDef, vbsPath: string): ZcodeHookMatcher {
   const entry: ZcodeHookEntry =
     process.platform === 'win32'
       ? {
-          // wscript.exe is a GUI-subsystem binary: unlike cmd/bash it never
-          // allocates a console window, so hook runs don't flash a black box
-          // over the desktop. The VBS launcher preserves the STDIN contract
-          // (ZCode's payload reaches hook-dispatch via a spooled temp file),
-          // waits bounded by the per-event timeout, and runs hidden (window
-          // style 0). The payload travels verbatim as a single argument so
-          // managed-entry detection and the manifest keep one command
-          // representation.
+          // `node` is on PATH wherever the teamai CLI is, and ZCode documents
+          // `command: "node"` as the form to prefer for a process hook. The
+          // launcher — written next to ZCode's config.json and rewritten
+          // whenever its content differs — inherits ZCode's stdio so the
+          // dispatch's reply survives, and hides the dispatch's console so a
+          // hook run never flashes a window.
           type: 'process',
-          command: 'wscript.exe',
-          args: [vbsPath, def.command],
+          command: 'node',
+          args: [launcherPath, def.command],
           timeoutMs,
         }
       : {
@@ -1358,9 +1358,9 @@ function toZcodeEntry(def: HookDef, vbsPath: string): ZcodeHookMatcher {
 /** Shell payload of a ZCode hook entry, for managed-entry matching. */
 function zcodeEntryCommand(entry: ZcodeHookMatcher): string {
   const hook = entry.hooks?.[0];
-  // The wscript launcher carries the command tail as its LAST argument —
-  // [vbsPath, tail] today; an earlier generation used a mode slot
-  // ([vbsPath, 'wait', tail]). Reading the last slot recognizes both shapes
+  // The launcher carries the command tail as its LAST argument —
+  // [launcherPath, tail] today; an earlier generation used a mode slot
+  // ([launcherPath, 'wait', tail]). Reading the last slot recognizes both shapes
   // (and team commands, which carry no teamai marker and are matched against
   // the managed-hooks manifest) so they get replaced or removed, not duplicated.
   if (Array.isArray(hook?.args) && hook.args.length > 0) {
@@ -1727,6 +1727,20 @@ function ownsCodexEntry(record: ManagedHookRecord, event: string, index: number,
 
 // ─── ZCode (~/.zcode/cli/config.json) reconcile ─────────────
 
+/** The launcher this build writes beside ZCode's config, and the WSH one it replaced. */
+const ZCODE_LAUNCHER = 'teamai-hook-dispatch.mjs';
+const ZCODE_LEGACY_LAUNCHER = 'teamai-hook-dispatch.vbs';
+
+/** Absolute path of the ZCode launcher — it must sit next to the config file. */
+function zcodeLauncherPath(settingsFile: string): string {
+  return path.join(path.dirname(expandHome(settingsFile)), ZCODE_LAUNCHER);
+}
+
+/** The pre-fix WSH launcher, kept as a name so inject can delete what it left behind. */
+function zcodeLegacyLauncherPath(settingsFile: string): string {
+  return path.join(path.dirname(expandHome(settingsFile)), ZCODE_LEGACY_LAUNCHER);
+}
+
 async function reconcileZcodeFormat(
   settingsPath: string,
   tool: string,
@@ -1736,37 +1750,38 @@ async function reconcileZcodeFormat(
 ): Promise<void> {
   const expanded = expandHome(settingsPath);
   await ensureDir(path.dirname(expanded));
-  const vbsPath = path.join(path.dirname(expanded), 'teamai-hook-dispatch.vbs');
-  // Hidden launcher: wscript.exe is a GUI-subsystem binary, so hook runs don't
-  // flash a black box over the desktop, and the spool file keeps the STDIN
-  // payload contract intact (ZCode's JSON reaches hook-dispatch even though
-  // WScript.Shell.Run cannot forward a live stdin pipe).
-  const vbsScript = [
-    "' TeamAI hook dispatcher - hidden, timeout-bounded, stdin-preserving.",
-    'Option Explicit',
-    'Dim sh, fso, spool, f',
-    'Set sh = CreateObject("WScript.Shell")',
-    'Set fso = CreateObject("Scripting.FileSystemObject")',
-    'spool = fso.GetSpecialFolder(2) & "\\teamai-hook-" & fso.GetTempName',
-    'Set f = fso.CreateTextFile(spool, True)',
-    'On Error Resume Next',
-    'f.Write WScript.StdIn.ReadAll()',
-    'f.Close',
-    'sh.Run "cmd /d /s /c """ & WScript.Arguments(0) & " < """ & spool & """ >nul 2>&1""", 0, True',
-    'fso.DeleteFile spool, True',
-  ].join('\r\n');
+  const launcherPath = zcodeLauncherPath(expanded);
+  // The launcher carries ZCode's stdin and stdout to the dispatch and the
+  // dispatch's exit code back to ZCode, and keeps the dispatch from opening a
+  // console window. It is a Node script because no WSH host can do any of that
+  // (see toZcodeEntry).
+  const launcherScript = [
+    '// TeamAI hook dispatcher: argv-preserving, invisible, exit-code transparent.',
+    "import { spawnSync } from 'node:child_process';",
+    '',
+    'const tail = process.argv[2];',
+    'if (!tail) process.exit(1);',
+    '',
+    "const { status } = spawnSync(tail, { shell: true, stdio: 'inherit', windowsHide: true });",
+    'process.exit(status ?? 1);',
+    '',
+  ].join('\n');
   if (opts.removeAll) {
     // Unconditional: after a normal inject the file equals the template, so a
     // content-diff gate never fires and the script would be left behind.
-    await rm(vbsPath, { force: true });
+    await rm(launcherPath, { force: true });
   } else if (process.platform === 'win32') {
     // POSIX never runs the launcher — writing it there would litter ~/.zcode
     // with a script no entry references.
-    const existingVbs = await readFileSafe(vbsPath);
-    if (existingVbs !== vbsScript) {
-      await writeFile(vbsPath, vbsScript);
+    const existingLauncher = await readFileSafe(launcherPath);
+    if (existingLauncher !== launcherScript) {
+      await writeFile(launcherPath, launcherScript);
     }
   }
+  // The pre-fix WSH launcher is dead weight now that the entries point at the
+  // .mjs, and only Windows ever wrote one — drop it everywhere so a stale copy
+  // cannot sit in ~/.zcode forever.
+  await rm(zcodeLegacyLauncherPath(expanded), { force: true });
   const cfg: ZcodeHooksJson = await readHookFile<ZcodeHooksJson>(expanded, {});
   if (!cfg.hooks) cfg.hooks = {};
   let changed = false;
@@ -1806,7 +1821,7 @@ async function reconcileZcodeFormat(
   for (const event of events) {
     const existing = eventsMap[event] ?? [];
     const untouched = existing.filter((e) => !isManaged(e));
-    const desiredEntries = defs.filter((d) => d.event === event).map((d) => toZcodeEntry(d, vbsPath));
+    const desiredEntries = defs.filter((d) => d.event === event).map((d) => toZcodeEntry(d, launcherPath));
     const newArr = [...untouched, ...desiredEntries];
     if (JSON.stringify(existing) !== JSON.stringify(newArr)) {
       eventsMap[event] = newArr;
@@ -2178,15 +2193,15 @@ export async function getHookStatus(
   }
 
   if (format === 'zcode') {
-    const vbsPath = path.join(path.dirname(expanded), 'teamai-hook-dispatch.vbs');
+    const launcherPath = zcodeLauncherPath(expanded);
     const cfg = await readJson<ZcodeHooksJson>(expanded);
     const eventsMap = cfg?.hooks?.events;
     if (!eventsMap) return 'missing';
-    // On Windows the entries are dead without the launcher script — a deleted,
-    // stale, or AV-quarantined VBS must not be reported as installed.
-    if (process.platform === 'win32' && !(await readFileSafe(vbsPath))) return 'missing';
+    // On Windows the entries are dead without the launcher — a deleted, stale,
+    // or AV-quarantined script must not be reported as installed.
+    if (process.platform === 'win32' && !(await readFileSafe(launcherPath))) return 'missing';
     const present = defs.every((def) => {
-      const want = toZcodeEntry(def, vbsPath);
+      const want = toZcodeEntry(def, launcherPath);
       const wantCmd = zcodeEntryCommand(want);
       const entries = eventsMap[def.event] ?? [];
       return entries.some((e) => e.matcher === want.matcher && zcodeEntryCommand(e) === wantCmd);
