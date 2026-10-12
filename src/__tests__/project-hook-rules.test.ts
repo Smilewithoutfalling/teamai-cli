@@ -207,6 +207,7 @@ describe('doctor checks the hook or extension that adds the project rules (#946)
   const find = async (enabled: string[], name: string) => (await checks(enabled)).find((c) => c.name === name);
 
   const ZCODE = 'The teamai SessionStart hook is registered and enabled for zcode';
+  const DELIVERS = 'The teamai SessionStart hook for zcode returns its reply to the session';
   const DSH = 'Project rules reach dsh through its session-start hook';
   const PI = 'pi adds the team instructions and rules to its prompt';
 
@@ -250,6 +251,58 @@ describe('doctor checks the hook or extension that adds the project rules (#946)
     await fse.outputJson(zcodeConfig(), { hooks: { enabled: true, events: {} } });
 
     expect(await (await find(['zcode'], ZCODE))!.check()).toBe(false);
+  });
+
+  it('zcode: runs the registered entry and passes when its reply comes back', async () => {
+    await reconcileHooks(zcodeConfig(), 'zcode');
+
+    const passing = (await find(['zcode'], DELIVERS))!;
+    expect(passing).toBeDefined();
+    expect(await passing.check()).toBe(true);
+  });
+
+  it('zcode: fails when the registered entry cannot answer, while registration still passes', async () => {
+    await reconcileHooks(zcodeConfig(), 'zcode');
+    const cfg = await fse.readJson(zcodeConfig());
+    // The entry keeps the shape ZCode reads, but its command cannot run here:
+    // registration is intact and delivery is not, which is the gap #1030 left.
+    cfg.hooks.events.SessionStart = [{
+      hooks: [{
+        type: 'process',
+        command: 'teamai-no-such-binary',
+        args: ['teamai hook-dispatch session-start --tool zcode'],
+      }],
+    }];
+    await fse.writeJson(zcodeConfig(), cfg);
+
+    const failing = (await find(['zcode'], DELIVERS))!;
+    expect(await failing.check()).toBe(false);
+    expect(failing.fix).toContain(zcodeConfig());
+    expect(failing.fix).toContain('teamai hooks inject');
+    // The two checks answer different questions: registration is still true.
+    expect(await (await find(['zcode'], ZCODE))!.check()).toBe(true);
+  });
+
+  it.skipIf(process.platform !== 'win32')('zcode: fails when the launcher drops the dispatch\'s output (#1030)', async () => {
+    await reconcileHooks(zcodeConfig(), 'zcode');
+    // The launcher #1030 replaced: it ran the dispatch, and dropped its stdout.
+    await fse.outputFile(
+      path.join(homeDir, '.zcode', 'cli', 'teamai-hook-dispatch.mjs'),
+      "import { spawnSync } from 'node:child_process';\n"
+        + "spawnSync(process.argv[2], { shell: true, stdio: 'ignore', windowsHide: true });\n",
+    );
+
+    expect(await (await find(['zcode'], DELIVERS))!.check()).toBe(false);
+  });
+
+  it('zcode: reports no delivery check while the entry is missing or turned off', async () => {
+    await reconcileHooks(zcodeConfig(), 'zcode');
+    const cfg = await fse.readJson(zcodeConfig());
+    await fse.writeJson(zcodeConfig(), { ...cfg, hooks: { ...cfg.hooks, enabled: false } });
+    expect(await find(['zcode'], DELIVERS)).toBeUndefined();
+
+    await fse.outputJson(zcodeConfig(), { hooks: { enabled: true, events: {} } });
+    expect(await find(['zcode'], DELIVERS)).toBeUndefined();
   });
 
   it('dsh: passes once the hook config and the patch are written', async () => {

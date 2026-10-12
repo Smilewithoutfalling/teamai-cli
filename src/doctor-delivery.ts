@@ -1,6 +1,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
+import { spawnSync } from 'node:child_process';
 import { expandHome, listFilesRecursive, pathExists, readFileSafe, readJsonObject } from './utils/fs.js';
 import {
   CODEX_TOOL_ID, DEFAULT_CODEX_ROOT, getDataHome, getMcpSharing, isAgentExcluded, isGitExcludeEnabled, managedMcpManifestKey,
@@ -529,18 +530,70 @@ async function buildRulesActivationChecks(ctx: DoctorContext, items: ResourceIte
   return checks;
 }
 
+/** The entries under `SessionStart` that dispatch a teamai session-start. */
+function sessionStartDispatchEntries(eventMap: unknown): { command: string; args: string[] }[] {
+  const groups = (eventMap as Record<string, unknown> | null | undefined)?.SessionStart;
+  if (!Array.isArray(groups)) return [];
+  return groups
+    .flatMap((group) => (Array.isArray(group?.hooks) ? group.hooks : []))
+    .map((entry: { command?: unknown; args?: unknown }) => ({
+      command: String(entry?.command ?? ''),
+      args: (Array.isArray(entry?.args) ? entry.args : []).map(String),
+    }))
+    .filter(({ command, args }) => [command, ...args].join(' ').includes('hook-dispatch session-start'));
+}
+
 /**
  * The teamai `hook-dispatch session-start` commands under `SessionStart` in a
  * Claude-shaped map of hook events (ZCode's `hooks.events`, the dsh bridge's
  * `hooks`).
  */
 function sessionStartDispatches(eventMap: unknown): string[] {
-  const groups = (eventMap as Record<string, unknown> | null | undefined)?.SessionStart;
-  if (!Array.isArray(groups)) return [];
-  return groups
-    .flatMap((group) => (Array.isArray(group?.hooks) ? group.hooks : []))
-    .map((entry: { command?: unknown; args?: unknown }) => [entry?.command, ...(Array.isArray(entry?.args) ? entry.args : [])].join(' '))
-    .filter((command) => command.includes('hook-dispatch session-start'));
+  return sessionStartDispatchEntries(eventMap).map(({ command, args }) => [command, ...args].join(' '));
+}
+
+/**
+ * Whether the registered ZCode entry hands back what it is given.
+ *
+ * ZCode talks to a `process` hook over stdio — one JSON line in, the reply on
+ * stdout — and on Windows the entry runs a Node launcher written beside the
+ * config, so the dispatch's bytes have to survive that hop. In #1030 they did
+ * not: the launcher's predecessor dropped the dispatch's stdout outright, so
+ * sessions got no rules while the entry stayed registered and enabled and the
+ * registration check above stayed green.
+ *
+ * This exercises that hop with the entry's own command and arguments, swapping
+ * its tail for two stubs: one that echoes its stdin, one that exits 7. The tail
+ * is the dispatch itself, which must not be run — a session-start dispatch
+ * carries a network pull (`toZcodeEntry`). Both stubs are bounded by
+ * `ZCODE_PROBE_TIMEOUT_MS` and touch nothing but the three stdio handles, so
+ * the check stays read-only.
+ */
+const ZCODE_PROBE_TIMEOUT_MS = 10_000;
+
+function zcodeEntryCarriesItsReply(entry: { command: string; args: string[] }): boolean {
+  // The tail is the entry's last argument: the dispatch command on POSIX
+  // (`bash -lc <tail>`), the same command behind the launcher on Windows
+  // (`node <launcher> <tail>`). Replacing only that slot leaves the rest of the
+  // entry — the launcher included — exactly as ZCode will invoke it, which is
+  // the point: the launcher is where #1030 broke.
+  if (!entry.command || entry.args.length === 0) return false;
+  const head = entry.args.slice(0, -1);
+  const run = (tail: string, input?: Buffer) => spawnSync(entry.command, [...head, tail], {
+    input,
+    timeout: ZCODE_PROBE_TIMEOUT_MS,
+    windowsHide: true,
+  });
+
+  const probe = Buffer.from('{"probe":"teamai-zcode-delivery"}', 'utf8');
+  const echoed = run('node -e "process.stdin.pipe(process.stdout)"', probe);
+  if (echoed.error || echoed.status !== 0 || !Buffer.isBuffer(echoed.stdout)) return false;
+  // A substring rather than an exact match: on POSIX the entry runs its tail
+  // through `bash -lc`, and a login profile that prints puts its own bytes in
+  // front of the reply. What this has to catch is the reply going missing, not
+  // extra bytes around it.
+  if (!echoed.stdout.includes(probe)) return false;
+  return run('node -e "process.exit(7)"').status === 7;
 }
 
 /**
@@ -552,10 +605,11 @@ function sessionStartDispatches(eventMap: unknown): string[] {
  * Pi's extension is checked with the team instructions it also carries
  * (`buildInstructionDeliveryChecks`).
  *
- * The ZCode check is a registration check, not a delivery check: it reads the
- * two things ZCode itself reads off the config, and nothing in that file tells
- * it whether the hook's output actually reaches a session (#1030). Its name and
- * fixes say so.
+ * The ZCode checks are split by what each one can see: registration reads the
+ * two things ZCode itself reads off the config — `hooks.enabled` and the
+ * SessionStart entry — and delivery runs that entry's own command with its
+ * dispatch tail swapped for a stub, because nothing in the file says whether
+ * the hook's output actually reaches a session (#1030).
  */
 async function buildProjectRulesHookChecks(ctx: DoctorContext): Promise<Check[]> {
   const { localConfig, teamConfig } = ctx;
@@ -570,7 +624,8 @@ async function buildProjectRulesHookChecks(ctx: DoctorContext): Promise<Check[]>
     const file = path.join(home, zcodeSettings);
     const read = await readJsonObject(file);
     const hooks = read.kind === 'ok' ? read.value.hooks as { enabled?: unknown; events?: unknown } | undefined : undefined;
-    const registered = sessionStartDispatches(hooks?.events).length > 0;
+    const entries = sessionStartDispatchEntries(hooks?.events);
+    const registered = entries.length > 0;
     const enabled = hooks?.enabled === true;
     checks.push({
       name: 'The teamai SessionStart hook is registered and enabled for zcode',
@@ -586,6 +641,22 @@ async function buildProjectRulesHookChecks(ctx: DoctorContext): Promise<Check[]>
           : `${file} sets hooks.enabled to something other than true, so ZCode runs none of the hooks it registers, `
             + 'and sessions in this project get none of the team rules. Run `teamai hooks inject`, which turns them on.',
     });
+    // Registration is not delivery: nothing below is worth probing until the
+    // entry is there and turned on, and while it is not, the check above
+    // already fails and names the reason.
+    const entry = entries[0];
+    if (entry && enabled) {
+      checks.push({
+        name: 'The teamai SessionStart hook for zcode returns its reply to the session',
+        source: 'local',
+        check: async () => zcodeEntryCarriesItsReply(entry),
+        fix: `${file} registers the teamai SessionStart hook and turns hooks on, but running that entry's own `
+          + 'command handed back nothing where the dispatch should have answered (or lost its exit status), so a '
+          + 'session would start with none of the team rules while registration still looks healthy (#1030). On '
+          + `Windows the entry goes through the Node launcher beside this file. ${inject} If it keeps failing, `
+          + "the entry's launch command cannot run in this shell.",
+      });
+    }
   }
 
   const { isDshInstalled } = await import('./dsh-hooks.js');
