@@ -127,6 +127,15 @@ export const SharingConfigSchema = z.object({
      *  dashboard reporting). */
     enabled: z.boolean().default(true),
   }).optional(),
+  // Optional (not .default) so existing TeamaiConfig literals stay valid; use
+  // isMrHintEnabled() for the resolved view.
+  mrHint: z.object({
+    /** Team default: whether the SessionStart hook tells members about MRs the
+     *  team merged recently. Kept separate from `contributeHint` (#988): a team
+     *  that routes knowledge sharing through its own review flow can drop the
+     *  MR summary while keeping the Stop hook's nudge, or the other way round. */
+    enabled: z.boolean().default(true),
+  }).optional(),
   // Optional (not .default) so existing TeamaiConfig literals stay valid, AND so
   // "team has no opinion" (block absent) stays distinct from "team says off"
   // (enabled: false). Only the former is a no-op; see resolveCoAuthor().
@@ -275,6 +284,23 @@ export function isContributeHintEnabled(
   if (env.TEAMAI_CONTRIBUTE_HINT_DISABLED === '1') return false;
   if (localConfig.contributeHintEnabled !== undefined) return localConfig.contributeHintEnabled;
   return teamConfig.sharing?.contributeHint?.enabled ?? true;
+}
+
+/**
+ * Resolve whether the SessionStart MR hint is enabled: env kill switch >
+ * user override > team config > default (true).
+ *
+ * Deliberately not folded into isContributeHintEnabled: #988 keeps the MR hint
+ * separate from the share workflow, so neither switch may turn the other off.
+ */
+export function isMrHintEnabled(
+  localConfig: { mrHintEnabled?: boolean },
+  teamConfig: { sharing?: { mrHint?: { enabled?: boolean } } },
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (env.TEAMAI_MR_HINT_DISABLED === '1') return false;
+  if (localConfig.mrHintEnabled !== undefined) return localConfig.mrHintEnabled;
+  return teamConfig.sharing?.mrHint?.enabled ?? true;
 }
 
 /** Resolve whether pull reports usage stats: user override > team config > default (true). */
@@ -801,6 +827,8 @@ export const LocalConfigSchema = z.object({
   gitExcludeEnabled: z.boolean().optional(),
   /** User-level override for the share-learnings hint. When set, takes precedence over team config. */
   contributeHintEnabled: z.boolean().optional(),
+  /** User-level override for the SessionStart MR hint. When set, takes precedence over team config. */
+  mrHintEnabled: z.boolean().optional(),
   /** Per-machine override of the team's `usageReport`. When set, takes
    *  precedence over the team config. Undefined defers to the team. */
   usageReportEnabled: z.boolean().optional(),

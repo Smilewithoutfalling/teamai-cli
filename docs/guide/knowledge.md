@@ -75,7 +75,15 @@ teamai recall status
 
 One machine overrides this with `recallEnabled` in `~/.teamai/config.yaml`. `TEAMAI_RECALL_DISABLED=1` forces it off. While it is off, pull does not install recall. `teamai recall` still searches.
 
-Turning recall off does not silence the SessionStart hint for recently merged MRs. That hint points to `teamai import --from-mr`, which can capture and publish a learning before the team enables recall. Disable this separate hint with `TEAMAI_MR_HINT_DISABLED=1`.
+Turning recall off does not silence the SessionStart hint for recently merged MRs. That hint points to `teamai import --from-mr`, which can capture and publish a learning before the team enables recall. It has its own switch, so a team can turn it off without touching `contributeHint`:
+
+```yaml
+sharing:
+  mrHint:
+    enabled: false
+```
+
+On one machine, set `mrHintEnabled: false` in `~/.teamai/config.yaml`, or `TEAMAI_MR_HINT_DISABLED=1`.
 
 `language` in `teamai.yaml` is `en` or `zh`. `en` makes the built-in recall rule, the TodoWrite hint, and the merged-MR hint English only. Omit it, or set `zh`, and those texts stay bilingual. The next `teamai pull` rewrites the recall rule.
 

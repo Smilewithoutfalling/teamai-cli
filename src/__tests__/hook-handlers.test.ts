@@ -1974,7 +1974,10 @@ describe('mr-hint agent language (#1014)', () => {
         ...scope,
         repo: { localPath: dir, remote: 'https://example.invalid/t.git' },
       });
-      expect(mockMrHintOutput).toHaveBeenCalledWith('en');
+      expect(mockMrHintOutput.mock.calls.at(-1)).toEqual([
+        'en',
+        expect.objectContaining({ repo: expect.objectContaining({ localPath: dir }) }),
+      ]);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -1993,7 +1996,10 @@ describe('mr-hint agent language (#1014)', () => {
         ...scope,
         repo: { localPath: dir, remote: 'https://example.invalid/t.git' },
       });
-      expect(mockMrHintOutput.mock.calls.at(-1)).toEqual([undefined]);
+      expect(mockMrHintOutput.mock.calls.at(-1)).toEqual([
+        undefined,
+        expect.objectContaining({ repo: expect.objectContaining({ localPath: dir }) }),
+      ]);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

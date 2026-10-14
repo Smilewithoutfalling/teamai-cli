@@ -863,7 +863,7 @@ const mrHintHandler: HookHandler = {
   name: 'mr-hint',
   async execute(_stdin, _tool, config) {
     const { computeMrHintOutput } = await import('./mr-hint.js');
-    return computeMrHintOutput(await teamAgentLanguage(config));
+    return computeMrHintOutput(await teamAgentLanguage(config), config);
   },
 };
 
