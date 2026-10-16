@@ -33,7 +33,13 @@ export function getCursorStateRoot(): string | null {
     return path.join(home, 'Library', 'Application Support', 'Cursor');
   }
   if (process.platform === 'linux') {
-    return path.join(home, '.config', 'Cursor');
+    // The IDE resolves its user-data dir the way VS Code does, so on Linux that is
+    // `$XDG_CONFIG_HOME/Cursor` when the variable is set and ~/.config/Cursor otherwise. The
+    // Cursor CLI's CURSOR_CONFIG_DIR / CURSOR_DATA_DIR do not apply here: neither variable
+    // appears in the IDE's own code (Cursor 3.16.29). ide-history.ts reads the same variable
+    // for the same class of path. Blank counts as unset -- `??` would keep the empty string
+    // and leave the result a relative `Cursor`, i.e. the working directory.
+    return path.join(process.env.XDG_CONFIG_HOME?.trim() || path.join(home, '.config'), 'Cursor');
   }
    return null; // Windows: %APPDATA%/Cursor -- not supported yet (no guaranteed sqlite3 CLI)
 }

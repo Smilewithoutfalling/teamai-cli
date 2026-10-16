@@ -159,6 +159,9 @@ beforeEach(() => {
   // Keep Codex's indexing step from starting a real CLI.
   vi.stubEnv('PATH', FAKE_OPENCODE_BIN);
   vi.stubEnv('XDG_DATA_HOME', path.join(mocks.home, '.local', 'share'));
+  // The composer store `cursorUserDir()` builds lives under ~/.config/Cursor; on Linux the IDE
+  // resolves $XDG_CONFIG_HOME/Cursor first, so pin the variable to that same directory.
+  vi.stubEnv('XDG_CONFIG_HOME', path.join(mocks.home, '.config'));
 });
 
 afterEach(() => {

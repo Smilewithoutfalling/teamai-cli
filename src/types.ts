@@ -845,11 +845,14 @@ export const LocalConfigSchema = z.object({
   /** When set, only inject hooks into these agents. Additive across multiple init --agent runs. */
   enabledAgents: z.array(z.string()).optional(),
   /**
-   * Per-machine relocation of a tool's user-scope root, keyed by the same tool
-   * id as `toolPaths` (`claude: ~/.claude-work`). A tool that can be told to
-   * keep its configuration elsewhere — Claude Code's `CLAUDE_CONFIG_DIR`, Codex's `CODEX_HOME` —
+   * Per-machine relocation of a tool's user-scope root. A tool that can be told
+   * to keep its configuration elsewhere — Claude Code's `CLAUDE_CONFIG_DIR`,
+   * Codex's `CODEX_HOME`, Cursor CLI's `CURSOR_DATA_DIR` / `CURSOR_CONFIG_DIR` —
    * reads nothing teamai writes to the team-wide default, and `teamai init`
    * records that variable here so every later run targets the right root.
+   * The key is the tool id in `toolPaths` for a tool whose whole layout moves
+   * with its root (`claude: ~/.claude-work`); a tool with more than one root
+   * records each of them under a name of its own (see `RELOCATABLE_TOOLS`).
    * The value must resolve inside HOME; `~/` is expanded.
    */
   toolRoots: z.record(z.string(), z.string()).optional(),
@@ -2299,6 +2302,20 @@ export const MUSE_TOOL_ID = 'muse';
 /** The `toolPaths.codex` root segment Codex uses when `CODEX_HOME` is unset. */
 export const DEFAULT_CODEX_ROOT = '.codex';
 
+/**
+ * Cursor CLI is the one tool with two relocatable roots, and neither is the
+ * root its `toolPaths` entry hangs off, so they are recorded under these two
+ * keys instead of under `cursor` — see `RELOCATABLE_TOOLS`. The names say which
+ * directory each one moves; `CURSOR_DATA_TOOL_ID` is the data root
+ * (`CURSOR_DATA_DIR`), `CURSOR_CONFIG_TOOL_ID` the config root
+ * (`CURSOR_CONFIG_DIR`).
+ */
+export const CURSOR_DATA_TOOL_ID = 'cursor-data';
+export const CURSOR_CONFIG_TOOL_ID = 'cursor-config';
+
+/** The root segment both Cursor CLI roots fall back to when their variable is unset. */
+export const DEFAULT_CURSOR_ROOT = '.cursor';
+
 /** A tool whose user root can be moved, and the variable that moves it. */
 export interface RelocatableTool {
   /** Display name in init output and doctor checks. */
@@ -2337,10 +2354,10 @@ function isAddressableRootSegment(segment: string): boolean {
 }
 
 /**
- * Tools a member may relocate, keyed by tool id. An allowlist, not a list of
- * known offenders: a root is only honest for a tool whose every user-scope
- * write follows it, and most tools keep at least one path teamai resolves
- * elsewhere (OMP's extension dir, Cursor's co-author file, Copilot's
+ * Roots a member may relocate, keyed by the name the recorded root is filed
+ * under. An allowlist, not a list of known offenders: a root is only honest for
+ * a tool whose every user-scope write follows it, and most tools keep at least
+ * one path teamai resolves elsewhere (OMP's extension dir, Copilot's
  * `$COPILOT_HOME`, OpenCode's plugin dir), which a partial move would split in
  * half.
  *
@@ -2351,10 +2368,28 @@ function isAddressableRootSegment(segment: string): boolean {
  * MCP resolve through `toolPaths`, co-author through `resolveToolRootDir`, and
  * model switching reads `CODEX_HOME` itself. `toolRoots` stays a generic
  * record, so a tool joins this table as soon as its writes have been audited.
+ *
+ * Cursor CLI is in this table as its two roots rather than as `cursor`. It
+ * moves two directories — the transcripts under `CURSOR_DATA_DIR`, the config
+ * `cli-config.json` lives in under `CURSOR_CONFIG_DIR` — while the rest of
+ * `~/.cursor` (the user `mcp.json`, `rules/`, `commands/`) stays there whatever
+ * the variables say. `toolPaths.cursor` therefore has to stay put, and a key
+ * named `cursor` would move it: `applyToolRoots` re-roots the `toolPaths` entry
+ * of every key it finds. So the two names below stand for roots, not tools, and
+ * only the two writers that address those roots read them (`getCursorProjectsDir`
+ * in `session-flow/fs.ts` and `cursorConfigDir` below).
+ *
+ * Those two keys carry no `toolPaths` entry, which is also why `doctor`'s
+ * `buildToolRootChecks` skips them: the check compares where teamai would write
+ * a tool's paths against where the tool reads them, and there are no such paths
+ * here for `applyToolRoots` to move. A stale record of either root is not caught
+ * by that check.
  */
 export const RELOCATABLE_TOOLS: Readonly<Record<string, RelocatableTool>> = {
   [CLAUDE_TOOL_ID]: { label: 'Claude Code', envVar: 'CLAUDE_CONFIG_DIR', defaultRoot: DEFAULT_CLAUDE_ROOT },
   [CODEX_TOOL_ID]: { label: 'Codex', envVar: 'CODEX_HOME', defaultRoot: DEFAULT_CODEX_ROOT },
+  [CURSOR_DATA_TOOL_ID]: { label: 'Cursor transcripts', envVar: 'CURSOR_DATA_DIR', defaultRoot: DEFAULT_CURSOR_ROOT },
+  [CURSOR_CONFIG_TOOL_ID]: { label: 'Cursor config', envVar: 'CURSOR_CONFIG_DIR', defaultRoot: DEFAULT_CURSOR_ROOT },
 };
 
 /**
@@ -2377,9 +2412,9 @@ export function toolRootRejection(dir: string): string | null {
 }
 
 /**
- * The root a relocatable tool's variable asks for (`CLAUDE_CONFIG_DIR`,
- * `CODEX_HOME`), or null when the variable is unset or blank, or the tool is
- * not relocatable.
+ * The root a relocatable tool's variable asks for (the `envVar` in
+ * `RELOCATABLE_TOOLS`), or null when the variable is unset or blank, or the
+ * tool is not relocatable.
  *
  * A value equal to the default root is still an answer, not an absence:
  * Claude Code reads `.claude.json` from INSIDE the configured directory
@@ -2397,6 +2432,25 @@ export function detectToolRoot(tool: string, env: NodeJS.ProcessEnv = process.en
   const configured = spec ? env[spec.envVar]?.trim() : undefined;
   if (!configured) return null;
   return path.resolve(expandHome(configured));
+}
+
+/**
+ * Cursor CLI's config directory, the one that holds `cli-config.json`.
+ *
+ * Resolution order read off the cursor-agent 2026.09.28 bundle:
+ * `CURSOR_CONFIG_DIR`, else `$XDG_CONFIG_HOME/cursor`, else `~/.cursor`. Only
+ * the variable can be recorded in `toolRoots` — `XDG_CONFIG_HOME` names a parent
+ * directory, and `~/.config` itself is refused as a root — so the fallback is
+ * read here, where the write happens, exactly as `session-flow/ide-history.ts`
+ * reads it for the Cursor IDE.
+ */
+export function cursorConfigDir(toolRoots?: Record<string, string>): string {
+  if (toolRoots?.[CURSOR_CONFIG_TOOL_ID]) {
+    return resolveToolRootDir(CURSOR_CONFIG_TOOL_ID, DEFAULT_CURSOR_ROOT, toolRoots);
+  }
+  const xdg = process.env.XDG_CONFIG_HOME?.trim();
+  if (xdg) return path.join(expandHome(xdg), 'cursor');
+  return path.join(getUserHome(), DEFAULT_CURSOR_ROOT);
 }
 
 /** Base directory for one tool's resources in the active scope. */
@@ -2504,7 +2558,7 @@ function toolRootSegment(tool: string, configured: string): string | null {
     if (!warnedToolRoots.has(tool)) {
       warnedToolRoots.add(tool);
       log.warn(
-        `Ignoring toolRoots.${tool}: toolRoots currently supports ${Object.keys(RELOCATABLE_TOOLS).join(' and ')} only — `
+        `Ignoring toolRoots.${tool}: toolRoots currently supports ${Object.keys(RELOCATABLE_TOOLS).join(', ')} only — `
         + `${tool} has writes teamai does not resolve through toolPaths.`
         + (tool === COPILOT_TOOL_ID ? ' Copilot CLI is relocated with COPILOT_HOME instead.' : ''),
       );

@@ -109,8 +109,9 @@ import {
 } from './known-agents.js';
 
 /**
- * Record each relocated tool root (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`) into the
- * config being written, so every later run targets the directory the tool reads.
+ * Record each relocated tool root (every entry of `RELOCATABLE_TOOLS`, by the
+ * variable it names) into the config being written, so every later run targets
+ * the directory the tool reads.
  *
  * `init` is the only command that reads these variables. They live in one
  * shell profile, while teamai also runs from session hooks and from other

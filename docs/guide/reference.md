@@ -83,15 +83,19 @@ The role, project and tag fields hold this directory's own selection. A workspac
 
 #### Relocated tool roots (`toolRoots`)
 
-When Claude Code uses `CLAUDE_CONFIG_DIR`, or Codex uses `CODEX_HOME`, `init` records that directory. Only `claude` and `codex` are accepted.
+When Claude Code uses `CLAUDE_CONFIG_DIR`, Codex uses `CODEX_HOME`, or Cursor CLI uses `CURSOR_DATA_DIR` / `CURSOR_CONFIG_DIR`, `init` records those directories. The accepted keys are `claude`, `codex`, `cursor-data` and `cursor-config`.
 
 ```bash
 CLAUDE_CONFIG_DIR=~/.claude-work teamai init
 CLAUDE_CONFIG_DIR= teamai init    # clear the record
 CODEX_HOME= teamai init
+CURSOR_DATA_DIR=~/.cursor-data teamai init
+CURSOR_CONFIG_DIR=~/.cursor-config teamai init
 ```
 
 The directory has to sit in your home or under `~/.config/`. Copilot uses its own `COPILOT_HOME`.
+
+Cursor CLI moves two directories: `CURSOR_DATA_DIR` holds the transcripts, `CURSOR_CONFIG_DIR` the `cli-config.json` the co-author setting goes into. Its user `mcp.json`, `rules/` and `commands/` stay in `~/.cursor` whatever the two variables say, so those keep their default paths. With `CURSOR_CONFIG_DIR` unset the config root is `$XDG_CONFIG_HOME/cursor` when that variable is set, `~/.cursor` otherwise.
 
 ### Webhook notifications (`sharing.webhooks`)
 

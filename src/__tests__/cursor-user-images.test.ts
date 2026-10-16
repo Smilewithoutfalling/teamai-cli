@@ -101,10 +101,14 @@ function readBubbles(db: string): { type: number; text: string; createdAt: strin
 beforeEach(() => {
   mocks.home = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-cursor-img-'));
   fs.mkdirSync(path.join(mocks.home, '.cursor', 'projects'), { recursive: true });
+  // The composer store this file builds lives under ~/.config/Cursor; on Linux the IDE resolves
+  // $XDG_CONFIG_HOME/Cursor first, so pin the variable to that same directory.
+  vi.stubEnv('XDG_CONFIG_HOME', path.join(mocks.home, '.config'));
 });
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   fs.rmSync(mocks.home, { recursive: true, force: true });
   mocks.home = '';
 });

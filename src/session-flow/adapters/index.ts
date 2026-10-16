@@ -20,9 +20,10 @@ import {
   getCodexSessionsDir,
   getCodexInternalSessionsDir,
   getTCodexSessionsDir,
+  getCursorProjectsDir,
 } from '../fs.js';
 
-/** Builds a platform's adapter. Claude Code and Codex keep their stores under the member's recorded `toolRoots`. */
+/** Builds a platform's adapter. Claude Code, Codex and Cursor keep their stores under the member's recorded `toolRoots`. */
 export type AdapterFactory = (toolRoots?: LocalConfig['toolRoots']) => AgentAdapter;
 
 export const ADAPTER_REGISTRY: Record<string, AdapterFactory> = {
@@ -35,7 +36,7 @@ export const ADAPTER_REGISTRY: Record<string, AdapterFactory> = {
   codebuddy: () => new CodeBuddyAdapter(),
   'codebuddy-ide': () => new CodeBuddyIdeAdapter(),
   workbuddy: () => new WorkBuddyAdapter(),
-  cursor: () => new CursorAdapter(),
+  cursor: (toolRoots) => new CursorAdapter('cursor', getCursorProjectsDir(toolRoots)),
   opencode: () => new OpencodeAdapter(),
   // TeamAI variants (different path prefixes, identical format)
   'claude-internal': () => new ClaudeCodeAdapter('claude-internal', getClaudeInternalProjectsDir()),

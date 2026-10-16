@@ -284,8 +284,10 @@ describe('toolRoots — re-rooting a relocated tool', () => {
   });
 
   // Every other tool still writes somewhere teamai does not resolve through
-  // toolPaths — Cursor's co-author file, OMP's extension dir, $COPILOT_HOME,
-  // OpenCode's plugin dir — so a root would move half a layout.
+  // toolPaths — OMP's extension dir, $COPILOT_HOME, OpenCode's plugin dir — so a
+  // root would move half a layout. `cursor` is here for that reason one step
+  // further: it has two roots and neither is the one its toolPaths hang off, so
+  // they are recorded under cursor-data / cursor-config instead.
   it.each(['codex-internal', 'omp', 'cursor', 'copilot', 'opencode'])(
     'refuses to relocate %s, which teamai does not address through toolPaths alone',
     (tool) => {
@@ -301,7 +303,7 @@ describe('toolRoots — re-rooting a relocated tool', () => {
       scopedToolPaths(teamConfig, withRoot);
       expect(warn).toHaveBeenCalledTimes(1);
       expect(warn.mock.calls[0][0]).toContain(`toolRoots.${tool}`);
-      expect(warn.mock.calls[0][0]).toContain('supports claude and codex only');
+      expect(warn.mock.calls[0][0]).toContain('supports claude, codex, cursor-data, cursor-config only');
       if (tool === 'copilot') expect(warn.mock.calls[0][0]).toContain('COPILOT_HOME');
     },
   );

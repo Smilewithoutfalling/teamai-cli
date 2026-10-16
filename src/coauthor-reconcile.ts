@@ -2,12 +2,12 @@ import path from 'node:path';
 import type { LocalConfig, TeamaiConfig, State } from './types.js';
 import {
   DEFAULT_CODEX_ROOT,
+  cursorConfigDir,
   resolveBaseDir,
   resolveCoAuthor,
   resolveToolRootDir,
   scopedToolPaths,
 } from './types.js';
-import { getUserHome } from './utils/home.js';
 import {
   writeJson,
   readFileSafe,
@@ -47,8 +47,10 @@ import { log } from './utils/logger.js';
 //                    (codex, codex-internal, tcodex) — user scope only.
 //                    Only takes effect when [features].codex_git_commit = true,
 //                    which we do NOT force; "" strips, unset = default trailer.
-//    Cursor          ~/.cursor/cli-config.json  attribution.attributeCommitsToAgent
-//                    user scope only. Known upstream bug: the local executor may
+//    Cursor          <config root>/cli-config.json  attribution.attributeCommitsToAgent
+//                    user scope only. The config root is CURSOR_CONFIG_DIR, else
+//                    $XDG_CONFIG_HOME/cursor, else ~/.cursor (cursor-agent 2026.09.28) --
+//                    see cursorConfigDir. Known upstream bug: the local executor may
 //                    ignore this, so treat it as best-effort.
 
 const CODEX_TOOLS = new Set(['codex', 'codex-internal', 'tcodex']);
@@ -98,7 +100,6 @@ async function resolveTargets(
 ): Promise<Target[]> {
   const baseDir = resolveBaseDir(localConfig);
   const projectScope = localConfig.scope === 'project';
-  const userHome = getUserHome();
   const targets: Target[] = [];
   const disabled = new Set(localConfig.disabledAgents ?? []);
   const whitelist = localConfig.enabledAgents;
@@ -156,12 +157,13 @@ async function resolveTargets(
         file: path.join(resolveToolRootDir(tool, defaultRoot, localConfig.toolRoots), 'config.toml'),
       });
     } else {
-      // Cursor: user scope only, ~/.cursor/cli-config.json.
+      // Cursor: user scope only. The CLI reads cli-config.json from its config root, not from the
+      // fixed ~/.cursor the rest of its paths use, so this write follows cursorConfigDir.
       if (projectScope) {
         log.debug(`[coauthor] Skipping ${tool}: co-author is user-scope only`);
         continue;
       }
-      targets.push({ tool, family, file: path.join(userHome, '.cursor', 'cli-config.json') });
+      targets.push({ tool, family, file: path.join(cursorConfigDir(localConfig.toolRoots), 'cli-config.json') });
     }
   }
   return targets;

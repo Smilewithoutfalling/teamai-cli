@@ -13,8 +13,10 @@ import { homedir } from 'node:os';
 import {
   CLAUDE_TOOL_ID,
   CODEX_TOOL_ID,
+  CURSOR_DATA_TOOL_ID,
   DEFAULT_CLAUDE_ROOT,
   DEFAULT_CODEX_ROOT,
+  DEFAULT_CURSOR_ROOT,
   resolveToolRootDir,
   type LocalConfig,
 } from '../types.js';
@@ -25,7 +27,8 @@ import {
 
 /**
  * The root of a relocatable tool: the one the member recorded (`toolRoots`, written by `teamai
- * init` from CLAUDE_CONFIG_DIR or CODEX_HOME), else the default one in the home directory.
+ * init` from CLAUDE_CONFIG_DIR, CODEX_HOME or CURSOR_DATA_DIR), else the default one in the home
+ * directory.
  */
 function toolRootDir(tool: string, defaultRoot: string, toolRoots: LocalConfig['toolRoots']): string {
   return toolRoots?.[tool] ? resolveToolRootDir(tool, defaultRoot, toolRoots) : path.join(homedir(), defaultRoot);
@@ -72,8 +75,12 @@ export function getWorkBuddyProjectsDir(): string {
   return path.join(homedir(), '.workbuddy', 'projects');
 }
 
-export function getCursorProjectsDir(): string {
-  return path.join(homedir(), '.cursor', 'projects');
+/**
+ * Cursor CLI's transcript store: <data root>/projects, where the data root is `CURSOR_DATA_DIR`
+ * when the member recorded one (cursor-agent 2026.09.28) and `~/.cursor` otherwise.
+ */
+export function getCursorProjectsDir(toolRoots?: LocalConfig['toolRoots']): string {
+  return path.join(toolRootDir(CURSOR_DATA_TOOL_ID, DEFAULT_CURSOR_ROOT, toolRoots), 'projects');
 }
 
 // ---------------------------------------------------------------------------

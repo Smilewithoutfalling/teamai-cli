@@ -1,8 +1,9 @@
 /**
  * adapters/cursor.ts — Cursor platform adapter.
  *
- * Reads and writes `~/.cursor/projects/<encoded-cwd>/agent-transcripts/<uuid>/<uuid>.jsonl`.
- * cwd encoding: `/` → `-`, with no leading `-`.
+ * Reads and writes `<data root>/projects/<encoded-cwd>/agent-transcripts/<uuid>/<uuid>.jsonl`.
+ * The data root is `CURSOR_DATA_DIR` when the member recorded one (`toolRoots`), `~/.cursor`
+ * otherwise. cwd encoding: `/` → `-`, with no leading `-`.
  *
  * JSONL line types (2 kinds):
  *   - Message line (no type field): {role, message:{content:[block...]}}
@@ -117,14 +118,26 @@ function denormalizeToolName(irName: string): string {
 // ---------------------------------------------------------------------------
 
 export class CursorAdapter extends AgentAdapter {
-  readonly platform = 'cursor';
+  readonly platform: string;
+  private readonly storageRoot: string;
+
+  /**
+   * @param platform Platform id (default 'cursor')
+   * @param storageRoot Transcript store (default ~/.cursor/projects; the adapter registry passes
+   *   the member's recorded CURSOR_DATA_DIR root when there is one)
+   */
+  constructor(platform = 'cursor', storageRoot?: string) {
+    super();
+    this.platform = platform;
+    this.storageRoot = storageRoot ?? getCursorProjectsDir();
+  }
 
   static isAvailable(): boolean {
     return dirExists(getCursorProjectsDir());
   }
 
   isReady(): boolean {
-    return dirExists(getCursorProjectsDir());
+    return dirExists(this.storageRoot);
   }
 
   static getDefaultStoragePath(): string {
@@ -132,7 +145,7 @@ export class CursorAdapter extends AgentAdapter {
   }
 
   private resolveProjectDir(projectPath?: string): string {
-    const root = getCursorProjectsDir();
+    const root = this.storageRoot;
     if (projectPath) {
       return path.join(root, encodeCwdGeneric(projectPath));
     }
@@ -150,7 +163,7 @@ export class CursorAdapter extends AgentAdapter {
       return fileExists(target) ? target : null;
     }
     // Walk every project directory
-    const root = getCursorProjectsDir();
+    const root = this.storageRoot;
     if (!dirExists(root)) return null;
     for (const projDir of fs.readdirSync(root)) {
       const transcriptsDir = path.join(root, projDir, 'agent-transcripts');
@@ -165,7 +178,7 @@ export class CursorAdapter extends AgentAdapter {
 
   async listConversations(projectPath?: string): Promise<SessionMeta[]> {
     const metas: SessionMeta[] = [];
-    const root = getCursorProjectsDir();
+    const root = this.storageRoot;
     if (!dirExists(root)) return [];
 
     const projDirs = projectPath
@@ -428,7 +441,7 @@ export class CursorAdapter extends AgentAdapter {
       targetCwd: cwd,
       sourceSessionId: session.sessionId,
     });
-    const projDir = path.join(getCursorProjectsDir(), encodeCwdGeneric(cwd));
+    const projDir = path.join(this.storageRoot, encodeCwdGeneric(cwd));
     const transcriptDir = path.join(projDir, 'agent-transcripts', sessionId);
     const jsonlPath = path.join(transcriptDir, `${sessionId}.jsonl`);
 

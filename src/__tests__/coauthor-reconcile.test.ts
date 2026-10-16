@@ -55,6 +55,10 @@ describe('co-author reconcile', () => {
     await fse.ensureDir(path.join(homeDir, '.teamai'));
 
     vi.stubEnv('HOME', homeDir);
+    // Cursor CLI resolves its config root as CURSOR_CONFIG_DIR, then $XDG_CONFIG_HOME/cursor,
+    // then ~/.cursor. This file expects the last of those, so pin the variable instead of
+    // inheriting whatever the runner exports.
+    vi.stubEnv('XDG_CONFIG_HOME', '');
 
     baseTeam = {
       team: 't',
