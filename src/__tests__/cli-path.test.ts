@@ -120,6 +120,40 @@ describe('gh-cli launches the resolved executable', () => {
     );
   });
 
+  it('reports a deadline instead of a silent non-zero exit', () => {
+    mockedExecFileSync.mockReturnValue(`${GH_EXE}\r\n`);
+    // `spawnSync` reports a killed child as `status: null` plus ETIMEDOUT, with
+    // both streams empty — the shape that was indistinguishable from `gh`
+    // exiting non-zero while printing nothing.
+    mockedCrossSpawnSync.mockReturnValue({
+      status: null,
+      stdout: '',
+      stderr: '',
+      error: Object.assign(new Error('spawnSync gh ETIMEDOUT'), { code: 'ETIMEDOUT' }),
+    });
+
+    const r = ghExec(['api', '/orgs/example/repos'], { timeoutMs: 30_000 });
+
+    expect(r.timedOut).toBe(true);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toBe('');
+  });
+
+  it('does not report a plain non-zero exit as a deadline', () => {
+    mockedExecFileSync.mockReturnValue(`${GH_EXE}\r\n`);
+    mockedCrossSpawnSync.mockReturnValue({
+      status: 1,
+      stdout: '',
+      stderr: 'gh: Not Found (HTTP 404)',
+      error: new Error('Command failed'),
+    });
+
+    const r = ghExec(['api', '/orgs/missing/repos'], { timeoutMs: 30_000 });
+
+    expect(r.timedOut).toBeUndefined();
+    expect(r.status).toBe(1);
+  });
+
   it('reports gh as installed exactly when the resolver finds it', () => {
     mockedExecFileSync.mockImplementation(() => { throw new Error('missing'); });
     expect(isGhInstalled()).toBe(false);
