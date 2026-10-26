@@ -163,7 +163,9 @@ afterEach(() => {
   process.env.GIT_CONFIG_NOSYSTEM = savedEnv.nosystem;
   if (savedEnv.global === undefined) delete process.env.GIT_CONFIG_GLOBAL;
   if (savedEnv.nosystem === undefined) delete process.env.GIT_CONFIG_NOSYSTEM;
-  fs.rmSync(tmp, { recursive: true, force: true });
+  // A commit or push can leave a detached `git gc --auto` writing objects/pack
+  // after the test returns, so a single rmdir races it (ENOTEMPTY).
+  fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 describe('SyncManager.gitPull', () => {
