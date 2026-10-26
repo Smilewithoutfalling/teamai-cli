@@ -39,9 +39,9 @@ export function isGhInstalled(): boolean {
  * exited non-zero while printing nothing: the caller only sees
  * `{ status: 1, stdout: '', stderr: '' }`.
  */
-function hitTimeout(result: { error?: Error }): boolean {
+function hitTimeout(result: { error?: Error | null }): boolean {
   const { error } = result;
-  return error !== undefined && 'code' in error && error.code === 'ETIMEDOUT';
+  return error instanceof Error && 'code' in error && error.code === 'ETIMEDOUT';
 }
 
 /**

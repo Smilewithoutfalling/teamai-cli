@@ -112,6 +112,17 @@ describe('gh-cli launches the resolved executable', () => {
     expect(r.stdout).toBe('gh version 2.0.0');
   });
 
+  it('returns a successful run when cross-spawn reports error: null', () => {
+    mockedExecFileSync.mockReturnValue(`${GH_EXE}\r\n`);
+    mockedCrossSpawnSync.mockReturnValue({ status: 0, stdout: 'gh version 2.0.0\n', stderr: '', error: null });
+
+    const r = ghExec(['--version'], { timeoutMs: 30_000 });
+
+    expect(r.status).toBe(0);
+    expect(r.stdout).toBe('gh version 2.0.0');
+    expect(r.timedOut).toBeUndefined();
+  });
+
   it('forwards inheritStdio through cross-spawn', () => {
     mockedExecFileSync.mockReturnValue(`${GH_EXE}\r\n`);
     ghExec(['auth', 'status'], { inheritStdio: true });
