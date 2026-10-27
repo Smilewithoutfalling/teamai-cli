@@ -58,11 +58,18 @@ const PROVIDER_SLUG_PREFIXES = ['github__', 'gitlab__', 'tgit__'] as const;
  * named `svc` share one evidence directory. Carrying curated artifacts across
  * such an import would attach the first repo's docs and domain to the second.
  *
- * Keep them only when the two manifests name the same repository. Teamwikis
- * written before the per-codebase `source-manifest.json` existed have no
- * published identity; there a provider-namespaced slug (`gitlab__group__repo`)
- * still names the remote repository, so the slug itself is the identity. A
- * bare `--dir` basename is not, and replaces the evidence like base.
+ * Keep them only when the two manifests name the same repository and the same
+ * directory in it. A checkout with a remote names it by `repoUrl`. One with no
+ * remote has no canonical identity (#1422), so the hashed git root it was read
+ * from is the only stable statement of "this source": the same checkout carries
+ * its docs over, while a different checkout with the same basename does not.
+ * The directory matters as much as the root there — two subdirectories of one
+ * origin-less repo hash to the same root and are still two codebases.
+ * Teamwikis written before the per-codebase `source-manifest.json` existed have
+ * no published identity; there a provider-namespaced slug
+ * (`gitlab__group__repo`) still names the remote repository, so the slug itself
+ * is the identity. A bare `--dir` basename is not, and replaces the evidence
+ * like base.
  */
 async function sameRepository(publishedDir: string, stagedDir: string, slug: string): Promise<boolean> {
   const [published, staged] = await Promise.all([
@@ -72,9 +79,22 @@ async function sameRepository(publishedDir: string, stagedDir: string, slug: str
   const publishedUrl = typeof published?.['repoUrl'] === 'string' ? published['repoUrl'] : '';
   const stagedUrl = typeof staged?.['repoUrl'] === 'string' ? staged['repoUrl'] : '';
   if (publishedUrl && stagedUrl) return repoIdentity(publishedUrl) === repoIdentity(stagedUrl);
-  return !publishedUrl
-    && Boolean(stagedUrl)
-    && PROVIDER_SLUG_PREFIXES.some((prefix) => slug.startsWith(prefix));
+  if (publishedUrl || stagedUrl) {
+    return !publishedUrl
+      && PROVIDER_SLUG_PREFIXES.some((prefix) => slug.startsWith(prefix));
+  }
+  // Neither side names a remote. Two origin-less runs are the same source only
+  // when both recorded the same verified git root *and* the same directory in
+  // it: `service-a/svc` and `service-b/svc` of one repo share one git root but
+  // are different codebases, so the root alone would carry docs across them.
+  // A manifest written before `localRootHash` existed is not evidence of the
+  // same source.
+  const publishedRoot = typeof published?.['localRootHash'] === 'string' ? published['localRootHash'] : '';
+  const stagedRoot = typeof staged?.['localRootHash'] === 'string' ? staged['localRootHash'] : '';
+  if (publishedRoot === '' || publishedRoot !== stagedRoot) return false;
+  const publishedSubdir = typeof published?.['sourceSubdir'] === 'string' ? published['sourceSubdir'] : '';
+  const stagedSubdir = typeof staged?.['sourceSubdir'] === 'string' ? staged['sourceSubdir'] : '';
+  return publishedSubdir === stagedSubdir;
 }
 
 /**
